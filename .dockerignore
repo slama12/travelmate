@@ -1,0 +1,30 @@
+# Environnements virtuels Python
+.venv/
+venv/
+ENV/
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches de tests et d'outils
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Git et IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Dépendances Node / build Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Bases SQLite locales et fichiers temporaires
+*.db
+*.sqlite3
+*.log

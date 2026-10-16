@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-canvas: #FAF9F6;
+    --color-ink: #0F172A;
+    --color-brand: #0F766E;
+    --radius-card: 12px;
+  }
+
+  html {
+    font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background-color: #FAF9F6;
+    color: #0F172A;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background-color: #FAF9F6;
+    color: #0F172A;
+  }
+}
+
+/* Personnalisation sobre de react-day-picker pour le thème clair sarcelle */
+.rdp {
+  --rdp-cell-size: 38px;
+  --rdp-accent-color: #0F766E;
+  --rdp-background-color: #F0FDFA;
+  --rdp-accent-color-dark: #115E59;
+  --rdp-background-color-dark: #CCFBF1;
+  --rdp-outline: 2px solid #0F766E;
+  --rdp-outline-selected: 2px solid #0F766E;
+  margin: 0;
+}
+
+.rdp-day_selected,
+.rdp-day_selected:focus-visible,
+.rdp-day_selected:hover {
+  background-color: #0F766E !important;
+  color: #FFFFFF !important;
+  font-weight: 600;
+}
+
+.rdp-day_range_middle {
+  background-color: #F0FDFA !important;
+  color: #0F172A !important;
+}

@@ -1,0 +1,25 @@
+# Python virtual environments & cache
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend dependencies
+node_modules/
+frontend/node_modules/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

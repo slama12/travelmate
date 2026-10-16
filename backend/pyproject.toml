@@ -1,0 +1,13 @@
+[project]
+name = "travelmate-backend"
+version = "0.1.0"
+description = "Backend modulaire FastAPI pour TravelMate"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
