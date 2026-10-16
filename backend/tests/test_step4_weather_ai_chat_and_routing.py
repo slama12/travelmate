@@ -361,7 +361,7 @@ async def test_ai_itinerary_filters_nonexistent_place_and_corrects_or_removes_re
     assert corrected_slot["place_id"] == real_museum["id"]
     assert corrected_slot["local_start_time"] != "06:30"
     assert corrected_slot["validation_status"] == "CORRECTED"
-    assert any("refusé" in msg and "corrigé" in msg for msg in data["adjustments_fr"])
+    assert any("Déplacé à" in msg and "ouvre à" in msg for msg in data["adjustments_fr"])
 
 
 @pytest.mark.asyncio
@@ -477,3 +477,205 @@ async def test_routing_provider_real_and_estimated_fallback() -> None:
     assert leg_fallback["source"] == "ESTIMATED"
     assert leg_fallback["fallback_used"] is True
     assert leg_fallback["label_fr"] == "Temps estimé"
+
+
+@pytest.mark.asyncio
+async def test_ai_draft_never_proposes_outdoor_place_on_storm_or_rain_day(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Correctif 6 — Brouillon IA :
+    - Ne propose jamais un lieu en plein air un jour d'orage ou de pluie (sauf si l'utilisateur le demande).
+    - Vérifie à la fois le fournisseur simulé par défaut et le filtrage/déplacement côté backend
+      lorsqu'un modèle tente de placer un lieu extérieur un jour d'orage (STORM) ou de pluie (RAIN).
+    """
+    headers, trip_id, _ = await _register_user_and_create_tokyo_trip(
+        client, email="step4.no.outdoor.storm@travelmate.app"
+    )
+
+    weather_resp = await client.get(f"/api/v1/itinerary/trip/{trip_id}/weather", headers=headers)
+    assert weather_resp.status_code == 200
+    weather_days = {d["date"]: d for d in weather_resp.json()["days"]}
+    storm_or_rain_dates = {
+        d_str
+        for d_str, w in weather_days.items()
+        if w["is_rainy"] or w["condition_code"] in ("RAIN", "STORM", "THUNDERSTORM")
+    }
+    assert "2026-06-10" in storm_or_rain_dates  # Jour 0 : RAIN
+    assert "2026-06-12" in storm_or_rain_dates  # Jour 2 : STORM (Orage)
+
+    # 1. Génération standard : aucun lieu en plein air un jour d'orage ou de pluie
+    gen_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/ai-generate",
+        headers=headers,
+        json={"budget_eur": 1800.0, "pace": "INTENSE", "tastes": ["CULTURE", "NATURE", "FOOD"]},
+    )
+    assert gen_resp.status_code == 200, gen_resp.text
+    draft = gen_resp.json()
+    for slot in draft["draft_items"]:
+        if slot["visit_date"] in storm_or_rain_dates:
+            assert slot["is_outdoor"] is False, (
+                f"Lieu en plein air '{slot['place_name']}' proposé un jour d'orage/pluie ({slot['visit_date']})"
+            )
+
+    # 2. Même si le modèle brut tente de planifier un lieu en plein air le jour d'orage (2026-06-12 STORM),
+    #    le brouillon ne garde jamais un lieu en plein air sur ce jour d'orage.
+    places_resp = await client.get("/api/v1/places/city/Tokyo", headers=headers)
+    places = places_resp.json()["places"]
+    outdoor_place = next(p for p in places if p["is_outdoor"] is True)
+    indoor_place = next(p for p in places if p["is_outdoor"] is False)
+
+    registry = get_provider_registry()
+
+    async def _mock_llm_outdoor_on_storm_day(**_kwargs: Any) -> str:
+        return json.dumps(
+            {
+                "summary_fr": "Test protection orage",
+                "pace": "NORMAL",
+                "slots": [
+                    {
+                        "place_id": outdoor_place["id"],
+                        "place_name": outdoor_place["name"],
+                        "visit_date": "2026-06-12",  # Jour d'orage (STORM)
+                        "local_start_time": "10:00",
+                        "duration_minutes": 90,
+                        "transit_mode": "METRO",
+                    },
+                    {
+                        "place_id": indoor_place["id"],
+                        "place_name": indoor_place["name"],
+                        "visit_date": "2026-06-12",
+                        "local_start_time": "14:00",
+                        "duration_minutes": 90,
+                        "transit_mode": "METRO",
+                    },
+                ],
+            }
+        )
+
+    monkeypatch.setattr(
+        registry.ai,
+        "generate_structured_itinerary_raw",
+        _mock_llm_outdoor_on_storm_day,
+    )
+
+    gen_storm_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/ai-generate",
+        headers=headers,
+        json={"budget_eur": 1500.0, "pace": "NORMAL", "tastes": ["NATURE", "CULTURE"]},
+    )
+    assert gen_storm_resp.status_code == 200, gen_storm_resp.text
+    storm_draft = gen_storm_resp.json()
+    for slot in storm_draft["draft_items"]:
+        if slot["visit_date"] in storm_or_rain_dates:
+            assert slot["is_outdoor"] is False, (
+                f"Aucun lieu en plein air ne doit rester sur un jour d'orage ({slot['visit_date']})"
+            )
+
+
+@pytest.mark.asyncio
+async def test_ai_draft_no_duplicate_places_and_marrakech_scarce_places_message_and_simple_correction(
+    client: AsyncClient,
+) -> None:
+    """
+    Correctif 6 — Brouillon IA sur Marrakech :
+    - Ne répète jamais un même lieu plus d'une fois.
+    - Affiche "Peu de lieux disponibles à Marrakech pour l'instant" lorsqu'il n'y a pas assez de lieux en base.
+    - Indique clairement quand un créneau a été corrigé par une phrase simple :
+      "Déplacé à 19:00 car le restaurant ouvre à 19:00".
+    - Pas de jargon ("moteur de validation", "Africa/Casablanca").
+    - Dates en français (ex: "mardi 10 novembre 2026") et trajet affiché "Trajet : ~X min" ou masqué quand nul.
+    """
+    reg_resp = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "step4.marrakech.draft@travelmate.app",
+            "full_name": "Voyageur Marrakech",
+            "password": "PasswordStep4!123",
+            "preferred_currency": "EUR",
+            "preferred_language": "fr",
+            "travel_style": "STANDARD",
+        },
+    )
+    assert reg_resp.status_code == 201
+    headers = {"Authorization": f"Bearer {reg_resp.json()['access_token']}"}
+
+    dest_resp = await client.get("/api/v1/destinations")
+    marrakech = next(d for d in dest_resp.json() if d["city_name"] == "Marrakech")
+
+    trip_resp = await client.post(
+        "/api/v1/trips",
+        headers=headers,
+        json={
+            "destination_id": marrakech["id"],
+            "title": "Séjour Marrakech Sans Doublon",
+            "arrival_at": "2026-11-10T06:00:00Z",
+            "departure_at": "2026-11-14T20:00:00Z",
+            "total_budget": "1500.00",
+            "currency": "EUR",
+        },
+    )
+    assert trip_resp.status_code == 201, trip_resp.text
+    trip_id = trip_resp.json()["id"]
+
+    gen_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/ai-generate",
+        headers=headers,
+        json={
+            "budget_eur": 1500.0,
+            "pace": "NORMAL",
+            "tastes": ["CULTURE", "NATURE", "FOOD", "NIGHT"],
+        },
+    )
+    assert gen_resp.status_code == 200, gen_resp.text
+    data = gen_resp.json()
+
+    # 1. Pas de doublon de lieu
+    place_ids = [item["place_id"] for item in data["draft_items"]]
+    place_names = [item["place_name"] for item in data["draft_items"]]
+    assert len(place_ids) == len(set(place_ids)), f"Doublon détecté dans les lieux : {place_names}"
+
+    # 2. Message explicite quand il y a peu de lieux en base à Marrakech
+    assert data["limited_places_notice_fr"] == "Peu de lieux disponibles à Marrakech pour l'instant"
+    assert "Peu de lieux disponibles à Marrakech pour l'instant" in data["adjustments_fr"]
+
+    # 3. Phrase simple de correction horaire ("Déplacé à 19:00 car le restaurant ouvre à 19:00")
+    assert any(
+        "Déplacé à 19:00 car le restaurant ouvre à 19:00" in msg
+        for msg in data["adjustments_fr"]
+    ), f"Phrase simple absente de adjustments_fr : {data['adjustments_fr']}"
+    resto_slot = next(
+        item for item in data["draft_items"] if "Grande Table Marocaine" in item["place_name"]
+    )
+    assert resto_slot["adjustment_note_fr"] == "Déplacé à 19:00 car le restaurant ouvre à 19:00"
+
+    # 4. Aucun lieu en plein air un jour de pluie ou d'orage (2026-11-10 RAIN, 2026-11-12 STORM)
+    for item in data["draft_items"]:
+        if item["visit_date"] in ("2026-11-10", "2026-11-12"):
+            assert item["is_outdoor"] is False
+
+    # 5. Dates en français et trajet "Trajet : ~X min" ou masqué (None) quand il est nul
+    for item in data["draft_items"]:
+        assert any(
+            mois in item["visit_date_label_fr"]
+            for mois in ("novembre", "octobre", "décembre", "juin")
+        )
+        if item["transit_from_prev_min"] == 0:
+            assert item["transit_label_fr"] is None
+        else:
+            assert item["transit_label_fr"] == f"Trajet : ~{item['transit_from_prev_min']} min"
+
+    # 6. Zéro jargon ("moteur de validation", "Africa/Casablanca") dans tous les textes visibles
+    all_texts = [
+        data["summary_fr"],
+        data["limited_places_notice_fr"] or "",
+        *data["adjustments_fr"],
+        *(item["adjustment_note_fr"] or "" for item in data["draft_items"]),
+        *(item["visit_date_label_fr"] or "" for item in data["draft_items"]),
+        *(item["transit_label_fr"] or "" for item in data["draft_items"]),
+    ]
+    combined_text = "\n".join(all_texts)
+    assert "moteur de validation" not in combined_text.lower()
+    assert "Africa/Casablanca" not in combined_text
+

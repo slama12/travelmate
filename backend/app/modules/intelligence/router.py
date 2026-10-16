@@ -665,6 +665,83 @@ async def reject_weather_alert_suggestion(
 # ==============================================================================
 # 2. ENDPOINTS ITINÉRAIRE IA ("GÉNÈRE MON PROGRAMME") — BROUILLON NON PERSISTÉ
 # ==============================================================================
+_FR_WEEKDAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_FR_MONTHS = [
+    "",
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+]
+
+
+def _format_date_fr(d: date) -> str:
+    return f"{_FR_WEEKDAYS[d.weekday()]} {d.day} {_FR_MONTHS[d.month]} {d.year}"
+
+
+def _place_noun_fr(place: Place) -> str:
+    cat = str(place.category or "").upper()
+    name_low = str(place.name or "").lower()
+    if cat == "RESTAURANT":
+        return "le restaurant"
+    if any(k in name_low for k in ("musée", "musee", "museum", "teamlab", "galerie")):
+        return "le musée"
+    if any(k in name_low for k in ("jardin", "parc", "park")):
+        return "le jardin"
+    return "le lieu"
+
+
+def _extract_opening_start_hm(place: Place, target_start_hm: str) -> str:
+    oh = place.opening_hours or {}
+    raw_str = str(oh.get("daily") or next(iter(oh.values()), "09:00-18:00"))
+    if raw_str.strip() == "24/7":
+        return "00:00"
+    starts: list[str] = []
+    for part in raw_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            s_hm = part.split("-")[0].strip()
+            starts.append(s_hm)
+    if target_start_hm in starts:
+        return target_start_hm
+    return starts[0] if starts else target_start_hm
+
+
+def _format_simple_slot_correction_fr(
+    place: Place,
+    val_res: ValidationResult,
+    sug_date: date,
+    sug_start_hm: str,
+    orig_date: date,
+) -> str:
+    same_day = sug_date == orig_date
+    prefix = (
+        f"Déplacé à {sug_start_hm}"
+        if same_day
+        else f"Déplacé au {_format_date_fr(sug_date)} à {sug_start_hm}"
+    )
+    if val_res.reason_code == "OUTSIDE_OPENING_HOURS":
+        open_hm = _extract_opening_start_hm(place, sug_start_hm)
+        noun = _place_noun_fr(place)
+        return f"{prefix} car {noun} ouvre à {open_hm}"
+    if val_res.reason_code == "OUTSIDE_TRIP_WINDOW":
+        phase = str((val_res.conflict_details or {}).get("violation_phase", ""))
+        if phase in {"DEPARTURE_BUFFER", "AFTER_DEPARTURE"}:
+            return f"{prefix} pour tenir compte du départ du vol retour"
+        return f"{prefix} pour tenir compte de l'arrivée du vol"
+    if val_res.reason_code == "OVERLAPPING_VISIT":
+        return f"{prefix} car un autre lieu est déjà prévu sur ce créneau"
+    return f"{prefix} pour laisser le temps de trajet"
+
+
 @router.post("/trip/{trip_id}/ai-generate", response_model=AIGenerateItineraryDraftResponse)
 async def generate_ai_itinerary_draft(
     trip_id: str,
@@ -676,8 +753,9 @@ async def generate_ai_itinerary_draft(
     Génère un brouillon de programme par IA (non enregistré en base et non synchronisé à Google Calendar) :
     - 3 champs de formulaire (budget, rythme, goûts <= 4 champs),
     - JSON validé par Pydantic avec 2 tentatives maximum,
-    - Filtre strictement les lieux existants en base pour la destination,
-    - Passe chaque créneau dans le moteur de validation (correction ou retrait avec message clair),
+    - Filtre strictement les lieux existants en base pour la destination, sans doublon de lieu,
+    - Ne propose jamais un lieu en plein air un jour d'orage ou de pluie (sauf demande explicite),
+    - Corrige ou retire les créneaux invalides avec une phrase simple en français sans jargon,
     - Intègre la météo et l'optimisation des temps de trajet.
     """
     registry = get_provider_registry()
@@ -718,6 +796,13 @@ async def generate_ai_itinerary_draft(
     )
     weather_by_date = {w.date: w.model_dump() for w in weather_days}
 
+    def _is_rain_or_storm_date(d_iso: str) -> bool:
+        w = weather_by_date.get(d_iso, {})
+        if not w or not w.get("available", True):
+            return False
+        cond = str(w.get("condition_code", "")).upper()
+        return bool(w.get("is_rainy", False)) or cond in {"RAIN", "STORM", "THUNDERSTORM"}
+
     max_attempts = 2
     parsed_plan: AIModelRawPlanSchema | None = None
     last_validation_error: str | None = None
@@ -726,16 +811,29 @@ async def generate_ai_itinerary_draft(
     for attempt in range(1, max_attempts + 1):
         attempts_used = attempt
         try:
-            raw_output = await registry.ai.generate_structured_itinerary_raw(
-                city_name=destination.city_name,
-                trip_dates=trip_dates,
-                budget_eur=payload.budget_eur,
-                pace=payload.pace,
-                tastes=payload.tastes,
-                available_places=available_places_dicts,
-                weather_by_date=weather_by_date,
-                attempt=attempt,
-            )
+            try:
+                raw_output = await registry.ai.generate_structured_itinerary_raw(
+                    city_name=destination.city_name,
+                    trip_dates=trip_dates,
+                    budget_eur=payload.budget_eur,
+                    pace=payload.pace,
+                    tastes=payload.tastes,
+                    available_places=available_places_dicts,
+                    weather_by_date=weather_by_date,
+                    attempt=attempt,
+                    allow_outdoor_in_rain=payload.allow_outdoor_in_rain,
+                )
+            except TypeError:
+                raw_output = await registry.ai.generate_structured_itinerary_raw(
+                    city_name=destination.city_name,
+                    trip_dates=trip_dates,
+                    budget_eur=payload.budget_eur,
+                    pace=payload.pace,
+                    tastes=payload.tastes,
+                    available_places=available_places_dicts,
+                    weather_by_date=weather_by_date,
+                    attempt=attempt,
+                )
             if isinstance(raw_output, str):
                 parsed_plan = AIModelRawPlanSchema.model_validate_json(raw_output)
             elif isinstance(raw_output, dict):
@@ -764,6 +862,7 @@ async def generate_ai_itinerary_draft(
     adjustments_fr: list[str] = []
     draft_snapshots: list[ScheduledVisitSnapshot] = []
     accepted_slots: list[dict[str, Any]] = []
+    used_place_ids: set[str] = set()
 
     trip_arr_utc = ensure_utc(trip.arrival_at) if trip.arrival_at else None
     trip_dep_utc = ensure_utc(trip.departure_at) if trip.departure_at else None
@@ -776,44 +875,32 @@ async def generate_ai_itinerary_draft(
             )
             continue
 
+        # Règle anti-doublon : ne jamais répéter un même lieu plus d'une fois
+        if place.id in used_place_ids:
+            continue
+
         dur_min = int(raw_slot.duration_minutes or place.recommended_duration_min or 90)
         transit_mode = normalize_transit_mode(raw_slot.transit_mode)
-        req_start_utc, req_end_utc = parse_local_slot_to_utc(
-            visit_date=raw_slot.visit_date,
-            local_start_time_str=raw_slot.local_start_time,
-            duration_minutes=dur_min,
-            timezone_name=dest_tz,
-        )
+        raw_date_iso = raw_slot.visit_date.isoformat()
 
         weather_adapted = False
         adjustment_note: str | None = None
-
-        val_res = _validate_slot(
-            requested_start_utc=req_start_utc,
-            duration_minutes=dur_min,
-            destination_timezone=dest_tz,
-            place_id=place.id,
-            place_name=place.name,
-            place_latitude=place.latitude,
-            place_longitude=place.longitude,
-            place_opening_hours=place.opening_hours or {},
-            trip_arrival_utc=trip_arr_utc,
-            trip_departure_utc=trip_dep_utc,
-            existing_items=draft_snapshots,
-            transit_mode=transit_mode,
-        )
-
-        chosen_start_utc = req_start_utc
-        chosen_end_utc = req_end_utc
         validation_status: str = "VALID"
 
-        if not val_res.valid:
-            corrected = False
-            for sug in val_res.suggested_slots:
-                sug_start_utc = ensure_utc(sug.start_at_utc)
-                sug_end_utc = ensure_utc(sug.end_at_utc)
-                recheck = _validate_slot(
-                    requested_start_utc=sug_start_utc,
+        # Règle météo stricte : ne jamais proposer un lieu en plein air un jour d'orage ou de pluie
+        # (sauf si l'utilisateur l'a demandé via allow_outdoor_in_rain=True)
+        if place.is_outdoor and not payload.allow_outdoor_in_rain and _is_rain_or_storm_date(raw_date_iso):
+            moved_to_dry = False
+            dry_dates = [d for d in trip_dates if not _is_rain_or_storm_date(d.isoformat())]
+            for dry_d in dry_dates:
+                cand_s_utc, cand_e_utc = parse_local_slot_to_utc(
+                    visit_date=dry_d,
+                    local_start_time_str=raw_slot.local_start_time,
+                    duration_minutes=dur_min,
+                    timezone_name=dest_tz,
+                )
+                dry_val = _validate_slot(
+                    requested_start_utc=cand_s_utc,
                     duration_minutes=dur_min,
                     destination_timezone=dest_tz,
                     place_id=place.id,
@@ -826,33 +913,162 @@ async def generate_ai_itinerary_draft(
                     existing_items=draft_snapshots,
                     transit_mode=transit_mode,
                 )
-                if recheck.valid:
-                    chosen_start_utc = sug_start_utc
-                    chosen_end_utc = sug_end_utc
+                if dry_val.valid:
+                    chosen_start_utc = cand_s_utc
+                    chosen_end_utc = cand_e_utc
                     validation_status = "CORRECTED"
+                    weather_adapted = True
                     adjustment_note = (
-                        f"Créneau initial ({raw_slot.visit_date.isoformat()} {raw_slot.local_start_time}) "
-                        f"refusé pour « {place.name} » ({val_res.message}) → "
-                        f"corrigé vers {sug.local_date} à {sug.local_start_time}."
+                        f"Déplacé au {_format_date_fr(dry_d)} à {raw_slot.local_start_time} "
+                        "en raison de la pluie ou de l'orage prévu"
                     )
-                    adjustments_fr.append(adjustment_note)
-                    corrected = True
+                    adjustments_fr.append(f"{place.name} : {adjustment_note}")
+                    moved_to_dry = True
+                    break
+                for sug in dry_val.suggested_slots:
+                    if _is_rain_or_storm_date(sug.local_date):
+                        continue
+                    sug_s_utc = ensure_utc(sug.start_at_utc)
+                    sug_e_utc = ensure_utc(sug.end_at_utc)
+                    recheck_dry = _validate_slot(
+                        requested_start_utc=sug_s_utc,
+                        duration_minutes=dur_min,
+                        destination_timezone=dest_tz,
+                        place_id=place.id,
+                        place_name=place.name,
+                        place_latitude=place.latitude,
+                        place_longitude=place.longitude,
+                        place_opening_hours=place.opening_hours or {},
+                        trip_arrival_utc=trip_arr_utc,
+                        trip_departure_utc=trip_dep_utc,
+                        existing_items=draft_snapshots,
+                        transit_mode=transit_mode,
+                    )
+                    if recheck_dry.valid:
+                        chosen_start_utc = sug_s_utc
+                        chosen_end_utc = sug_e_utc
+                        validation_status = "CORRECTED"
+                        weather_adapted = True
+                        sug_d = date.fromisoformat(sug.local_date)
+                        adjustment_note = (
+                            f"Déplacé au {_format_date_fr(sug_d)} à {sug.local_start_time} "
+                            "en raison de la pluie ou de l'orage prévu"
+                        )
+                        adjustments_fr.append(f"{place.name} : {adjustment_note}")
+                        moved_to_dry = True
+                        break
+                if moved_to_dry:
                     break
 
-            if not corrected:
+            if not moved_to_dry:
                 adjustments_fr.append(
-                    f"Créneau ({raw_slot.visit_date.isoformat()} {raw_slot.local_start_time}) "
-                    f"refusé et retiré pour « {place.name} » : {val_res.message}"
+                    f"« {place.name} » retiré car lieu en plein air un jour d'orage ou de pluie."
                 )
                 continue
+        else:
+            req_start_utc, req_end_utc = parse_local_slot_to_utc(
+                visit_date=raw_slot.visit_date,
+                local_start_time_str=raw_slot.local_start_time,
+                duration_minutes=dur_min,
+                timezone_name=dest_tz,
+            )
+
+            val_res = _validate_slot(
+                requested_start_utc=req_start_utc,
+                duration_minutes=dur_min,
+                destination_timezone=dest_tz,
+                place_id=place.id,
+                place_name=place.name,
+                place_latitude=place.latitude,
+                place_longitude=place.longitude,
+                place_opening_hours=place.opening_hours or {},
+                trip_arrival_utc=trip_arr_utc,
+                trip_departure_utc=trip_dep_utc,
+                existing_items=draft_snapshots,
+                transit_mode=transit_mode,
+            )
+
+            chosen_start_utc = req_start_utc
+            chosen_end_utc = req_end_utc
+
+            if not val_res.valid:
+                corrected = False
+                candidate_suggestions = list(val_res.suggested_slots)
+                if place.is_outdoor and not payload.allow_outdoor_in_rain:
+                    extra_sugs = ItineraryValidationEngine.suggest_free_slots(
+                        trip_arrival_utc=trip_arr_utc,
+                        trip_departure_utc=trip_dep_utc,
+                        destination_tz_name=dest_tz,
+                        place_id=place.id,
+                        place_name=place.name,
+                        place_lat=place.latitude,
+                        place_lng=place.longitude,
+                        place_opening_hours=place.opening_hours or {},
+                        preferred_start_utc=req_start_utc,
+                        duration_minutes=dur_min,
+                        transit_mode=transit_mode,
+                        existing_visits=draft_snapshots,
+                        max_suggestions=12,
+                    )
+                    seen_starts = {s.start_at_utc for s in candidate_suggestions}
+                    for es in extra_sugs:
+                        if es.start_at_utc not in seen_starts:
+                            candidate_suggestions.append(es)
+
+                for sug in candidate_suggestions:
+                    if place.is_outdoor and not payload.allow_outdoor_in_rain and _is_rain_or_storm_date(sug.local_date):
+                        continue
+                    sug_start_utc = ensure_utc(sug.start_at_utc)
+                    sug_end_utc = ensure_utc(sug.end_at_utc)
+                    recheck = _validate_slot(
+                        requested_start_utc=sug_start_utc,
+                        duration_minutes=dur_min,
+                        destination_timezone=dest_tz,
+                        place_id=place.id,
+                        place_name=place.name,
+                        place_latitude=place.latitude,
+                        place_longitude=place.longitude,
+                        place_opening_hours=place.opening_hours or {},
+                        trip_arrival_utc=trip_arr_utc,
+                        trip_departure_utc=trip_dep_utc,
+                        existing_items=draft_snapshots,
+                        transit_mode=transit_mode,
+                    )
+                    if recheck.valid:
+                        chosen_start_utc = sug_start_utc
+                        chosen_end_utc = sug_end_utc
+                        validation_status = "CORRECTED"
+                        sug_d = date.fromisoformat(sug.local_date)
+                        adjustment_note = _format_simple_slot_correction_fr(
+                            place=place,
+                            val_res=val_res,
+                            sug_date=sug_d,
+                            sug_start_hm=sug.local_start_time,
+                            orig_date=raw_slot.visit_date,
+                        )
+                        adjustments_fr.append(f"{place.name} : {adjustment_note}")
+                        corrected = True
+                        break
+
+                if not corrected:
+                    adjustments_fr.append(
+                        f"Créneau non disponible pour « {place.name} » à {raw_slot.local_start_time} (retiré)."
+                    )
+                    continue
 
         loc_s = to_destination_local(chosen_start_utc, dest_tz)
         loc_e = to_destination_local(chosen_end_utc, dest_tz)
         final_date_str = loc_s.strftime("%Y-%m-%d")
+
+        # Garde-fou final : aucun lieu en plein air un jour d'orage ou de pluie
+        if place.is_outdoor and not payload.allow_outdoor_in_rain and _is_rain_or_storm_date(final_date_str):
+            continue
+
         final_day_w = weather_by_date.get(final_date_str, {})
-        if final_day_w.get("available", True) and final_day_w.get("is_rainy") and not place.is_outdoor:
+        if final_day_w.get("available", True) and _is_rain_or_storm_date(final_date_str) and not place.is_outdoor:
             weather_adapted = True
 
+        used_place_ids.add(place.id)
         draft_snapshots.append(
             ScheduledVisitSnapshot(
                 item_id=f"draft-{idx}",
@@ -880,6 +1096,15 @@ async def generate_ai_itinerary_draft(
                 "weather_adapted": weather_adapted,
             }
         )
+
+    visits_per_day = {"RELAX": 1, "NORMAL": 2, "INTENSE": 3}.get((payload.pace or "NORMAL").upper(), 2)
+    target_days_count = max(1, min(len(trip_dates), 5))
+    desired_slots_count = target_days_count * visits_per_day
+    limited_places_notice_fr: str | None = None
+    if len(db_places) < desired_slots_count or len(accepted_slots) < desired_slots_count:
+        limited_places_notice_fr = f"Peu de lieux disponibles à {destination.city_name} pour l'instant"
+        if limited_places_notice_fr not in adjustments_fr:
+            adjustments_fr.append(limited_places_notice_fr)
 
     accepted_slots.sort(key=lambda x: x["start_utc"])
     prev_by_day: dict[str, Place] = {}
@@ -916,6 +1141,8 @@ async def generate_ai_itinerary_draft(
         prev_by_day[d_str] = p
         cost_val = float(p.estimated_cost or 0.0)
         total_cost_eur += cost_val
+        v_date_obj = entry["loc_s"].date()
+        transit_label_fr = f"Trajet : ~{from_prev_min} min" if from_prev_min > 0 else None
 
         draft_items.append(
             AIDraftSlotSchema(
@@ -923,7 +1150,8 @@ async def generate_ai_itinerary_draft(
                 place_name=p.name,
                 place_category=p.category,
                 is_outdoor=bool(p.is_outdoor),
-                visit_date=entry["loc_s"].date(),
+                visit_date=v_date_obj,
+                visit_date_label_fr=_format_date_fr(v_date_obj),
                 local_start_time=entry["loc_s"].strftime("%H:%M"),
                 local_end_time=entry["loc_e"].strftime("%H:%M"),
                 start_at=entry["start_utc"],
@@ -935,6 +1163,7 @@ async def generate_ai_itinerary_draft(
                 transit_distance_from_prev_m=from_prev_m,
                 transit_time_source=t_source,
                 transit_source_label=t_label,
+                transit_label_fr=transit_label_fr,
                 weather_summary=entry["weather_summary"],
                 weather_adapted=entry["weather_adapted"],
                 validation_status=entry["validation_status"],
@@ -958,6 +1187,7 @@ async def generate_ai_itinerary_draft(
         total_estimated_cost_eur=round(total_cost_eur, 2),
         total_transit_minutes=total_transit_min,
         routing_source_label="Temps réel" if any_real_source else "Temps estimé",
+        limited_places_notice_fr=limited_places_notice_fr,
         adjustments_fr=adjustments_fr,
         draft_items=draft_items,
     )

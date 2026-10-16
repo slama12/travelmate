@@ -285,6 +285,7 @@ export interface AIDraftSlot {
   place_category: string;
   is_outdoor: boolean;
   visit_date: string;
+  visit_date_label_fr?: string;
   local_start_time: string;
   local_end_time: string;
   duration_minutes: number;
@@ -294,6 +295,7 @@ export interface AIDraftSlot {
   transit_distance_from_prev_m: number;
   transit_time_source: string;
   transit_source_label: string;
+  transit_label_fr?: string | null;
   weather_summary: string;
   weather_adapted: boolean;
   validation_status: "VALID" | "CORRECTED";
@@ -316,6 +318,7 @@ export interface AIGenerateDraftPayload {
   total_estimated_cost_eur: number;
   total_transit_minutes: number;
   routing_source_label: string;
+  limited_places_notice_fr?: string | null;
   adjustments_fr: string[];
   draft_items: AIDraftSlot[];
 }
@@ -2483,13 +2486,22 @@ export function ItineraryScreen({
             </div>
           </div>
 
+          {aiDraft.limited_places_notice_fr && (
+            <div
+              className="rounded-card bg-white border border-amber-300 px-3.5 py-2.5 text-caption font-medium text-ink"
+              data-testid="ai-draft-limited-places-notice"
+            >
+              {aiDraft.limited_places_notice_fr}
+            </div>
+          )}
+
           {aiDraft.adjustments_fr?.length > 0 && (
             <div
               className="rounded-card bg-white border border-border p-3.5 space-y-1"
               data-testid="ai-draft-adjustments"
             >
               <div className="text-caption font-semibold text-ink">
-                Vérifications automatiques du moteur de validation :
+                Ajustements pour votre confort :
               </div>
               {aiDraft.adjustments_fr.map((note, idx) => (
                 <div key={idx} className="text-caption text-ink-secondary">
@@ -2507,12 +2519,16 @@ export function ItineraryScreen({
                 className="rounded-card bg-white border border-border p-3.5 space-y-1.5 shadow-soft"
               >
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-caption font-semibold text-brand-800">
-                    {slot.visit_date} • {slot.local_start_time} → {slot.local_end_time}
+                  <span className="text-caption font-semibold text-brand-800 capitalize">
+                    {slot.visit_date_label_fr || formatFullDateHuman(slot.visit_date)} •{" "}
+                    {slot.local_start_time} → {slot.local_end_time}
                   </span>
-                  <Badge>
-                    {slot.transit_from_prev_min} min ({slot.transit_source_label})
-                  </Badge>
+                  {slot.transit_from_prev_min > 0 && (
+                    <Badge data-testid={`ai-draft-slot-transit-${idx}`}>
+                      {slot.transit_label_fr ||
+                        `Trajet : ~${slot.transit_from_prev_min} min`}
+                    </Badge>
+                  )}
                 </div>
                 <div className="text-body font-semibold text-ink">
                   {slot.place_name}
@@ -2525,6 +2541,14 @@ export function ItineraryScreen({
                     <Badge variant="success">Adapté à la météo</Badge>
                   )}
                 </div>
+                {slot.adjustment_note_fr && (
+                  <div
+                    className="text-caption font-medium text-brand-800 bg-brand-50 rounded-md px-2.5 py-1 border border-brand-200"
+                    data-testid={`ai-draft-slot-adjustment-${idx}`}
+                  >
+                    {slot.adjustment_note_fr}
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -2640,8 +2664,8 @@ export function ItineraryScreen({
                     className="inline-flex items-center gap-2 rounded-card bg-white border border-brand-300 px-3.5 py-2 text-caption font-semibold text-brand-800 shadow-soft hover:bg-brand-50 transition-colors"
                   >
                     <CalendarIcon className="h-3.5 w-3.5 text-brand-700" />
-                    <span>
-                      {slot.local_date} • {slot.local_start_time} → {slot.local_end_time}
+                    <span className="capitalize">
+                      {formatFullDateHuman(slot.local_date)} • {slot.local_start_time} → {slot.local_end_time}
                     </span>
                   </button>
                 ))}

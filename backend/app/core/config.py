@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     WEATHER_PROVIDER_MODE: ProviderMode = Field(default="simulated")
     WEATHER_API_KEY: str = Field(default="")
     WEATHER_BASE_URL: str = Field(default="https://api.openweathermap.org/data/2.5")
-    WEATHER_FORECAST_HORIZON_DAYS: int = Field(default=90, ge=1)
+    WEATHER_FORECAST_HORIZON_DAYS: int = Field(default=180, ge=1)
 
     AI_PROVIDER_MODE: ProviderMode = Field(default="simulated")
     AI_API_KEY: str = Field(default="")

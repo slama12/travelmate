@@ -326,7 +326,7 @@ class ItineraryValidationEngine:
                 reason_code="OUTSIDE_TRIP_WINDOW",
                 message=(
                     f"Visite refusée : le créneau demandé ({local_start.strftime('%d/%m/%Y %H:%M')} -> "
-                    f"{local_end.strftime('%d/%m/%Y %H:%M')}, fuseau {destination_tz_name}) sort de la période "
+                    f"{local_end.strftime('%d/%m/%Y %H:%M')}) sort de la période "
                     f"du séjour ({local_eff_arr.strftime('%d/%m/%Y %H:%M')} -> {local_eff_dep.strftime('%d/%m/%Y %H:%M')}) : "
                     f"{phase_reason}."
                 ),
@@ -366,8 +366,8 @@ class ItineraryValidationEngine:
                 valid=False,
                 reason_code="OUTSIDE_OPENING_HOURS",
                 message=(
-                    f"Visite refusée : « {place_name} » est ouvert de {hours_label.replace('-', ' à ')} "
-                    f"(heure locale {destination_tz_name}), alors que le créneau demandé est "
+                    f"Visite refusée : « {place_name} » est ouvert de {hours_label.replace('-', ' à ')}, "
+                    f"alors que le créneau demandé est "
                     f"{local_start.strftime('%H:%M')} à {local_end.strftime('%H:%M')}."
                 ),
                 conflict_details={
@@ -598,7 +598,7 @@ class ItineraryValidationEngine:
                             timezone=destination_tz_name,
                             label=(
                                 f"{loc_s.strftime('%d/%m/%Y')} de {loc_s.strftime('%H:%M')} "
-                                f"à {loc_e.strftime('%H:%M')} ({destination_tz_name})"
+                                f"à {loc_e.strftime('%H:%M')}"
                             ),
                         )
                     )

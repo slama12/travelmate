@@ -156,6 +156,7 @@ class BaseAIProvider(BaseServiceProvider, ABC):
         available_places: list[dict[str, Any]],
         weather_by_date: dict[str, dict[str, Any]],
         attempt: int = 1,
+        allow_outdoor_in_rain: bool = False,
     ) -> str | dict[str, Any]:
         """Retourne un JSON (str ou dict) d'itinéraire structuré validable par Pydantic."""
 

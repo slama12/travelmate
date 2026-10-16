@@ -108,6 +108,10 @@ class AIGenerateItineraryRequest(BaseModel):
         max_length=4,
         description="Goûts parmi CULTURE, NATURE, FOOD, NUIT",
     )
+    allow_outdoor_in_rain: bool = Field(
+        default=False,
+        description="Autoriser les lieux en plein air un jour d'orage ou de pluie si demandé explicitement",
+    )
 
 
 class AIDraftSlotSchema(BaseModel):
@@ -116,6 +120,7 @@ class AIDraftSlotSchema(BaseModel):
     place_category: str
     is_outdoor: bool
     visit_date: date
+    visit_date_label_fr: str = ""
     local_start_time: str
     local_end_time: str
     start_at: datetime
@@ -127,6 +132,7 @@ class AIDraftSlotSchema(BaseModel):
     transit_distance_from_prev_m: int = 0
     transit_time_source: str = "ESTIMATED"
     transit_source_label: str = "Temps estimé"
+    transit_label_fr: str | None = None
     weather_summary: str = ""
     weather_adapted: bool = False
     validation_status: Literal["VALID", "CORRECTED"] = "VALID"
@@ -149,6 +155,7 @@ class AIGenerateItineraryDraftResponse(BaseModel):
     total_estimated_cost_eur: float
     total_transit_minutes: int
     routing_source_label: str
+    limited_places_notice_fr: str | None = None
     adjustments_fr: list[str]
     draft_items: list[AIDraftSlotSchema]
 

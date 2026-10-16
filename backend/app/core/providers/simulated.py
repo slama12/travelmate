@@ -554,13 +554,14 @@ class SimulatedAIProvider(BaseAIProvider):
         available_places: list[dict[str, Any]],
         weather_by_date: dict[str, dict[str, Any]],
         attempt: int = 1,
+        allow_outdoor_in_rain: bool = False,
     ) -> str:
         """
         Génère de manière déterministe et réaliste un JSON d'itinéraire tenant compte :
-        - des lieux réellement présents en base (available_places),
+        - des lieux réellement présents en base (available_places), sans aucun doublon de lieu,
         - des goûts (CULTURE, NATURE, FOOD/RESTAURANT, NIGHTLIFE),
         - du rythme (RELAX=1/j, NORMAL=2/j, INTENSE=3/j),
-        - de la météo (lieux intérieurs les jours de pluie, extérieurs les jours secs),
+        - de la météo (aucun lieu en plein air un jour de pluie ou d'orage sauf demande explicite),
         - du regroupement géographique au plus proche voisin.
         """
         normalized_pace = (pace or "NORMAL").strip().upper()
@@ -602,23 +603,30 @@ class SimulatedAIProvider(BaseAIProvider):
         for day_idx, current_date in enumerate(target_dates):
             date_iso = current_date.isoformat()
             day_weather = weather_by_date.get(date_iso, {})
-            is_rainy_day = bool(day_weather.get("is_rainy", False))
+            cond_code = str(day_weather.get("condition_code", "")).upper()
+            is_rainy_day = (
+                bool(day_weather.get("is_rainy", False))
+                or cond_code in {"RAIN", "STORM", "THUNDERSTORM"}
+            )
 
-            # Choix des candidats du jour selon la météo (intérieur privilégié sous la pluie)
+            # Choix des candidats du jour selon la météo :
+            # - Jour de pluie ou d'orage : jamais de lieu en plein air (sauf allow_outdoor_in_rain=True)
+            # - Jour sec : priorité aux lieux en plein air puis lieux en intérieur
+            # - Jamais de doublon de lieu sur l'ensemble du séjour
             day_places: list[dict[str, Any]] = []
-            primary_pool = indoor_queue if is_rainy_day else (outdoor_queue + indoor_queue)
-            secondary_pool = outdoor_queue if is_rainy_day else indoor_queue
+            if is_rainy_day and not allow_outdoor_in_rain:
+                candidate_pools: tuple[list[dict[str, Any]], ...] = (indoor_queue,)
+            elif is_rainy_day and allow_outdoor_in_rain:
+                candidate_pools = (indoor_queue, outdoor_queue)
+            else:
+                candidate_pools = (outdoor_queue, indoor_queue)
 
-            for pool in (primary_pool, secondary_pool, ordered_places):
+            for pool in candidate_pools:
                 for candidate in pool:
                     pid = str(candidate["id"])
                     if pid not in used_place_ids and len(day_places) < visits_per_day:
                         day_places.append(candidate)
                         used_place_ids.add(pid)
-
-            # Si tous les lieux ont déjà été visités sur un long séjour, on autorise à revisiter
-            if not day_places and ordered_places:
-                day_places.append(ordered_places[day_idx % len(ordered_places)])
 
             # Ordre au plus proche voisin pour minimiser les trajets du jour
             if len(day_places) > 1:
@@ -642,14 +650,14 @@ class SimulatedAIProvider(BaseAIProvider):
             for slot_idx, p in enumerate(day_places):
                 cat = str(p.get("category", "")).upper()
                 if cat == "RESTAURANT":
-                    start_hm = "12:30" if slot_idx == 0 and day_idx > 0 else "19:30"
+                    start_hm = "12:30" if slot_idx == 0 and day_idx > 0 else "18:00"
                 elif day_idx == 0 and slot_idx == 0:
                     start_hm = "14:00"
                 else:
                     start_hm = default_times[min(slot_idx, len(default_times) - 1)]
 
                 weather_note = (
-                    "Lieu en intérieur privilégié en raison de la pluie prévue"
+                    "Lieu en intérieur privilégié en raison de la pluie ou de l'orage prévu"
                     if is_rainy_day and not p.get("is_outdoor", False)
                     else "Créneau optimisé par proximité géographique"
                 )

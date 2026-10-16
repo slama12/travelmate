@@ -256,6 +256,7 @@ class RealAIProvider(BaseAIProvider):
         available_places: list[dict[str, Any]],
         weather_by_date: dict[str, dict[str, Any]],
         attempt: int = 1,
+        allow_outdoor_in_rain: bool = False,
     ) -> str | dict[str, Any]:
         if not self.has_credentials():
             raise RuntimeError("AI_API_KEY manquant dans .env pour RealAIProvider.")
@@ -268,6 +269,7 @@ class RealAIProvider(BaseAIProvider):
             available_places=available_places,
             weather_by_date=weather_by_date,
             attempt=attempt,
+            allow_outdoor_in_rain=allow_outdoor_in_rain,
         )
 
     async def generate_chat_reply(

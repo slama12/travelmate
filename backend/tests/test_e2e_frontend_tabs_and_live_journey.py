@@ -707,6 +707,8 @@ def test_envoi_b_design_system_routes_and_zero_jargon() -> None:
         "UTC",
         "latitude",
         "longitude",
+        "moteur de validation",
+        "Africa/Casablanca",
     )
     for route_key, page_payload in pages.items():
         visible_text = page_payload["visible_text"]
@@ -742,6 +744,7 @@ def test_envoi_b_design_system_routes_and_zero_jargon() -> None:
         "Testeur Villes du Monde",
         "Post-Commit",
         "PWA • ÉTAPE 3",
+        "moteur de validation",
     ):
         assert forbidden_in_bundle not in built_js
         assert forbidden_in_bundle not in app_tsx
