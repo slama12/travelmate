@@ -440,16 +440,16 @@ const FALLBACK_PLACE_IMAGE =
 
 export function formatDayPillHuman(dateStr: string, index: number): string {
   try {
-    const formatted = format(parseISO(dateStr), "EEE d MMM", { locale: fr });
+    const formatted = format(parseISO(dateStr), "EEE d MMM", { locale: fr }).toLowerCase();
     return `Jour ${index + 1} · ${formatted}`;
   } catch {
-    return `Jour ${index + 1} · ${dateStr}`;
+    return `Jour ${index + 1}`;
   }
 }
 
 export function formatFullDateHuman(dateStr: string): string {
   try {
-    return format(parseISO(dateStr), "EEEE d MMMM yyyy", { locale: fr });
+    return format(parseISO(dateStr), "EEEE d MMMM", { locale: fr }).toLowerCase();
   } catch {
     return dateStr;
   }
@@ -502,7 +502,8 @@ export function normalizeSchedulePayload(raw: any): TripItinerarySchedule {
 export function buildTripDayDates(
   schedule: TripItinerarySchedule | null,
   fallbackStart: string = "2026-11-10",
-  fallbackEnd: string = "2026-11-18"
+  fallbackEnd: string = "2026-11-17",
+  extraDates: string[] = []
 ): string[] {
   const startStr = schedule?.local_arrival_at
     ? schedule.local_arrival_at.slice(0, 10)
@@ -524,6 +525,11 @@ export function buildTripDayDates(
   for (const d of schedule?.days || []) {
     if (d.visit_date && !dates.includes(d.visit_date)) {
       dates.push(d.visit_date);
+    }
+  }
+  for (const extra of extraDates) {
+    if (extra && !dates.includes(extra)) {
+      dates.push(extra);
     }
   }
   return dates.sort();
@@ -1292,7 +1298,7 @@ export function ActivitiesScreen({
       const created: ItineraryItemView = await resp.json();
       notify({
         title: "Visite ajoutée à votre programme",
-        description: `${created.place_name} le ${created.local_visit_date} à ${created.local_start_time}.`,
+        description: `${created.place_name} le ${formatFullDateHuman(created.local_visit_date)} à ${created.local_start_time}.`,
         tone: "success",
       });
       setAddPanelPlace(null);
@@ -1365,7 +1371,7 @@ export function ActivitiesScreen({
       </div>
 
       {/* Filtres sobres par catégorie */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1">
+      <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pb-1">
         {[
           { value: "ALL", label: "Tout voir" },
           { value: "CULTURE", label: "Culture & Patrimoine" },
@@ -1524,7 +1530,7 @@ export function ActivitiesScreen({
               />
               {tripDays.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1.5">
-                  {tripDays.slice(0, 5).map((d, i) => (
+                  {tripDays.map((d, i) => (
                     <button
                       key={d}
                       type="button"
@@ -1598,7 +1604,7 @@ export function ActivitiesScreen({
                           }}
                           className="rounded-md bg-white border border-brand-300 px-2.5 py-1.5 text-caption font-medium text-brand-800 hover:bg-brand-50 transition-colors"
                         >
-                          {slot.local_date} • {slot.local_start_time} →{" "}
+                          {formatFullDateHuman(slot.local_date)} • {slot.local_start_time} →{" "}
                           {slot.local_end_time}
                         </button>
                       ))}
@@ -1868,7 +1874,15 @@ export function ItineraryScreen({
     }
   }, [places, selectedPlaceId]);
 
-  const tripDays = useMemo(() => buildTripDayDates(schedule), [schedule]);
+  const tripDays = useMemo(() => {
+    const fallbackStart = trip?.arrival_at ? trip.arrival_at.slice(0, 10) : "2026-11-10";
+    const fallbackEnd = trip?.departure_at ? trip.departure_at.slice(0, 10) : "2026-11-17";
+    const extraDates = [
+      ...(weatherData?.days?.map((d) => d.date) || []),
+      ...(aiDraft?.draft_items?.map((s) => s.visit_date) || []),
+    ];
+    return buildTripDayDates(schedule, fallbackStart, fallbackEnd, extraDates);
+  }, [schedule, trip?.arrival_at, trip?.departure_at, weatherData, aiDraft]);
 
   const weatherByDate = useMemo(() => {
     const map: Record<string, DailyWeatherForecast> = {};
@@ -1972,7 +1986,7 @@ export function ItineraryScreen({
     await refreshSchedule();
     notify({
       title: "Visite planifiée",
-      description: `${created.place_name} le ${created.local_visit_date} à ${created.local_start_time}.`,
+      description: `${created.place_name} le ${formatFullDateHuman(created.local_visit_date)} à ${created.local_start_time}.`,
       tone: "success",
     });
     return true;
@@ -2063,7 +2077,7 @@ export function ItineraryScreen({
         await refreshSchedule();
         notify({
           title: "Visite adaptée à la météo",
-          description: `${opt.replacement_place_name} planifié le ${opt.visit_date} à ${opt.local_start_time}.`,
+          description: `${opt.replacement_place_name} planifié le ${formatFullDateHuman(opt.visit_date)} à ${opt.local_start_time}.`,
           tone: "success",
         });
       }
@@ -2374,12 +2388,12 @@ export function ItineraryScreen({
 
   return (
     <div
-      className="mx-auto max-w-4xl px-4 py-8 space-y-6 pb-24"
+      className="mx-auto max-w-6xl px-4 py-6 space-y-5 pb-24"
       data-testid="itinerary-screen"
     >
       {/* En-tête Mon programme */}
-      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
-        <div>
+      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
+        <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2 mb-2">
             <Badge variant="brand">
               Agenda jour par jour • {cityLabel}
@@ -2394,11 +2408,12 @@ export function ItineraryScreen({
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 shrink-0">
           <Button
             type="button"
             variant="secondary"
             size="md"
+            className="whitespace-nowrap"
             data-testid="open-ai-generator-modal-btn"
             onClick={() => {
               setAiErrorMsg("");
@@ -2413,6 +2428,7 @@ export function ItineraryScreen({
             type="button"
             variant="secondary"
             size="md"
+            className="whitespace-nowrap"
             disabled={optimizing}
             data-testid="optimize-itinerary-btn"
             onClick={handlePreviewOptimization}
@@ -2425,7 +2441,9 @@ export function ItineraryScreen({
 
           <Button
             type="button"
+            variant="primary"
             size="md"
+            className="whitespace-nowrap"
             data-testid="open-schedule-visit-modal-btn"
             onClick={() => {
               setVisitDate(selectedDayDate || tripDays[0] || "2026-11-11");
@@ -2438,11 +2456,174 @@ export function ItineraryScreen({
         </div>
       </div>
 
+      {/* Puces horizontales des jours du séjour AVEC météo par jour (UN JOUR À LA FOIS) */}
+      <div
+        className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1"
+        role="tablist"
+        aria-label="Jours du séjour"
+        data-testid="itinerary-day-pills"
+      >
+        {tripDays.map((dayStr, index) => {
+          const isSelected = dayStr === selectedDayDate;
+          const countForDay =
+            schedule?.days.find((d) => d.visit_date === dayStr)?.items.length || 0;
+          const dayWeather = weatherByDate[dayStr];
+
+          return (
+            <button
+              key={dayStr}
+              type="button"
+              role="tab"
+              aria-selected={isSelected}
+              data-testid={`day-pill-${index}`}
+              onClick={() => setSelectedDayDate(dayStr)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                if (draggedVisit && draggedVisit.local_visit_date !== dayStr) {
+                  handleMoveOrUpdateVisit(
+                    draggedVisit,
+                    dayStr,
+                    draggedVisit.local_start_time
+                  );
+                  setDraggedVisit(null);
+                }
+              }}
+              className={`flex flex-1 min-w-[122px] flex-col items-start gap-1 rounded-card px-2.5 py-2 text-[12px] font-semibold whitespace-nowrap transition-all ${
+                isSelected
+                  ? "bg-brand-700 text-white shadow-soft"
+                  : "bg-canvas-card border border-border text-ink-secondary hover:text-ink"
+              }`}
+            >
+              <div className="flex items-center gap-1.5">
+                <span>{formatDayPillHuman(dayStr, index)}</span>
+                {countForDay > 0 && (
+                  <span
+                    className={`inline-flex h-4 min-w-[18px] items-center justify-center rounded-full px-1 text-[10px] font-bold ${
+                      isSelected
+                        ? "bg-white/20 text-white"
+                        : "bg-brand-50 text-brand-800"
+                    }`}
+                  >
+                    {countForDay}
+                  </span>
+                )}
+              </div>
+
+              <div
+                className={`inline-flex items-center gap-1 text-[11px] font-medium ${
+                  isSelected ? "text-white/90" : "text-ink-muted"
+                }`}
+                data-testid={`day-pill-weather-${index}`}
+              >
+                {renderWeatherIcon(dayWeather?.condition_code, isSelected)}
+                <span>
+                  {dayWeather ? dayWeather.badge_label : "Prévision non disponible"}
+                </span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Étape 4.1 — Alerte Pluie / Orage sur visite extérieure avec suggestion validée en 1 clic */}
+      {weatherData?.alerts && weatherData.alerts.length > 0 && (
+        <div className="space-y-3" data-testid="weather-alerts-container">
+          {weatherData.alerts.map((alert) => {
+            const shortAlertTitle = `${
+              alert.weather_condition_code === "STORM"
+                ? "Orage prévu le"
+                : "Pluie prévue le"
+            } ${formatFullDateHuman(alert.visit_date)}`;
+
+            return (
+              <Card
+                key={alert.item_id}
+                data-testid="weather-visit-alert-card"
+                className="p-3.5 border-amber-300 bg-feedback-warningBg space-y-2.5"
+              >
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                  <div className="space-y-0.5">
+                    <div
+                      className="inline-flex items-center gap-1.5 text-body font-semibold text-ink"
+                      data-testid="weather-alert-title"
+                    >
+                      <CloudRain className="h-4 w-4 text-feedback-warning shrink-0" />
+                      <span>{shortAlertTitle}</span>
+                    </div>
+                    <p
+                      className="text-caption text-ink-secondary"
+                      data-testid="weather-alert-message"
+                    >
+                      {alert.alert_message_fr}
+                    </p>
+                  </div>
+
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="sm"
+                    className="shrink-0 whitespace-nowrap bg-white"
+                    disabled={weatherActionLoadingId === alert.item_id}
+                    data-testid="weather-reject-alert-btn"
+                    onClick={() => handleRejectWeatherAlert(alert.item_id)}
+                  >
+                    Conserver ma visite
+                  </Button>
+                </div>
+
+                {alert.options.length > 0 && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {alert.options.slice(0, 2).map((opt, optIdx) => (
+                      <div
+                        key={opt.option_id}
+                        className="rounded-card bg-white border border-amber-200 p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 shadow-soft"
+                      >
+                        <div className="space-y-0.5 min-w-0">
+                          <div className="text-[11px] font-semibold text-brand-800">
+                            {opt.suggestion_type === "INDOOR_PLACE"
+                              ? "Option 1 • Lieu en intérieur"
+                              : "Option 2 • Autre créneau"}
+                          </div>
+                          <div className="text-caption font-semibold text-ink truncate">
+                            {opt.replacement_place_name}
+                          </div>
+                          <div className="text-[11px] text-ink-secondary">
+                            {formatFullDateHuman(opt.visit_date)} à {opt.local_start_time}
+                          </div>
+                        </div>
+
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="shrink-0 whitespace-nowrap"
+                          title={opt.label_fr}
+                          disabled={weatherActionLoadingId === alert.item_id}
+                          data-testid={`weather-accept-option-btn-${optIdx}`}
+                          onClick={() => handleAcceptWeatherOption(alert.item_id, opt)}
+                        >
+                          <CheckCircle2 className="h-4 w-4" />
+                          <span>
+                            {opt.suggestion_type === "INDOOR_PLACE"
+                              ? "Remplacer par ce lieu"
+                              : "Déplacer ma visite"}
+                          </span>
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
       {/* Étape 4.2 — Aperçu en brouillon de l'Itinéraire IA (non enregistré tant que non validé) */}
       {aiDraft && (
         <Card
           data-testid="ai-draft-preview-card"
-          className="p-6 border-brand-300 bg-brand-50/40 space-y-4"
+          className="p-5 border-brand-300 bg-brand-50/40 space-y-3.5"
         >
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="space-y-1">
@@ -2453,6 +2634,9 @@ export function ItineraryScreen({
                 <Badge variant="brand">
                   Trajets : {aiDraft.routing_source_label}
                 </Badge>
+                <Badge>
+                  {aiDraft.draft_items.length} visites sur {new Set(aiDraft.draft_items.map((s) => s.visit_date)).size} jours
+                </Badge>
               </div>
               <h2 className="text-h2 text-ink">
                 Proposition d'itinéraire sur mesure
@@ -2462,7 +2646,7 @@ export function ItineraryScreen({
               </p>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <Button
                 type="button"
                 variant="secondary"
@@ -2497,7 +2681,7 @@ export function ItineraryScreen({
 
           {aiDraft.adjustments_fr?.length > 0 && (
             <div
-              className="rounded-card bg-white border border-border p-3.5 space-y-1"
+              className="rounded-card bg-white border border-border p-3 space-y-0.5"
               data-testid="ai-draft-adjustments"
             >
               <div className="text-caption font-semibold text-ink">
@@ -2511,15 +2695,15 @@ export function ItineraryScreen({
             </div>
           )}
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
             {aiDraft.draft_items.map((slot, idx) => (
               <div
                 key={`${slot.place_id}-${idx}`}
                 data-testid={`ai-draft-slot-${idx}`}
-                className="rounded-card bg-white border border-border p-3.5 space-y-1.5 shadow-soft"
+                className="rounded-card bg-white border border-border p-3 space-y-1 shadow-soft"
               >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-caption font-semibold text-brand-800 capitalize">
+                <div className="flex items-center justify-between gap-1.5">
+                  <span className="text-[11px] font-semibold text-brand-800">
                     {slot.visit_date_label_fr || formatFullDateHuman(slot.visit_date)} •{" "}
                     {slot.local_start_time} → {slot.local_end_time}
                   </span>
@@ -2530,10 +2714,10 @@ export function ItineraryScreen({
                     </Badge>
                   )}
                 </div>
-                <div className="text-body font-semibold text-ink">
+                <div className="text-caption font-semibold text-ink">
                   {slot.place_name}
                 </div>
-                <div className="flex flex-wrap items-center gap-2 text-caption text-ink-secondary">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-ink-secondary">
                   <span>{slot.is_outdoor ? "En plein air" : "En intérieur"}</span>
                   <span>•</span>
                   <span>Météo : {slot.weather_summary}</span>
@@ -2543,7 +2727,7 @@ export function ItineraryScreen({
                 </div>
                 {slot.adjustment_note_fr && (
                   <div
-                    className="text-caption font-medium text-brand-800 bg-brand-50 rounded-md px-2.5 py-1 border border-brand-200"
+                    className="text-[11px] font-medium text-brand-800 bg-brand-50 rounded-md px-2 py-0.5 border border-brand-200"
                     data-testid={`ai-draft-slot-adjustment-${idx}`}
                   >
                     {slot.adjustment_note_fr}
@@ -2553,63 +2737,6 @@ export function ItineraryScreen({
             ))}
           </div>
         </Card>
-      )}
-
-      {/* Étape 4.1 — Alerte Pluie / Orage sur visite extérieure avec suggestion validée en 1 clic */}
-      {weatherData?.alerts && weatherData.alerts.length > 0 && (
-        <div className="space-y-3" data-testid="weather-alerts-container">
-          {weatherData.alerts.map((alert) => (
-            <Card
-              key={alert.item_id}
-              data-testid="weather-visit-alert-card"
-              className="p-5 border-amber-300 bg-feedback-warningBg space-y-3"
-            >
-              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="inline-flex items-center gap-1.5 text-caption font-bold uppercase tracking-wide text-feedback-warning">
-                    <CloudRain className="h-4 w-4" />
-                    <span>Alerte météo • {alert.weather_summary}</span>
-                  </div>
-                  <p
-                    className="text-body font-medium text-ink"
-                    data-testid="weather-alert-message"
-                  >
-                    {alert.alert_message_fr}
-                  </p>
-                </div>
-
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="sm"
-                  disabled={weatherActionLoadingId === alert.item_id}
-                  data-testid="weather-reject-alert-btn"
-                  onClick={() => handleRejectWeatherAlert(alert.item_id)}
-                >
-                  Conserver ma visite
-                </Button>
-              </div>
-
-              {alert.options.length > 0 && (
-                <div className="flex flex-wrap gap-2 pt-1">
-                  {alert.options.map((opt, optIdx) => (
-                    <Button
-                      key={opt.option_id}
-                      type="button"
-                      size="sm"
-                      disabled={weatherActionLoadingId === alert.item_id}
-                      data-testid={`weather-accept-option-btn-${optIdx}`}
-                      onClick={() => handleAcceptWeatherOption(alert.item_id, opt)}
-                    >
-                      <CheckCircle2 className="h-4 w-4" />
-                      <span>{opt.label_fr}</span>
-                    </Button>
-                  ))}
-                </div>
-              )}
-            </Card>
-          ))}
-        </div>
       )}
 
       {/* Bandeau d'erreur en français simple avec créneaux suggérés cliquables */}
@@ -2664,7 +2791,7 @@ export function ItineraryScreen({
                     className="inline-flex items-center gap-2 rounded-card bg-white border border-brand-300 px-3.5 py-2 text-caption font-semibold text-brand-800 shadow-soft hover:bg-brand-50 transition-colors"
                   >
                     <CalendarIcon className="h-3.5 w-3.5 text-brand-700" />
-                    <span className="capitalize">
+                    <span>
                       {formatFullDateHuman(slot.local_date)} • {slot.local_start_time} → {slot.local_end_time}
                     </span>
                   </button>
@@ -2675,81 +2802,11 @@ export function ItineraryScreen({
         </Card>
       )}
 
-      {/* Puces horizontales des jours du séjour AVEC météo par jour (UN JOUR À LA FOIS) */}
-      <div
-        className="flex items-center gap-2 overflow-x-auto pb-2"
-        role="tablist"
-        aria-label="Jours du séjour"
-        data-testid="itinerary-day-pills"
-      >
-        {tripDays.map((dayStr, index) => {
-          const isSelected = dayStr === selectedDayDate;
-          const countForDay =
-            schedule?.days.find((d) => d.visit_date === dayStr)?.items.length || 0;
-          const dayWeather = weatherByDate[dayStr];
-
-          return (
-            <button
-              key={dayStr}
-              type="button"
-              role="tab"
-              aria-selected={isSelected}
-              data-testid={`day-pill-${index}`}
-              onClick={() => setSelectedDayDate(dayStr)}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => {
-                e.preventDefault();
-                if (draggedVisit && draggedVisit.local_visit_date !== dayStr) {
-                  handleMoveOrUpdateVisit(
-                    draggedVisit,
-                    dayStr,
-                    draggedVisit.local_start_time
-                  );
-                  setDraggedVisit(null);
-                }
-              }}
-              className={`flex flex-col items-start gap-1 rounded-card px-4 py-2.5 text-caption font-semibold whitespace-nowrap transition-all ${
-                isSelected
-                  ? "bg-brand-700 text-white shadow-soft"
-                  : "bg-canvas-card border border-border text-ink-secondary hover:text-ink"
-              }`}
-            >
-              <div className="flex items-center gap-2">
-                <span>{formatDayPillHuman(dayStr, index)}</span>
-                {countForDay > 0 && (
-                  <span
-                    className={`inline-flex h-5 min-w-[20px] items-center justify-center rounded-full px-1.5 text-[11px] font-bold ${
-                      isSelected
-                        ? "bg-white/20 text-white"
-                        : "bg-brand-50 text-brand-800"
-                    }`}
-                  >
-                    {countForDay}
-                  </span>
-                )}
-              </div>
-
-              <div
-                className={`inline-flex items-center gap-1 text-[11px] font-medium ${
-                  isSelected ? "text-white/90" : "text-ink-muted"
-                }`}
-                data-testid={`day-pill-weather-${index}`}
-              >
-                {renderWeatherIcon(dayWeather?.condition_code, isSelected)}
-                <span>
-                  {dayWeather ? dayWeather.badge_label : "Prévision non disponible"}
-                </span>
-              </div>
-            </button>
-          );
-        })}
-      </div>
-
       {/* Vue chronologique verticale du jour choisi */}
       <Card className="p-6 space-y-5" data-testid="single-day-timeline-card">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-4">
           <div>
-            <h2 className="text-h2 text-ink capitalize">
+            <h2 className="text-h2 text-ink">
               {selectedDayDate ? formatFullDateHuman(selectedDayDate) : "Journée sélectionnée"}
             </h2>
             <p className="text-caption text-ink-secondary mt-0.5">
@@ -3184,7 +3241,7 @@ export function ItineraryScreen({
                 >
                   <div>
                     <div className="text-caption font-semibold text-brand-800">
-                      Jour {slot.day_number} ({slot.visit_date}) •{" "}
+                      Jour {slot.day_number} ({formatFullDateHuman(slot.visit_date)}) •{" "}
                       {slot.local_start_time} → {slot.local_end_time}
                     </div>
                     <div className="text-body font-semibold text-ink">
@@ -3219,8 +3276,11 @@ export function ItineraryScreen({
         )}
       </Modal>
 
-      {/* Étape 4.3 — Bulle flottante Assistant de chat avec confirmation explicite */}
-      <div className="fixed bottom-5 right-5 z-40">
+      {/* Étape 4.3 — Bulle flottante Assistant de chat entièrement visible avec 16 px de marge */}
+      <div
+        className="fixed bottom-4 right-4 z-50"
+        style={{ bottom: "16px", right: "16px" }}
+      >
         {!chatOpen ? (
           <Button
             type="button"
@@ -3327,7 +3387,7 @@ export function ItineraryScreen({
                           </div>
                           <div className="text-caption font-semibold text-ink">
                             {msg.proposed_action.place_name} •{" "}
-                            {msg.proposed_action.visit_date} à{" "}
+                            {formatFullDateHuman(msg.proposed_action.visit_date)} à{" "}
                             {msg.proposed_action.local_start_time}
                           </div>
 
@@ -3375,7 +3435,7 @@ export function ItineraryScreen({
                                           )
                                         }
                                       >
-                                        Confirmer {s.local_date} • {s.local_start_time}
+                                        Confirmer {formatFullDateHuman(s.local_date)} • {s.local_start_time}
                                       </Button>
                                     )
                                   )}

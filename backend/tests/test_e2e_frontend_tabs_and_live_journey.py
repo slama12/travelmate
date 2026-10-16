@@ -710,6 +710,8 @@ def test_envoi_b_design_system_routes_and_zero_jargon() -> None:
         "moteur de validation",
         "Africa/Casablanca",
     )
+    import re
+
     for route_key, page_payload in pages.items():
         visible_text = page_payload["visible_text"]
         for jargon in forbidden_rendered_jargon:
@@ -717,6 +719,16 @@ def test_envoi_b_design_system_routes_and_zero_jargon() -> None:
                 f"Jargon interdit '{jargon}' détecté dans le texte affiché de la page '{route_key}': "
                 f"{visible_text}"
             )
+        iso_dates_in_text = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", visible_text)
+        assert not iso_dates_in_text, (
+            f"Date brute AAAA-MM-JJ détectée dans le texte affiché de la page '{route_key}': "
+            f"{iso_dates_in_text} dans '{visible_text}'"
+        )
+
+    assert not re.findall(r"\b\d{4}-\d{2}-\d{2}\b", all_visible_text), (
+        f"Date brute AAAA-MM-JJ détectée dans all_visible_text: "
+        f"{re.findall(r'\\b\\d{4}-\\d{2}-\\d{2}\\b', all_visible_text)}"
+    )
 
     # Vérification également sur le build de production (dist/)
     dist_dir = frontend_dir / "dist"

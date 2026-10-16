@@ -679,3 +679,60 @@ async def test_ai_draft_no_duplicate_places_and_marrakech_scarce_places_message_
     assert "moteur de validation" not in combined_text.lower()
     assert "Africa/Casablanca" not in combined_text
 
+
+@pytest.mark.asyncio
+async def test_enriched_seed_each_city_has_at_least_12_real_places_with_photo_hours_and_duration(
+    client: AsyncClient,
+) -> None:
+    """
+    Vérifie l'enrichissement du seed :
+    - Chaque ville (Paris, Tokyo, Rome, New York, Marrakech) possède entre 12 et 15 lieux réels (>= 12).
+    - Répartis en CULTURE, NATURE, RESTAURANT et NIGHTLIFE.
+    - Chaque lieu possède une photo correspondant au lieu, des horaires d'ouverture,
+      une durée conseillée (> 0) et l'indication intérieur/extérieur (booléen).
+    """
+    reg_resp = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "seed.enriched.check@travelmate.app",
+            "full_name": "Vérificateur Seed Enrichi",
+            "password": "PasswordSeed!123",
+            "preferred_currency": "EUR",
+            "preferred_language": "fr",
+            "travel_style": "STANDARD",
+        },
+    )
+    assert reg_resp.status_code == 201
+    headers = {"Authorization": f"Bearer {reg_resp.json()['access_token']}"}
+
+    expected_cities = ("Paris", "Tokyo", "Rome", "New York", "Marrakech")
+    expected_categories = {"CULTURE", "NATURE", "RESTAURANT", "NIGHTLIFE"}
+
+    for city in expected_cities:
+        resp = await client.get(f"/api/v1/places/city/{city}", headers=headers)
+        assert resp.status_code == 200, f"Échec récupération lieux pour {city}: {resp.text}"
+        places = resp.json()["places"]
+        assert len(places) >= 12, f"{city} n'a que {len(places)} lieux (attendu >= 12)"
+        assert len(places) <= 15, f"{city} a {len(places)} lieux (attendu 12 à 15)"
+
+        categories_present = {p["category"] for p in places}
+        assert expected_categories.issubset(categories_present), (
+            f"Catégories manquantes à {city}: attendu {expected_categories}, obtenu {categories_present}"
+        )
+
+        city_photos: list[str] = []
+        for p in places:
+            assert isinstance(p["name"], str) and len(p["name"].strip()) >= 3
+            assert isinstance(p["is_outdoor"], bool)
+            assert isinstance(p["recommended_duration_min"], int) and p["recommended_duration_min"] >= 30
+            assert isinstance(p["opening_hours"], dict) and len(p["opening_hours"]) >= 1
+            assert any(
+                isinstance(v, str) and "-" in v and ":" in v for v in p["opening_hours"].values()
+            ), f"Horaires invalides pour {p['name']}: {p['opening_hours']}"
+            assert isinstance(p["hero_photos"], list) and len(p["hero_photos"]) >= 1
+            photo_url = p["hero_photos"][0]
+            assert isinstance(photo_url, str) and photo_url.startswith("https://")
+            city_photos.append(photo_url)
+
+        assert len(city_photos) == len(set(city_photos)), f"Photos dupliquées détectées à {city}"
+

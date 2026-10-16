@@ -57,227 +57,20 @@ REALISTIC_FLIGHTS_CATALOG: dict[str, dict[str, Any]] = {
     },
 }
 
+from app.core.seed import SEED_DESTINATIONS
+
 REALISTIC_CITY_PLACES: dict[str, list[dict[str, Any]]] = {
-    "Paris": [
+    dest_entry["city_name"]: [
         {
-            "name": "Musée du Louvre",
-            "description": "Le plus grand musée d'art et d'antiquités au monde au cœur du Palais du Louvre.",
-            "category": "CULTURE",
-            "is_outdoor": False,
-            "latitude": 48.8606,
-            "longitude": 2.3376,
-            "recommended_duration_min": 180,
-            "estimated_cost": 22.0,
-            "price_tier": "STANDARD",
-            "avg_rating": 4.8,
-            "opening_hours": {"daily": "09:00-18:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/6/66/Louvre_Museum_Wikimedia_Commons.jpg"],
+            **place,
+            "category": str(place["category"].value if hasattr(place["category"], "value") else place["category"]),
+            "price_tier": str(place["price_tier"].value if hasattr(place["price_tier"], "value") else place["price_tier"]),
+            "estimated_cost": float(place["estimated_cost"]),
             "source_provider": "simulated",
-        },
-        {
-            "name": "Jardin du Luxembourg",
-            "description": "Magnifique parc du Sénat avec bassins, statues et chaises vertes emblématiques.",
-            "category": "NATURE",
-            "is_outdoor": True,
-            "latitude": 48.8462,
-            "longitude": 2.3372,
-            "recommended_duration_min": 90,
-            "estimated_cost": 0.0,
-            "price_tier": "ECONOMIC",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "07:30-20:30"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/9/92/LuxembourgMontparnasse.JPG"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "Le Jules Verne (Tour Eiffel)",
-            "description": "Restaurant gastronomique étoilé perché au 2e étage de la Tour Eiffel.",
-            "category": "RESTAURANT",
-            "is_outdoor": False,
-            "latitude": 48.8584,
-            "longitude": 2.2945,
-            "recommended_duration_min": 150,
-            "estimated_cost": 290.0,
-            "price_tier": "LUXURY",
-            "avg_rating": 4.7,
-            "opening_hours": {"daily": "12:00-13:30, 19:00-21:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/b/b8/Le_Jules_Verne.jpg"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "Bouillon Chartier Grands Boulevards",
-            "description": "Brasserie parisienne historique Belle Époque à petits prix.",
-            "category": "RESTAURANT",
-            "is_outdoor": False,
-            "latitude": 48.8719,
-            "longitude": 2.3431,
-            "recommended_duration_min": 75,
-            "estimated_cost": 24.0,
-            "price_tier": "ECONOMIC",
-            "avg_rating": 4.5,
-            "opening_hours": {"daily": "11:30-00:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/1/14/Paris_Chartier_1304.jpg"],
-            "source_provider": "simulated",
-        },
-    ],
-    "Tokyo": [
-        {
-            "name": "Temple Senso-ji (Asakusa)",
-            "description": "Le plus ancien temple bouddhiste de Tokyo et son allée commerçante Nakamise-dori.",
-            "category": "CULTURE",
-            "is_outdoor": True,
-            "latitude": 35.7148,
-            "longitude": 139.7967,
-            "recommended_duration_min": 120,
-            "estimated_cost": 0.0,
-            "price_tier": "ECONOMIC",
-            "avg_rating": 4.8,
-            "opening_hours": {"daily": "06:00-17:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/4/43/Sensoji_2023.jpg"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "teamLab Planets Tokyo",
-            "description": "Musée d'art numérique immersif où l'on marche pieds nus dans l'eau et la lumière.",
-            "category": "CULTURE",
-            "is_outdoor": False,
-            "latitude": 35.6491,
-            "longitude": 139.7898,
-            "recommended_duration_min": 120,
-            "estimated_cost": 32.0,
-            "price_tier": "STANDARD",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "09:00-22:00"},
-            "hero_photos": ["https://images.unsplash.com/photo-1503899036084-c55cdd92da26?auto=format&fit=crop&w=1200&q=80"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "Jardin National Shinjuku Gyoen",
-            "description": "Immense parc impérial mêlant jardins japonais traditionnels, anglais et français.",
-            "category": "NATURE",
-            "is_outdoor": True,
-            "latitude": 35.6852,
-            "longitude": 139.7101,
-            "recommended_duration_min": 120,
-            "estimated_cost": 4.0,
-            "price_tier": "ECONOMIC",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "09:00-16:30"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/9/9d/Shinjuku_Gyoen_National_Garden_-_sakura_3.JPG"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "Sukiyabashi Jiro Roppongi",
-            "description": "Comptoir d'omakase sushi de haute tradition à Tokyo.",
-            "category": "RESTAURANT",
-            "is_outdoor": False,
-            "latitude": 35.6604,
-            "longitude": 139.7292,
-            "recommended_duration_min": 90,
-            "estimated_cost": 260.0,
-            "price_tier": "LUXURY",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "11:30-14:00, 17:30-21:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/9/92/Inside_Sukiyabashi_Jiro_%2811557082593%29.jpg"],
-            "source_provider": "simulated",
-        },
-    ],
-    "Rome": [
-        {
-            "name": "Colisée & Forum Romain",
-            "description": "L'amphithéâtre flavien emblématique et le cœur politique de la Rome antique.",
-            "category": "CULTURE",
-            "is_outdoor": True,
-            "latitude": 41.8902,
-            "longitude": 12.4922,
-            "recommended_duration_min": 180,
-            "estimated_cost": 18.0,
-            "price_tier": "STANDARD",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "08:30-19:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/d/de/Colosseo_2020.jpg"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "Trattoria Da Enzo al 29",
-            "description": "Trattoria romaine authentique au cœur du Trastevere (Carbonara & Cacio e Pepe).",
-            "category": "RESTAURANT",
-            "is_outdoor": False,
-            "latitude": 41.8879,
-            "longitude": 12.4777,
-            "recommended_duration_min": 90,
-            "estimated_cost": 28.0,
-            "price_tier": "ECONOMIC",
-            "avg_rating": 4.7,
-            "opening_hours": {"daily": "12:15-15:00, 19:00-23:00"},
-            "hero_photos": ["https://images.unsplash.com/photo-1551183053-bf91a1d81141?auto=format&fit=crop&w=1200&q=80"],
-            "source_provider": "simulated",
-        },
-    ],
-    "New York": [
-        {
-            "name": "Central Park",
-            "description": "Poumon vert de 341 hectares au cœur de Manhattan.",
-            "category": "NATURE",
-            "is_outdoor": True,
-            "latitude": 40.7812,
-            "longitude": -73.9665,
-            "recommended_duration_min": 150,
-            "estimated_cost": 0.0,
-            "price_tier": "ECONOMIC",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "06:00-01:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/0/05/Southwest_corner_of_Central_Park%2C_looking_east%2C_NYC.jpg"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "Katz's Delicatessen",
-            "description": "Institution new-yorkaise du Lower East Side célèbre pour son pastrami depuis 1888.",
-            "category": "RESTAURANT",
-            "is_outdoor": False,
-            "latitude": 40.7222,
-            "longitude": -73.9874,
-            "recommended_duration_min": 75,
-            "estimated_cost": 32.0,
-            "price_tier": "STANDARD",
-            "avg_rating": 4.7,
-            "opening_hours": {"daily": "08:00-23:00"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/b/b2/Katz%27s_Delicatessen_%2851623899326%29.jpg"],
-            "source_provider": "simulated",
-        },
-    ],
-    "Marrakech": [
-        {
-            "name": "Jardin Majorelle & Musée Yves Saint Laurent",
-            "description": "Oasis botanique au bleu cobalt iconique créée par Jacques Majorelle.",
-            "category": "NATURE",
-            "is_outdoor": True,
-            "latitude": 31.6415,
-            "longitude": -8.0033,
-            "recommended_duration_min": 120,
-            "estimated_cost": 28.0,
-            "price_tier": "STANDARD",
-            "avg_rating": 4.8,
-            "opening_hours": {"daily": "08:00-18:30"},
-            "hero_photos": ["https://upload.wikimedia.org/wikipedia/commons/5/57/Le_jardin_des_majorelle_16.JPG"],
-            "source_provider": "simulated",
-        },
-        {
-            "name": "La Grande Table Marocaine (Royal Mansour)",
-            "description": "Haute gastronomie marocaine dans un palais de la Médina.",
-            "category": "RESTAURANT",
-            "is_outdoor": False,
-            "latitude": 31.6258,
-            "longitude": -7.9985,
-            "recommended_duration_min": 150,
-            "estimated_cost": 195.0,
-            "price_tier": "LUXURY",
-            "avg_rating": 4.9,
-            "opening_hours": {"daily": "19:00-23:00"},
-            "hero_photos": ["https://images.unsplash.com/photo-1541518763669-27fef04b14ea?auto=format&fit=crop&w=1200&q=80"],
-            "source_provider": "simulated",
-        },
-    ],
+        }
+        for place in dest_entry["places"]
+    ]
+    for dest_entry in SEED_DESTINATIONS
 }
 
 
@@ -591,14 +384,30 @@ class SimulatedAIProvider(BaseAIProvider):
             rating = -float(p.get("avg_rating", 4.5) or 4.5)
             return (cat_match, budget_penalty, rating, str(p.get("name", "")))
 
+        def _is_evening_only(cand: dict[str, Any]) -> int:
+            c_cat = str(cand.get("category", "")).upper()
+            c_oh = str(cand.get("opening_hours", ""))
+            if c_cat == "NIGHTLIFE":
+                return 2
+            if ("18:" in c_oh or "19:" in c_oh) and "12:" not in c_oh and "09:" not in c_oh and "10:" not in c_oh:
+                return 1
+            return 0
+
         ordered_places = sorted(available_places, key=_place_priority)
         indoor_queue = [p for p in ordered_places if not bool(p.get("is_outdoor", False))]
         outdoor_queue = [p for p in ordered_places if bool(p.get("is_outdoor", False))]
         used_place_ids: set[str] = set()
 
         slots: list[dict[str, Any]] = []
-        target_dates = trip_dates[: max(1, min(len(trip_dates), 5))]
-        default_times = ["10:00", "14:30", "19:30"]
+        target_dates = trip_dates[: max(1, min(len(trip_dates), 14))]
+        default_times = ["10:00", "14:30", "17:30"]
+        total_days = len(target_dates)
+
+        reserved_last_day_id: str | None = None
+        if total_days >= 6:
+            daytime_indoors = [p for p in indoor_queue if _is_evening_only(p) == 0]
+            if daytime_indoors:
+                reserved_last_day_id = str(daytime_indoors[-1]["id"])
 
         for day_idx, current_date in enumerate(target_dates):
             date_iso = current_date.isoformat()
@@ -608,6 +417,15 @@ class SimulatedAIProvider(BaseAIProvider):
                 bool(day_weather.get("is_rainy", False))
                 or cond_code in {"RAIN", "STORM", "THUNDERSTORM"}
             )
+            is_final_day = total_days >= 6 and day_idx == total_days - 1
+
+            # Répartition équilibrée sur tous les jours du séjour (y compris séjour de 8 jours)
+            if total_days >= 7 and visits_per_day == 2 and day_idx >= total_days - 2:
+                day_target_count = 1
+            elif total_days > 5 and day_idx == total_days - 1:
+                day_target_count = 1
+            else:
+                day_target_count = visits_per_day
 
             # Choix des candidats du jour selon la météo :
             # - Jour de pluie ou d'orage : jamais de lieu en plein air (sauf allow_outdoor_in_rain=True)
@@ -624,23 +442,31 @@ class SimulatedAIProvider(BaseAIProvider):
             for pool in candidate_pools:
                 for candidate in pool:
                     pid = str(candidate["id"])
-                    if pid not in used_place_ids and len(day_places) < visits_per_day:
+                    if not is_final_day and pid == reserved_last_day_id:
+                        continue
+                    if is_final_day and _is_evening_only(candidate) > 0:
+                        continue
+                    if pid not in used_place_ids and len(day_places) < day_target_count:
                         day_places.append(candidate)
                         used_place_ids.add(pid)
 
-            # Ordre au plus proche voisin pour minimiser les trajets du jour
+            # Ordre au plus proche voisin tout en plaçant les visites de journée avant les lieux du soir
             if len(day_places) > 1:
+                day_places.sort(key=_is_evening_only)
                 nn_ordered = [day_places[0]]
                 remaining = day_places[1:]
                 while remaining:
                     last_p = nn_ordered[-1]
                     next_p = min(
                         remaining,
-                        key=lambda cand: haversine_distance_km(
-                            float(last_p.get("latitude", 0.0)),
-                            float(last_p.get("longitude", 0.0)),
-                            float(cand.get("latitude", 0.0)),
-                            float(cand.get("longitude", 0.0)),
+                        key=lambda cand: (
+                            _is_evening_only(cand),
+                            haversine_distance_km(
+                                float(last_p.get("latitude", 0.0)),
+                                float(last_p.get("longitude", 0.0)),
+                                float(cand.get("latitude", 0.0)),
+                                float(cand.get("longitude", 0.0)),
+                            ),
                         ),
                     )
                     nn_ordered.append(next_p)
@@ -649,10 +475,28 @@ class SimulatedAIProvider(BaseAIProvider):
 
             for slot_idx, p in enumerate(day_places):
                 cat = str(p.get("category", "")).upper()
-                if cat == "RESTAURANT":
-                    start_hm = "12:30" if slot_idx == 0 and day_idx > 0 else "18:00"
+                oh_str = str(p.get("opening_hours", ""))
+                is_last_day_long_trip = total_days > 5 and day_idx == total_days - 1
+
+                if is_last_day_long_trip:
+                    start_hm = "09:30"
+                elif cat == "NIGHTLIFE":
+                    start_hm = "19:30"
+                elif cat == "RESTAURANT":
+                    if "19:00" in oh_str and "12:" not in oh_str:
+                        start_hm = "18:00"
+                    elif "19:30" in oh_str and "12:" not in oh_str:
+                        start_hm = "19:30"
+                    elif "18:30" in oh_str and "12:" not in oh_str:
+                        start_hm = "18:30"
+                    elif "08:00-14:00" in oh_str:
+                        start_hm = "10:00"
+                    else:
+                        start_hm = "12:30" if slot_idx == 0 and day_idx > 0 else "19:30"
                 elif day_idx == 0 and slot_idx == 0:
                     start_hm = "14:00"
+                elif day_idx == 0 and slot_idx == 1:
+                    start_hm = "16:30"
                 else:
                     start_hm = default_times[min(slot_idx, len(default_times) - 1)]
 
@@ -696,6 +540,30 @@ class SimulatedAIProvider(BaseAIProvider):
         - Détecte les demandes d'ajout, déplacement ou suppression de visite et construit une
           proposition d'action qui devra être validée par le moteur ET confirmée par l'utilisateur.
         """
+        fr_weekdays = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+        fr_months = [
+            "",
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ]
+
+        def _fmt_date_fr(iso_str: str) -> str:
+            try:
+                d = date.fromisoformat(str(iso_str)[:10])
+                return f"{fr_weekdays[d.weekday()]} {d.day} {fr_months[d.month]}"
+            except Exception:
+                return str(iso_str)
+
         msg_lower = user_message.lower().strip()
         trip_info = safe_trip_context.get("trip", {})
         city_name = trip_info.get("city_name", "votre destination")
@@ -754,7 +622,7 @@ class SimulatedAIProvider(BaseAIProvider):
                 return {
                     "reply": (
                         f"Je peux retirer la visite « {target_item['place_name']} » prévue le "
-                        f"{target_item['visit_date']} à {target_item['local_start_time']}. "
+                        f"{_fmt_date_fr(target_item['visit_date'])} à {target_item['local_start_time']}. "
                         "Confirmez-vous cette suppression ?"
                     ),
                     "proposed_action": {
@@ -778,7 +646,7 @@ class SimulatedAIProvider(BaseAIProvider):
                 return {
                     "reply": (
                         f"Je vous propose de déplacer « {target_item['place_name']} » au "
-                        f"{new_date} à {new_time}. Souhaitez-vous appliquer ce changement ?"
+                        f"{_fmt_date_fr(new_date)} à {new_time}. Souhaitez-vous appliquer ce changement ?"
                     ),
                     "proposed_action": {
                         "action_type": "MOVE_VISIT",
@@ -800,7 +668,7 @@ class SimulatedAIProvider(BaseAIProvider):
                 return {
                     "reply": (
                         f"Je vous propose d'ajouter « {target_place['name']} » le "
-                        f"{default_date_str} à {new_time} ({target_place['recommended_duration_min']} min). "
+                        f"{_fmt_date_fr(default_date_str)} à {new_time} ({target_place['recommended_duration_min']} min). "
                         "Rien n'est modifié tant que vous ne confirmez pas."
                     ),
                     "proposed_action": {

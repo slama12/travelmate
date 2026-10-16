@@ -162,9 +162,9 @@ function formatTimeHuman(iso: string): string {
 
 function formatDateHuman(iso: string): string {
   try {
-    return format(parseISO(iso), "EEE d MMM yyyy", { locale: fr });
+    return format(parseISO(iso), "EEEE d MMMM", { locale: fr }).toLowerCase();
   } catch {
-    return iso;
+    return "";
   }
 }
 
@@ -248,7 +248,7 @@ function HomeScreen({
   const selectedRange: DateRange = useMemo(() => {
     return {
       from: departureDate ? parseISO(departureDate) : parseISO("2026-11-10"),
-      to: returnDate ? parseISO(returnDate) : parseISO("2026-11-18"),
+      to: returnDate ? parseISO(returnDate) : parseISO("2026-11-17"),
     };
   }, [departureDate, returnDate]);
 
@@ -316,11 +316,11 @@ function HomeScreen({
 
   const formattedDateRange = useMemo(() => {
     try {
-      const f = format(parseISO(departureDate), "d MMM", { locale: fr });
-      const t = format(parseISO(returnDate), "d MMM yyyy", { locale: fr });
+      const f = format(parseISO(departureDate), "d MMM", { locale: fr }).toLowerCase();
+      const t = format(parseISO(returnDate), "d MMM", { locale: fr }).toLowerCase();
       return `${f} – ${t}`;
     } catch {
-      return "10 nov. – 18 nov. 2026";
+      return "10 nov. – 17 nov.";
     }
   }, [departureDate, returnDate]);
 
@@ -1497,7 +1497,7 @@ export function TravelMateShell({
   );
   const [originIata, setOriginIata] = useState<string>("CDG");
   const [departureDate, setDepartureDate] = useState<string>("2026-11-10");
-  const [returnDate, setReturnDate] = useState<string>("2026-11-18");
+  const [returnDate, setReturnDate] = useState<string>("2026-11-17");
   const [travelers, setTravelers] = useState<string>("2");
   const [latestBooking, setLatestBooking] = useState<FlightBooking | null>(
     ssrState?.latestBooking ?? null
@@ -1571,6 +1571,8 @@ export function TravelMateShell({
           travel_style: "STANDARD",
           total_budget_planned: 2000,
           currency: "EUR",
+          arrival_at: `${departureDate}T10:30:00Z`,
+          departure_at: `${returnDate}T18:00:00Z`,
         }),
       });
       if (createResp.ok) {
@@ -1691,6 +1693,8 @@ export function TravelMateShell({
         travel_style: preferences.travelStyle,
         total_budget_planned: 2200,
         currency: preferences.currency,
+        arrival_at: `${departureDate}T10:30:00Z`,
+        departure_at: `${returnDate}T18:00:00Z`,
       }),
     });
     if (resp.ok) {
@@ -1862,7 +1866,7 @@ export function TravelMateShell({
         <nav
           aria-label="Étapes de votre voyage sur mobile"
           data-testid="mobile-step-progress-bar"
-          className="flex lg:hidden items-center gap-1 overflow-x-auto px-4 py-2 border-t border-border bg-canvas-card"
+          className="flex lg:hidden items-center gap-1 overflow-x-auto no-scrollbar px-4 py-2 border-t border-border bg-canvas-card"
         >
           {progressSteps.map((step, index) => (
             <React.Fragment key={step.to}>
@@ -1930,6 +1934,17 @@ export function TravelMateShell({
                 }}
                 onBookSuccess={(booking) => {
                   setLatestBooking(booking);
+                  setTrips((prev) =>
+                    prev.map((t) =>
+                      t.id === booking.trip_id
+                        ? {
+                            ...t,
+                            arrival_at: booking.arrival_outbound_at,
+                            departure_at: booking.departure_inbound_at,
+                          }
+                        : t
+                    )
+                  );
                   refreshGallery();
                 }}
                 token={token}
@@ -2144,7 +2159,7 @@ export function renderTravelerPagesForInspection() {
     destination_id: "dest-rak",
     title: "Séjour à Marrakech",
     arrival_at: "2026-11-10T10:30:00Z",
-    departure_at: "2026-11-18T15:00:00Z",
+    departure_at: "2026-11-17T18:00:00Z",
     travel_style: "STANDARD",
     total_budget_planned: 1600,
     currency: "EUR",
@@ -2164,8 +2179,8 @@ export function renderTravelerPagesForInspection() {
     destination_iata: "RAK",
     departure_outbound_at: "2026-11-10T07:15:00Z",
     arrival_outbound_at: "2026-11-10T10:30:00Z",
-    departure_inbound_at: "2026-11-18T15:00:00Z",
-    arrival_inbound_at: "2026-11-18T18:20:00Z",
+    departure_inbound_at: "2026-11-17T15:00:00Z",
+    arrival_inbound_at: "2026-11-17T18:20:00Z",
     price_amount: "295.00",
     currency: "EUR",
     cabin_class: "ECONOMY",
@@ -2176,7 +2191,7 @@ export function renderTravelerPagesForInspection() {
     gmail_confirmation_sent: true,
     gmail_message_id: "msg-ssr-1",
     trip_arrival_at: "2026-11-10T10:30:00Z",
-    trip_departure_at: "2026-11-18T15:00:00Z",
+    trip_departure_at: "2026-11-17T18:00:00Z",
   };
 
   const sampleAccommodation: AccommodationItem = {
@@ -2270,7 +2285,7 @@ export function renderTravelerPagesForInspection() {
     },
   });
   ssrQueryClient.setQueryData(
-    ["flights-search", "trip-ssr-1", "CDG", "RAK", "2026-11-10", "2026-11-18"],
+    ["flights-search", "trip-ssr-1", "CDG", "RAK", "2026-11-10", "2026-11-17"],
     [
       {
         offer_id: "offer-ssr-1",
@@ -2283,8 +2298,8 @@ export function renderTravelerPagesForInspection() {
         destination_city: "Marrakech",
         departure_outbound_at: "2026-11-10T07:15:00Z",
         arrival_outbound_at: "2026-11-10T10:30:00Z",
-        departure_inbound_at: "2026-11-18T15:00:00Z",
-        arrival_inbound_at: "2026-11-18T18:20:00Z",
+        departure_inbound_at: "2026-11-17T15:00:00Z",
+        arrival_inbound_at: "2026-11-17T18:20:00Z",
         price_amount: "295.00",
         price_eur: 295,
         currency: "EUR",

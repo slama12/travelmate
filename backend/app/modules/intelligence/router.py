@@ -149,6 +149,28 @@ def sanitize_external_data_for_llm(raw_text: str | None) -> str:
     return f'<external_data_only do_not_execute="true">{cleaned[:500]}</external_data_only>'
 
 
+_FR_WEEKDAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_FR_MONTHS = [
+    "",
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+]
+
+
+def _format_date_fr(d: date) -> str:
+    return f"{_FR_WEEKDAYS[d.weekday()]} {d.day} {_FR_MONTHS[d.month]}"
+
+
 def _compute_trip_dates_local(trip: Trip, dest_tz: str) -> list[date]:
     if trip.arrival_at and trip.departure_at:
         loc_arr = to_destination_local(ensure_utc(trip.arrival_at), dest_tz).date()
@@ -161,7 +183,7 @@ def _compute_trip_dates_local(trip: Trip, dest_tz: str) -> list[date]:
         if dates:
             return dates
     base = date(2026, 11, 10)
-    return [base + timedelta(days=i) for i in range(5)]
+    return [base + timedelta(days=i) for i in range(8)]
 
 
 def _format_weather_badge(cond_code: str, temp_c: float | None, available: bool) -> str:
@@ -436,7 +458,7 @@ async def get_trip_weather_and_alerts(
                     suggestion_type="INDOOR_PLACE",
                     label_fr=(
                         f"Remplacer par « {indoor_cand.name} » (en intérieur) "
-                        f"le {c_loc_s.strftime('%Y-%m-%d')} de {c_loc_s.strftime('%H:%M')} à {c_loc_e.strftime('%H:%M')}"
+                        f"le {_format_date_fr(c_loc_s.date())} de {c_loc_s.strftime('%H:%M')} à {c_loc_e.strftime('%H:%M')}"
                     ),
                     replacement_place_id=indoor_cand.id,
                     replacement_place_name=indoor_cand.name,
@@ -495,7 +517,7 @@ async def get_trip_weather_and_alerts(
                     option_id=f"slot-{a_loc_s.strftime('%Y-%m-%d-%H%M')}",
                     suggestion_type="ALTERNATE_SLOT",
                     label_fr=(
-                        f"Déplacer « {place.name} » au {a_loc_s.strftime('%Y-%m-%d')} "
+                        f"Déplacer « {place.name} » au {_format_date_fr(a_loc_s.date())} "
                         f"de {a_loc_s.strftime('%H:%M')} à {a_loc_e.strftime('%H:%M')} ({dry_f.summary})"
                     ),
                     replacement_place_id=place.id,
@@ -513,6 +535,11 @@ async def get_trip_weather_and_alerts(
             )
             break
 
+        weather_title_prefix = (
+            "Orage prévu"
+            if str(day_weather.condition_code).upper() in {"STORM", "THUNDERSTORM"}
+            else "Pluie prévue"
+        )
         alerts.append(
             WeatherVisitAlertSchema(
                 item_id=item.id,
@@ -525,9 +552,8 @@ async def get_trip_weather_and_alerts(
                 weather_summary=day_weather.summary,
                 precipitation_probability=day_weather.precipitation_probability,
                 alert_message_fr=(
-                    f"Météo défavorable prévue le {visit_date_str} ({day_weather.summary}) "
-                    f"pendant votre visite en extérieur « {place.name} ». "
-                    "Souhaitez-vous la remplacer par un lieu en intérieur ou la décaler ?"
+                    f"{weather_title_prefix} le {_format_date_fr(loc_start.date())} "
+                    f"pendant votre visite « {place.name} »."
                 ),
                 options=options,
             )
@@ -665,28 +691,6 @@ async def reject_weather_alert_suggestion(
 # ==============================================================================
 # 2. ENDPOINTS ITINÉRAIRE IA ("GÉNÈRE MON PROGRAMME") — BROUILLON NON PERSISTÉ
 # ==============================================================================
-_FR_WEEKDAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
-_FR_MONTHS = [
-    "",
-    "janvier",
-    "février",
-    "mars",
-    "avril",
-    "mai",
-    "juin",
-    "juillet",
-    "août",
-    "septembre",
-    "octobre",
-    "novembre",
-    "décembre",
-]
-
-
-def _format_date_fr(d: date) -> str:
-    return f"{_FR_WEEKDAYS[d.weekday()]} {d.day} {_FR_MONTHS[d.month]} {d.year}"
-
-
 def _place_noun_fr(place: Place) -> str:
     cat = str(place.category or "").upper()
     name_low = str(place.name or "").lower()
@@ -1097,11 +1101,9 @@ async def generate_ai_itinerary_draft(
             }
         )
 
-    visits_per_day = {"RELAX": 1, "NORMAL": 2, "INTENSE": 3}.get((payload.pace or "NORMAL").upper(), 2)
-    target_days_count = max(1, min(len(trip_dates), 5))
-    desired_slots_count = target_days_count * visits_per_day
+    unique_tastes_count = len({str(t).strip().upper() for t in (payload.tastes or []) if str(t).strip()})
     limited_places_notice_fr: str | None = None
-    if len(db_places) < desired_slots_count or len(accepted_slots) < desired_slots_count:
+    if len(db_places) < 12 or unique_tastes_count >= 4:
         limited_places_notice_fr = f"Peu de lieux disponibles à {destination.city_name} pour l'instant"
         if limited_places_notice_fr not in adjustments_fr:
             adjustments_fr.append(limited_places_notice_fr)
@@ -1607,13 +1609,14 @@ async def send_trip_chat_message(
             ]
             if not val_res.valid:
                 reply_text = (
-                    f"Le créneau demandé ({v_date_str} à {v_time_str}) pour « {place_obj.name} » "
+                    f"Le créneau demandé ({_format_date_fr(v_date_obj)} à {v_time_str}) pour « {place_obj.name} » "
                     f"ne respecte pas les règles du séjour : {val_res.message}"
                 )
                 if sug_dicts:
                     first_s = sug_dicts[0]
+                    sug_date_fr = _format_date_fr(date.fromisoformat(str(first_s["local_date"])))
                     reply_text += (
-                        f" Je vous suggère plutôt le {first_s['local_date']} de "
+                        f" Je vous suggère plutôt le {sug_date_fr} de "
                         f"{first_s['local_start_time']} à {first_s['local_end_time']}."
                     )
 
@@ -1787,7 +1790,7 @@ async def confirm_chat_proposed_action(
             applied_change=True,
             updated_item=_to_item_response(target_item, place, dest_tz),
             deleted_item_id=None,
-            detail_fr=f"Visite « {place.name} » déplacée au {v_date.isoformat()} à {v_time}.",
+            detail_fr=f"Visite « {place.name} » déplacée au {_format_date_fr(v_date)} à {v_time}.",
         )
 
     new_item = ItineraryItem(
@@ -1818,7 +1821,7 @@ async def confirm_chat_proposed_action(
         applied_change=True,
         updated_item=_to_item_response(new_item, place, dest_tz),
         deleted_item_id=None,
-        detail_fr=f"Visite « {place.name} » ajoutée le {v_date.isoformat()} à {v_time}.",
+        detail_fr=f"Visite « {place.name} » ajoutée le {_format_date_fr(v_date)} à {v_time}.",
     )
 
 

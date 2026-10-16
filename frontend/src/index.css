@@ -48,3 +48,12 @@
   background-color: #F0FDFA !important;
   color: #0F172A !important;
 }
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
