@@ -1,9 +1,11 @@
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 import json
 import logging
 import re
 import time
 from typing import Any
+import unicodedata
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import ValidationError
@@ -20,7 +22,12 @@ from app.core.itinerary_validator import (
     parse_local_slot_to_utc,
     to_destination_local,
 )
-from app.core.providers import build_chat_assistant_prompt, get_provider_registry
+from app.core.providers import (
+    RealAIProvider,
+    SimulatedAIProvider,
+    build_chat_assistant_prompt,
+    get_provider_registry,
+)
 from app.core.redis import cache_client
 from app.models.entities import (
     Accommodation,
@@ -1617,6 +1624,7 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         "duration_minutes",
         "duration",
         "transit_mode",
+        "info_subtype",
     }
     unknown_top = set(raw_res.keys()) - allowed_keys
     if unknown_top:
@@ -1642,7 +1650,7 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
     elif has_nested and nested_pa is None and not any(k in raw_res for k in ("action_type", "action", "type")):
         return {
             "action_type": "NONE",
-            "reply": str(reply_val or "Pouvez-vous préciser votre demande ?"),
+            "reply": str(reply_val or "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?"),
             "proposed_action": None,
         }
     else:
@@ -1656,7 +1664,7 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
     if raw_act is None:
         return {
             "action_type": "NONE",
-            "reply": str(reply_val or "Pouvez-vous préciser votre demande ?"),
+            "reply": str(reply_val or "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?"),
             "proposed_action": None,
         }
     if not isinstance(raw_act, str):
@@ -1687,6 +1695,8 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
     if norm_act == "INFO":
         return {
             "action_type": "INFO",
+            "info_subtype": raw_res.get("info_subtype"),
+            "place_name": raw_res.get("place_name"),
             "reply": str(reply_val or ""),
             "proposed_action": None,
         }
@@ -1767,9 +1777,12 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
     if norm_act in {"ASK", "NONE"}:
         return {
             "action_type": norm_act,
+            "place_name": raw_pname.strip() if isinstance(raw_pname, str) and raw_pname.strip() else None,
+            "visit_date": norm_date,
+            "local_start_time": norm_time,
             "reply": str(
                 reply_val
-                or "Quel lieu souhaitez-vous planifier ou modifier, et pour quel jour du séjour ?"
+                or "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?"
             ),
             "proposed_action": None,
         }
@@ -1799,12 +1812,14 @@ async def send_trip_chat_message(
 ) -> ChatConversationResponse:
     """
     Envoie un message à l'assistant du voyage :
+    - Stratégie configurable AI_CHAT_STRATEGY=rules (défaut) | hybrid | model :
+      en mode rules, aucun appel à Ollama et aucune dépendance réseau externe.
     - Contrôle d'accès strict (403 si le voyage appartient à un autre utilisateur),
     - Historique limité aux 6 derniers échanges envoyés au modèle,
     - Résumé du séjour (visites, budget, météo) toujours recalculé en direct à chaque demande,
-    - Action INFO obligatoire pour les questions sur d'autres lieux à visiter (sans modification ni carte Confirmer/Refuser),
+    - Action INFO obligatoire pour les questions d'information (autres lieux, météo, budget, horaires),
     - Anti-doublon : refuse un même lieu deux fois sauf demande explicite ("ajoute-le une deuxième fois"),
-    - Journalisation fournisseur/modèle/durée à chaque message et aucun repli silencieux vers le simulateur quand AI_PROVIDER_MODE=real.
+    - Journalisation fournisseur/modèle/durée à chaque message et aucun repli silencieux vers le simulateur quand AI_CHAT_STRATEGY=model et AI_PROVIDER_MODE=real.
     """
     registry = get_provider_registry()
     settings = get_settings()
@@ -1897,6 +1912,15 @@ async def send_trip_chat_message(
 
     trip_dates = _compute_trip_dates_local(trip, dest_tz)
 
+    def _norm_txt_local(s: str) -> str:
+        s_clean = str(s).lower().replace("œ", "oe").replace("æ", "ae")
+        s_dec = unicodedata.normalize("NFD", s_clean)
+        s_no_acc = "".join(c for c in s_dec if unicodedata.category(c) != "Mn")
+        return re.sub(r"[^a-z0-9]+", " ", s_no_acc).strip()
+
+    def _spaceless_local(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", _norm_txt_local(s))
+
     def _resolve_named_trip_date(raw_msg: str) -> date | None:
         lower = raw_msg.lower()
         iso_m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", raw_msg)
@@ -1920,37 +1944,77 @@ async def send_trip_chat_message(
             if 0 <= idx < len(trip_dates):
                 return trip_dates[idx]
 
-        month_map = {
-            "janvier": 1,
-            "février": 2,
-            "fevrier": 2,
-            "mars": 3,
-            "avril": 4,
-            "mai": 5,
-            "juin": 6,
-            "juillet": 7,
-            "août": 8,
-            "aout": 8,
-            "septembre": 9,
-            "octobre": 10,
-            "novembre": 11,
-            "décembre": 12,
-            "decembre": 12,
-        }
-        dm_m = re.search(
-            r"\b(\d{1,2})\s+(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)\b",
-            lower,
-        )
-        if dm_m:
-            day_num = int(dm_m.group(1))
-            month_num = month_map[dm_m.group(2)]
+        slash_m = re.search(r"\b(\d{1,2})/(\d{1,2})(?:/(20\d{2}))?\b", lower)
+        if slash_m:
+            day_num = int(slash_m.group(1))
+            month_num = int(slash_m.group(2))
+            year_num = int(slash_m.group(3)) if slash_m.group(3) else base_d.year
             for d_obj in trip_dates:
                 if d_obj.day == day_num and d_obj.month == month_num:
                     return d_obj
             try:
-                return date(base_d.year, month_num, day_num)
+                return date(year_num, month_num, day_num)
             except ValueError:
                 pass
+
+        month_canonical: list[tuple[str, int]] = [
+            ("janvier", 1),
+            ("janv", 1),
+            ("fevrier", 2),
+            ("fevr", 2),
+            ("mars", 3),
+            ("avril", 4),
+            ("avr", 4),
+            ("mai", 5),
+            ("juin", 6),
+            ("juillet", 7),
+            ("juil", 7),
+            ("aout", 8),
+            ("septembre", 9),
+            ("sept", 9),
+            ("octobre", 10),
+            ("oct", 10),
+            ("novembre", 11),
+            ("nov", 11),
+            ("decembre", 12),
+            ("dec", 12),
+        ]
+        non_month_after_num = {
+            "heure", "heures", "min", "minutes", "minute", "fois", "jour", "jours",
+            "personne", "personnes", "euro", "euros", "an", "ans",
+        }
+        for dm_m in re.finditer(
+            r"\b(\d{1,2})(?:er)?\s+([a-zàâçéèêëîïôûùüÿñæœ]{3,12})\b",
+            lower,
+        ):
+            day_num = int(dm_m.group(1))
+            if not (1 <= day_num <= 31):
+                continue
+            word_norm = _norm_txt_local(dm_m.group(2))
+            if not word_norm or word_norm in non_month_after_num or re.match(r"^\d", word_norm):
+                continue
+            matched_month: int | None = None
+            for m_name, m_idx in month_canonical:
+                if word_norm == m_name:
+                    matched_month = m_idx
+                    break
+            if matched_month is None and len(word_norm) >= 4:
+                best_ratio = 0.0
+                for m_name, m_idx in month_canonical:
+                    if len(m_name) < 4:
+                        continue
+                    ratio = SequenceMatcher(None, word_norm, m_name).ratio()
+                    if ratio >= 0.74 and ratio > best_ratio:
+                        best_ratio = ratio
+                        matched_month = m_idx
+            if matched_month is not None:
+                for d_obj in trip_dates:
+                    if d_obj.day == day_num and d_obj.month == matched_month:
+                        return d_obj
+                try:
+                    return date(base_d.year, matched_month, day_num)
+                except ValueError:
+                    pass
 
         weekday_map = {
             "lundi": 0,
@@ -1965,8 +2029,17 @@ async def send_trip_chat_message(
             r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b",
             lower,
         )
+        target_wd: int | None = None
         if wd_matches:
             target_wd = weekday_map[wd_matches[-1]]
+        else:
+            for tok in _norm_txt_local(raw_msg).split():
+                if len(tok) < 5:
+                    continue
+                for wd_name, wd_idx in weekday_map.items():
+                    if SequenceMatcher(None, tok, wd_name).ratio() >= 0.84:
+                        target_wd = wd_idx
+        if target_wd is not None:
             for d_obj in trip_dates:
                 if d_obj.weekday() == target_wd:
                     return d_obj
@@ -1976,7 +2049,13 @@ async def send_trip_chat_message(
         return None
 
     def _extract_time_from_msg(raw_msg: str) -> str | None:
-        m = re.search(r"\b(\d{1,2})\s*(?:h|:)\s*(\d{2})?\b", raw_msg.lower())
+        cleaned = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", raw_msg.lower())
+        cleaned = re.sub(r"\b\d{1,2}/\d{1,2}(?:/20\d{2})?\b", " ", cleaned)
+        if re.search(r"\bmidi\b", cleaned):
+            return "12:00"
+        if re.search(r"\bminuit\b", cleaned):
+            return "00:00"
+        m = re.search(r"\b(\d{1,2})\s*(?:h|heures?|:)\s*(\d{2})?\b", cleaned)
         if not m:
             return None
         hh = int(m.group(1))
@@ -2001,11 +2080,20 @@ async def send_trip_chat_message(
 
         pname = str(raw_action_dict.get("place_name") or "").strip().lower()
         if pname:
+            pname_norm = _norm_txt_local(pname)
+            pname_space = _spaceless_local(pname)
             for p in places_by_id.values():
-                if p.name.lower() == pname:
+                if p.name.lower() == pname or _norm_txt_local(p.name) == pname_norm:
                     return p
             for p in places_by_id.values():
-                if pname in p.name.lower() or p.name.lower() in pname:
+                p_norm = _norm_txt_local(p.name)
+                p_space = _spaceless_local(p.name)
+                if (
+                    pname in p.name.lower()
+                    or p.name.lower() in pname
+                    or (pname_space and (pname_space in p_space or p_space in pname_space))
+                    or SequenceMatcher(None, pname_norm, p_norm).ratio() >= 0.76
+                ):
                     return p
 
         iid = str(raw_action_dict.get("item_id") or "").strip()
@@ -2014,12 +2102,36 @@ async def send_trip_chat_message(
                 if it.id == iid and it.place_id in places_by_id:
                     return places_by_id[it.place_id]
 
-        msg_low = raw_msg.lower()
+        msg_norm_local = _norm_txt_local(raw_msg)
+        msg_space_local = _spaceless_local(raw_msg)
+        best_p: Place | None = None
+        best_sc = 0.0
+        stopwords = {"le", "la", "les", "l", "de", "du", "des", "d", "au", "aux", "el", "al"}
+        heads = {"palais", "jardin", "jardins", "musee", "place", "mosquee", "parc", "cafe", "tombeaux", "medersa"}
+        msg_toks = [t for t in msg_norm_local.split() if len(t) >= 3 and not t.isdigit()]
         for p in places_by_id.values():
-            p_low = p.name.lower()
-            tokens = [tok for tok in re.split(r"\W+", p_low) if len(tok) >= 4]
-            if p_low in msg_low or any(t in msg_low for t in tokens):
-                return p
+            p_norm = _norm_txt_local(p.name)
+            p_space = _spaceless_local(p.name)
+            p_core = [t for t in p_norm.split() if t not in stopwords and len(t) >= 2]
+            p_spec = [t for t in p_core if t not in heads and len(t) >= 3] or p_core
+            sc = 0.0
+            if p_norm in msg_norm_local:
+                sc = 1.0
+            elif len(p_space) >= 6 and p_space in msg_space_local:
+                sc = 0.98
+            else:
+                for sp in p_spec:
+                    if sp in msg_toks:
+                        sc = max(sc, 0.88)
+                    else:
+                        best_r = max((SequenceMatcher(None, sp, mt).ratio() for mt in msg_toks), default=0.0)
+                        if best_r >= 0.78:
+                            sc = max(sc, 0.80 * best_r)
+            if sc >= 0.72 and sc > best_sc:
+                best_sc = sc
+                best_p = p
+        if best_p is not None:
+            return best_p
 
         if last_context_place is not None:
             return last_context_place
@@ -2029,91 +2141,141 @@ async def send_trip_chat_message(
     msg_extracted_time = _extract_time_from_msg(payload.message)
     is_info_places_question = _is_informational_places_request(payload.message)
 
-    provider_cls_name = type(registry.ai).__name__
-    provider_mode = str(getattr(registry.ai, "mode", settings.AI_PROVIDER_MODE or "simulated"))
-    model_name = (
-        settings.OLLAMA_MODEL
-        if provider_mode == "real"
-        else "simulated-deterministic"
-    )
+    chat_strategy = str(settings.AI_CHAT_STRATEGY or "rules")
+    is_custom_test_provider = not isinstance(registry.ai, (SimulatedAIProvider, RealAIProvider))
+    rules_provider = SimulatedAIProvider(settings)
 
-    # Appel du modèle IA avec validation stricte du schéma (2 essais max) et journalisation obligatoire
-    max_attempts = 2
+    if is_custom_test_provider:
+        active_provider = registry.ai
+        provider_cls_name = type(registry.ai).__name__
+        provider_mode = str(getattr(registry.ai, "mode", settings.AI_PROVIDER_MODE or "simulated"))
+        model_name = settings.OLLAMA_MODEL if provider_mode == "real" else "simulated-deterministic"
+    elif chat_strategy == "rules":
+        # Mode rules (défaut) : aucun appel à Ollama, aucune dépendance réseau externe
+        active_provider = rules_provider
+        provider_cls_name = "SimulatedAIProvider"
+        provider_mode = "rules"
+        model_name = "rules-deterministic"
+    else:
+        active_provider = registry.ai
+        provider_cls_name = type(registry.ai).__name__
+        provider_mode = str(getattr(registry.ai, "mode", settings.AI_PROVIDER_MODE or "simulated"))
+        model_name = settings.OLLAMA_MODEL if provider_mode == "real" else "simulated-deterministic"
+
+    # En mode hybrid : on exécute d'abord l'analyseur à règles et on n'appelle le modèle que si rules renvoie ASK
     validated_ai: dict[str, Any] | None = None
+    if not is_custom_test_provider and chat_strategy == "hybrid":
+        t0_hyb = time.perf_counter()
+        raw_rules_hyb = await rules_provider.generate_chat_reply(
+            user_message=payload.message.strip(),
+            safe_trip_context=safe_context,
+            chat_history=history_for_ai,
+        )
+        dur_hyb = round((time.perf_counter() - t0_hyb) * 1000, 2)
+        cand_hyb = _validate_and_normalize_chat_llm_payload(raw_rules_hyb)
+        if cand_hyb.get("action_type") in {"ADD_VISIT", "MOVE_VISIT", "REMOVE_VISIT", "INFO"} or provider_mode != "real":
+            validated_ai = cand_hyb
+            logger.info(
+                "[CHAT_AI] strategy=hybrid(rules) | provider=SimulatedAIProvider | mode=rules | model=rules-deterministic | duration_ms=%.2f | attempt=1 | trip_id=%s",
+                dur_hyb,
+                trip.id,
+            )
+
+    # Appel du fournisseur IA actif (si non déjà résolu par hybrid) avec validation stricte du schéma (2 essais max)
+    max_attempts = 2
     last_provider_runtime_error: Exception | None = None
 
-    for _attempt in range(1, max_attempts + 1):
-        t0 = time.perf_counter()
-        try:
-            raw_ai_result = await registry.ai.generate_chat_reply(
-                user_message=payload.message.strip(),
-                safe_trip_context=safe_context,
-                chat_history=history_for_ai,
-            )
-            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-            logger.info(
-                "[CHAT_AI] provider=%s | mode=%s | model=%s | duration_ms=%.2f | attempt=%d | trip_id=%s",
-                provider_cls_name,
-                provider_mode,
-                model_name,
-                duration_ms,
-                _attempt,
-                trip.id,
-            )
-        except Exception as exc:
-            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-            logger.error(
-                "[CHAT_AI] provider=%s | mode=%s | model=%s | duration_ms=%.2f | attempt=%d | trip_id=%s | error=%s",
-                provider_cls_name,
-                provider_mode,
-                model_name,
-                duration_ms,
-                _attempt,
-                trip.id,
-                exc,
-            )
-            last_provider_runtime_error = exc
-            if provider_mode == "real":
-                # Interdiction stricte du repli silencieux vers le simulateur quand AI_PROVIDER_MODE=real
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=(
-                        f"Fournisseur IA réel ({provider_cls_name}, modèle={model_name}) indisponible "
-                        f"(repli vers le simulateur interdit) : {exc}"
-                    ),
-                ) from exc
-            validated_ai = None
-            continue
+    if validated_ai is None:
+        for _attempt in range(1, max_attempts + 1):
+            t0 = time.perf_counter()
+            try:
+                raw_ai_result = await active_provider.generate_chat_reply(
+                    user_message=payload.message.strip(),
+                    safe_trip_context=safe_context,
+                    chat_history=history_for_ai,
+                )
+                duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+                logger.info(
+                    "[CHAT_AI] strategy=%s | provider=%s | mode=%s | model=%s | duration_ms=%.2f | attempt=%d | trip_id=%s",
+                    chat_strategy,
+                    provider_cls_name,
+                    provider_mode,
+                    model_name,
+                    duration_ms,
+                    _attempt,
+                    trip.id,
+                )
+            except Exception as exc:
+                duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+                logger.error(
+                    "[CHAT_AI] strategy=%s | provider=%s | mode=%s | model=%s | duration_ms=%.2f | attempt=%d | trip_id=%s | error=%s",
+                    chat_strategy,
+                    provider_cls_name,
+                    provider_mode,
+                    model_name,
+                    duration_ms,
+                    _attempt,
+                    trip.id,
+                    exc,
+                )
+                last_provider_runtime_error = exc
+                if provider_mode == "real" and chat_strategy == "model":
+                    # Interdiction stricte du repli silencieux vers le simulateur quand AI_CHAT_STRATEGY=model et AI_PROVIDER_MODE=real
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=(
+                            f"Fournisseur IA réel ({provider_cls_name}, modèle={model_name}) indisponible "
+                            f"(repli vers le simulateur interdit) : {exc}"
+                        ),
+                    ) from exc
+                validated_ai = None
+                continue
 
-        try:
-            validated_ai = _validate_and_normalize_chat_llm_payload(raw_ai_result)
-            break
-        except ValueError as val_exc:
-            logger.warning(
-                "[CHAT_AI_SCHEMA] provider=%s | mode=%s | model=%s | attempt=%d | schema_error=%s",
-                provider_cls_name,
-                provider_mode,
-                model_name,
-                _attempt,
-                val_exc,
-            )
-            validated_ai = None
-            continue
+            try:
+                validated_ai = _validate_and_normalize_chat_llm_payload(raw_ai_result)
+                break
+            except ValueError as val_exc:
+                logger.warning(
+                    "[CHAT_AI_SCHEMA] strategy=%s | provider=%s | mode=%s | model=%s | attempt=%d | schema_error=%s",
+                    chat_strategy,
+                    provider_cls_name,
+                    provider_mode,
+                    model_name,
+                    _attempt,
+                    val_exc,
+                )
+                validated_ai = None
+                continue
 
-    # Point 1 : Question d'information sur les autres lieux à visiter -> Action INFO obligatoire
-    if is_info_places_question or (validated_ai is not None and validated_ai.get("action_type") == "INFO"):
+    # Point 1 : Question d'information (autres lieux, horaires, météo, budget) -> Action INFO sans modification
+    if is_info_places_question or (
+        validated_ai is not None
+        and validated_ai.get("action_type") == "INFO"
+        and validated_ai.get("info_subtype") in (None, "PLACES")
+        and not validated_ai.get("reply")
+    ):
         reply_text = _format_unscheduled_places_info(
             destination.city_name, places_by_id, existing_items
         )
         raw_action = None
+    elif validated_ai is not None and validated_ai.get("action_type") == "INFO":
+        if validated_ai.get("info_subtype") == "PLACES":
+            reply_text = _format_unscheduled_places_info(
+                destination.city_name, places_by_id, existing_items
+            )
+        else:
+            reply_text = str(validated_ai.get("reply") or "").strip() or _format_unscheduled_places_info(
+                destination.city_name, places_by_id, existing_items
+            )
+        raw_action = None
     elif validated_ai is None:
-        reply_text = (
-            "Je n'ai pas pu interpréter cette demande. "
-            "Pouvez-vous préciser le lieu, le jour et l'heure souhaités ?"
-        )
+        reply_text = "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?"
         raw_action = None
     else:
-        reply_text = str(validated_ai.get("reply") or "Je suis à votre disposition pour votre voyage.")
+        reply_text = str(
+            validated_ai.get("reply")
+            or "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?"
+        )
         raw_action = validated_ai.get("proposed_action")
 
     # Point 3 : Le message "Modification confirmée et appliquée" ne doit JAMAIS apparaître avant un clic sur Confirmer

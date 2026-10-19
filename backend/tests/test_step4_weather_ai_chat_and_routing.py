@@ -1644,9 +1644,10 @@ async def test_real_ai_provider_no_silent_fallback_logs_and_health_check(
             for rec in caplog.records
         )
 
-    # 2. Basculer en AI_PROVIDER_MODE=real avec une URL Ollama injoignable :
+    # 2. Basculer en AI_CHAT_STRATEGY=model + AI_PROVIDER_MODE=real avec une URL Ollama injoignable :
     #    - /health doit tester la vraie connexion et signaler ollama_unreachable (connected=False)
     #    - le chat doit renvoyer 503 (aucun repli silencieux vers le simulateur)
+    monkeypatch.setenv("AI_CHAT_STRATEGY", "model")
     monkeypatch.setenv("AI_PROVIDER_MODE", "real")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:59999")
     monkeypatch.setenv("OLLAMA_MODEL", "mistral")
@@ -1656,6 +1657,7 @@ async def test_real_ai_provider_no_silent_fallback_logs_and_health_check(
     health_resp = await client.get("/health")
     assert health_resp.status_code == 200
     health_data = health_resp.json()
+    assert health_data["ai_chat_strategy"] == "model"
     assert health_data["providers"]["ai"]["mode"] == "real"
     assert health_data["providers"]["ai"]["connected"] is False
     assert health_data["ai_connection"]["connected"] is False
@@ -1673,6 +1675,263 @@ async def test_real_ai_provider_no_silent_fallback_logs_and_health_check(
             "mode=real" in rec.message and "model=mistral" in rec.message and "duration_ms=" in rec.message
             for rec in caplog.records
         )
+
+
+@pytest.mark.asyncio
+async def test_rules_mode_default_40_real_french_sentences_and_health_strategy(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Vérifie :
+    1. AI_CHAT_STRATEGY=rules (défaut) | hybrid | model : en mode rules, aucun appel à Ollama,
+       aucune dépendance réseau externe, et /health indique la stratégie active sans exiger Ollama.
+    2. L'analyseur à règles sur un jeu de 40 phrases réelles (synonymes, correspondance approximative,
+       pronoms liés au dernier lieu cité, jours nommés, dates françaises avec fautes, heures,
+       questions d'information, et clarification en cas d'incompréhension).
+    3. Conservation de la validation, de la confirmation obligatoire et du contrôle d'accès.
+    """
+    from app.core.providers import SimulatedAIProvider, reset_provider_registry
+
+    monkeypatch.setenv("AI_CHAT_STRATEGY", "rules")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:59999")
+    get_settings.cache_clear()
+    reset_provider_registry()
+
+    # 1. Vérification de /health en mode rules (n'exige pas Ollama même si l'URL Ollama est injoignable)
+    health_resp = await client.get("/health")
+    assert health_resp.status_code == 200
+    h_json = health_resp.json()
+    assert h_json["ai_chat_strategy"] == "rules"
+    assert h_json["providers"]["ai"]["chat_strategy"] == "rules"
+    assert h_json["providers"]["ai"]["ollama_required"] is False
+    assert h_json["providers"]["ai"]["connected"] is True
+
+    # 2. Contexte de test Marrakech (mardi 10 novembre 2026 -> lundi 16 novembre 2026)
+    safe_trip_context = {
+        "trip": {
+            "city_name": "Marrakech",
+            "arrival_at": "2026-11-10T09:00:00+00:00",
+            "departure_at": "2026-11-16T18:00:00+00:00",
+            "currency": "EUR",
+            "total_budget_planned": 1800,
+        },
+        "weather": [
+            {"date": "2026-11-10", "condition_label_fr": "Ensoleillé", "temp_max_c": 25},
+            {"date": "2026-11-11", "condition_label_fr": "Ensoleillé", "temp_max_c": 26},
+            {"date": "2026-11-12", "condition_label_fr": "Éclaircies", "temp_max_c": 24},
+            {"date": "2026-11-13", "condition_label_fr": "Ensoleillé", "temp_max_c": 25},
+            {"date": "2026-11-14", "condition_label_fr": "Ensoleillé", "temp_max_c": 27},
+            {"date": "2026-11-15", "condition_label_fr": "Ensoleillé", "temp_max_c": 26},
+            {"date": "2026-11-16", "condition_label_fr": "Ensoleillé", "temp_max_c": 24},
+        ],
+        "budget": {
+            "planned_total": 1800,
+            "committed_total": 620,
+            "remaining_total": 1180,
+        },
+        "itinerary": [
+            {
+                "item_id": "visit-bahia",
+                "place_id": "bahia-id",
+                "place_name": "Palais de la Bahia",
+                "visit_date": "2026-11-11",
+                "local_start_time": "10:00",
+                "duration_minutes": 90,
+                "transit_mode": "WALKING",
+            },
+            {
+                "item_id": "visit-koutoubia",
+                "place_id": "koutoubia-id",
+                "place_name": "Mosquée Koutoubia",
+                "visit_date": "2026-11-12",
+                "local_start_time": "09:30",
+                "duration_minutes": 60,
+                "transit_mode": "WALKING",
+            },
+            {
+                "item_id": "visit-menara",
+                "place_id": "menara-id",
+                "place_name": "Jardins de la Ménara",
+                "visit_date": "2026-11-12",
+                "local_start_time": "16:00",
+                "duration_minutes": 90,
+                "transit_mode": "TAXI",
+            },
+        ],
+        "available_places": [
+            {
+                "id": "bahia-id",
+                "name": "Palais de la Bahia",
+                "category": "CULTURE",
+                "recommended_duration_min": 90,
+                "is_outdoor": False,
+                "opening_hours": {"default": "09:00 - 17:00"},
+            },
+            {
+                "id": "koutoubia-id",
+                "name": "Mosquée Koutoubia",
+                "category": "MONUMENT",
+                "recommended_duration_min": 60,
+                "is_outdoor": True,
+                "opening_hours": {"default": "08:00 - 20:00"},
+            },
+            {
+                "id": "menara-id",
+                "name": "Jardins de la Ménara",
+                "category": "PARK",
+                "recommended_duration_min": 90,
+                "is_outdoor": True,
+                "opening_hours": {"default": "08:00 - 18:00"},
+            },
+            {
+                "id": "majorelle-id",
+                "name": "Jardin Majorelle",
+                "category": "NATURE",
+                "recommended_duration_min": 120,
+                "is_outdoor": True,
+                "opening_hours": {"default": "08:30 - 18:00"},
+            },
+            {
+                "id": "jemaa-id",
+                "name": "Place Jemaa el-Fna",
+                "category": "CULTURE",
+                "recommended_duration_min": 120,
+                "is_outdoor": True,
+                "opening_hours": {"default": "09:00 - 23:00"},
+            },
+            {
+                "id": "medersa-id",
+                "name": "Medersa Ben Youssef",
+                "category": "CULTURE",
+                "recommended_duration_min": 90,
+                "is_outdoor": False,
+                "opening_hours": {"default": "09:00 - 18:00"},
+            },
+            {
+                "id": "saadiens-id",
+                "name": "Tombeaux saadiens",
+                "category": "MONUMENT",
+                "recommended_duration_min": 75,
+                "is_outdoor": False,
+                "opening_hours": {"default": "09:00 - 17:00"},
+            },
+            {
+                "id": "ysl-id",
+                "name": "Musée Yves Saint Laurent",
+                "category": "MUSEUM",
+                "recommended_duration_min": 90,
+                "is_outdoor": False,
+                "opening_hours": {"default": "10:00 - 18:00"},
+            },
+            {
+                "id": "secret-id",
+                "name": "Le Jardin Secret",
+                "category": "NATURE",
+                "recommended_duration_min": 90,
+                "is_outdoor": True,
+                "opening_hours": {"default": "09:30 - 18:30"},
+            },
+            {
+                "id": "epices-id",
+                "name": "Café des Épices",
+                "category": "RESTAURANT",
+                "recommended_duration_min": 75,
+                "is_outdoor": False,
+                "opening_hours": {"default": "09:00 - 22:00"},
+            },
+        ],
+        "last_place_id": "bahia-id",
+        "last_place_name": "Palais de la Bahia",
+        "last_place_date": "2026-11-11",
+        "last_place_time": "10:00",
+    }
+
+    # Jeu de 40 phrases réelles : (phrase, action_attendue, lieu_attendu, date_attendue, heure_attendue)
+    benchmark_40_sentences: list[tuple[str, str, str | None, str | None, str | None]] = [
+        # 5 phrases imposées par l'énoncé
+        ("modifier Palais de la Bahia le 13 novembre à 12h", "MOVE_VISIT", "Palais de la Bahia", "2026-11-13", "12:00"),
+        ("on le mets à 12h", "MOVE_VISIT", "Palais de la Bahia", "2026-11-11", "12:00"),
+        ("on change un truc", "ASK", None, None, None),
+        ("Palaisde la bahia le 13 novmbre à 14h", "MOVE_VISIT", "Palais de la Bahia", "2026-11-13", "14:00"),
+        ("tu peux me donner d'autres lieux", "INFO", None, None, None),
+        # Ajouts (synonymes + fautes + articles manquants + jours nommés + dates françaises)
+        ("ajouter Jardin Majorelle le 12 novembre à 10h", "ADD_VISIT", "Jardin Majorelle", "2026-11-12", "10:00"),
+        ("rajouter Place Jemaa el-Fna vendredi à 18h30", "ADD_VISIT", "Place Jemaa el-Fna", "2026-11-13", "18:30"),
+        ("mettre Medersa Ben Youssef mercredi à 15h", "ADD_VISIT", "Medersa Ben Youssef", "2026-11-11", "15:00"),
+        ("planifier Tombeaux saadiens samedi à 11h", "ADD_VISIT", "Tombeaux saadiens", "2026-11-14", "11:00"),
+        ("programmer Musée Yves Saint Laurent jeudi à 14h30", "ADD_VISIT", "Musée Yves Saint Laurent", "2026-11-12", "14:30"),
+        ("insérer Le Jardin Secret dimanche à 10h30", "ADD_VISIT", "Le Jardin Secret", "2026-11-15", "10:30"),
+        ("visiter Café des Épices demain à 13h", "ADD_VISIT", "Café des Épices", "2026-11-11", "13:00"),
+        ("aller voir majorele après-demain à 9h30", "ADD_VISIT", "Jardin Majorelle", "2026-11-12", "09:30"),
+        ("ajoute ben yousef le 14 novembre à 16h", "ADD_VISIT", "Medersa Ben Youssef", "2026-11-14", "16:00"),
+        ("rajoute tombeaux sadiens le 15 novmbre à 11h15", "ADD_VISIT", "Tombeaux saadiens", "2026-11-15", "11:15"),
+        ("mets jemaa el fna samedi à 19h", "ADD_VISIT", "Place Jemaa el-Fna", "2026-11-14", "19:00"),
+        # Déplacements / modifications (synonymes + pronoms + fautes + articles manquants)
+        ("déplacer Palais de la Bahia à jeudi 15h", "MOVE_VISIT", "Palais de la Bahia", "2026-11-12", "15:00"),
+        ("décaler Mosquée Koutoubia à 11h30", "MOVE_VISIT", "Mosquée Koutoubia", "2026-11-12", "11:30"),
+        ("changer Jardins de la Ménara au vendredi à 17h", "MOVE_VISIT", "Jardins de la Ménara", "2026-11-13", "17:00"),
+        ("modifie la bahia vendredi à 10h30", "MOVE_VISIT", "Palais de la Bahia", "2026-11-13", "10:30"),
+        ("décale koutoubia à demain 16h", "MOVE_VISIT", "Mosquée Koutoubia", "2026-11-11", "16:00"),
+        ("deplace menara samedi à 14h", "MOVE_VISIT", "Jardins de la Ménara", "2026-11-14", "14:00"),
+        ("on la décale à vendredi 15h30", "MOVE_VISIT", "Palais de la Bahia", "2026-11-13", "15:30"),
+        ("déplace-le à samedi 10h", "MOVE_VISIT", "Palais de la Bahia", "2026-11-14", "10:00"),
+        ("mettre ça vendredi à 16h", "MOVE_VISIT", "Palais de la Bahia", "2026-11-13", "16:00"),
+        # Suppressions / retraits / annulations (synonymes + pronoms + articles manquants)
+        ("retirer Palais de la Bahia", "REMOVE_VISIT", "Palais de la Bahia", "2026-11-11", "10:00"),
+        ("supprimer Mosquée Koutoubia du programme", "REMOVE_VISIT", "Mosquée Koutoubia", "2026-11-12", "09:30"),
+        ("annuler la visite de Jardins de la Ménara", "REMOVE_VISIT", "Jardins de la Ménara", "2026-11-12", "16:00"),
+        ("enlever bahia", "REMOVE_VISIT", "Palais de la Bahia", "2026-11-11", "10:00"),
+        ("supprime-le du programme", "REMOVE_VISIT", "Palais de la Bahia", "2026-11-11", "10:00"),
+        ("retire ça s'il te plaît", "REMOVE_VISIT", "Palais de la Bahia", "2026-11-11", "10:00"),
+        # Questions d'information (autres lieux, météo, budget, horaires)
+        ("quels autres endroits je peux voir à Marrakech ?", "INFO", None, None, None),
+        ("quelle est la météo prévue pour mon séjour ?", "INFO", None, None, None),
+        ("combien il me reste dans mon budget ?", "INFO", None, None, None),
+        ("quels sont les horaires d'ouverture de Jardin Majorelle ?", "INFO", "Jardin Majorelle", None, None),
+        # Demandes floues ou incomplètes -> ASK (jamais de proposition au hasard ni de résumé hors sujet)
+        ("je ne sais pas trop quoi faire", "ASK", None, None, None),
+        ("ajoute une visite", "ASK", None, None, None),
+        ("déplace un musée", "ASK", None, None, None),
+        ("supprime un lieu", "ASK", None, None, None),
+        ("ajoute Jardin Majorelle", "ASK", "Jardin Majorelle", None, None),
+    ]
+
+    assert len(benchmark_40_sentences) == 40
+    rules_provider = SimulatedAIProvider(get_settings())
+    passed_count = 0
+    failures: list[str] = []
+
+    for idx, (sentence, exp_action, exp_place, exp_date, exp_time) in enumerate(benchmark_40_sentences, start=1):
+        res = await rules_provider.generate_chat_reply(
+            user_message=sentence,
+            safe_trip_context=safe_trip_context,
+            chat_history=[],
+        )
+        pa = res.get("proposed_action")
+        got_action = pa["action_type"] if isinstance(pa, dict) else res.get("action_type")
+        got_place = pa.get("place_name") if isinstance(pa, dict) else res.get("place_name")
+        got_date = pa.get("visit_date") if isinstance(pa, dict) else res.get("visit_date")
+        got_time = pa.get("local_start_time") if isinstance(pa, dict) else res.get("local_start_time")
+
+        if (
+            got_action == exp_action
+            and got_place == exp_place
+            and got_date == exp_date
+            and got_time == exp_time
+        ):
+            passed_count += 1
+        else:
+            failures.append(
+                f"#{idx} {sentence!r} -> attendu=({exp_action}, {exp_place}, {exp_date}, {exp_time}) | "
+                f"obtenu=({got_action}, {got_place}, {got_date}, {got_time})"
+            )
+
+        if exp_action == "ASK":
+            assert pa is None
+            assert "Pour votre séjour à" not in str(res.get("reply", ""))
+
+    assert passed_count == 40, "Échecs sur le jeu de 40 phrases :\n" + "\n".join(failures)
 
 
 

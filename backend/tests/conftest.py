@@ -17,6 +17,7 @@ def default_simulated_ai_provider_for_tests(monkeypatch: pytest.MonkeyPatch) -> 
     Par défaut, les tests unitaires/d'intégration s'exécutent en mode simulé déterministe,
     tandis que les tests dédiés au mode réel basculent explicitement AI_PROVIDER_MODE=real.
     """
+    monkeypatch.setenv("AI_CHAT_STRATEGY", "rules")
     monkeypatch.setenv("AI_PROVIDER_MODE", "simulated")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
     monkeypatch.setenv("OLLAMA_MODEL", "mistral")

@@ -48,7 +48,8 @@ services:
       DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER:-travelmate}:${POSTGRES_PASSWORD:-travelmate_dev_password}@postgres:5432/${POSTGRES_DB:-travelmate_db}
       REDIS_URL: redis://redis:6379/0
       FRONTEND_INTERNAL_URL: http://frontend:5173
-      AI_PROVIDER_MODE: ${AI_PROVIDER_MODE:-real}
+      AI_CHAT_STRATEGY: ${AI_CHAT_STRATEGY:-rules}
+      AI_PROVIDER_MODE: ${AI_PROVIDER_MODE:-simulated}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral}
       OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-90}

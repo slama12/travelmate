@@ -6,6 +6,7 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderMode = Literal["simulated", "real"]
+ChatStrategyMode = Literal["rules", "hybrid", "model"]
 
 _ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
 _LOCAL_ENV = Path(__file__).resolve().parents[2] / ".env"
@@ -70,6 +71,7 @@ class Settings(BaseSettings):
     WEATHER_BASE_URL: str = Field(default="https://api.openweathermap.org/data/2.5")
     WEATHER_FORECAST_HORIZON_DAYS: int = Field(default=180, ge=1)
 
+    AI_CHAT_STRATEGY: ChatStrategyMode = Field(default="rules")
     AI_PROVIDER_MODE: ProviderMode = Field(default="simulated")
     AI_API_KEY: str = Field(default="")
     AI_MODEL_NAME: str = Field(default="gemini-2.5-flash")
