@@ -262,7 +262,7 @@ export function Modal({
  * 6. BADGE
  * ========================================================================== */
 const badgeVariants = cva(
-  "inline-flex items-center gap-1 rounded-md px-2.5 py-0.5 text-caption font-medium",
+  "inline-flex items-center gap-1 rounded-md px-2.5 py-0.5 text-caption font-medium whitespace-nowrap shrink-0",
   {
     variants: {
       variant: {

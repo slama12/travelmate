@@ -17,8 +17,9 @@ from app.core.providers.real import (
     RealPlacesProvider,
     RealRoutingProvider,
     RealWeatherProvider,
+    build_chat_assistant_prompt,
 )
-from app.core.providers.registry import ProviderRegistry, get_provider_registry
+from app.core.providers.registry import ProviderRegistry, get_provider_registry, reset_provider_registry
 from app.core.providers.simulated import (
     SimulatedAIProvider,
     SimulatedCalendarProvider,
@@ -54,4 +55,5 @@ __all__ = [
     "SimulatedRoutingProvider",
     "ProviderRegistry",
     "get_provider_registry",
+    "reset_provider_registry",
 ]

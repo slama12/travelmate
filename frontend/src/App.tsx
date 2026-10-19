@@ -1726,23 +1726,24 @@ export function TravelMateShell({
     <div className="min-h-screen flex flex-col bg-canvas text-ink overflow-x-hidden">
       {/* Navigation finale : barre de progression Destination > Vol > Hébergement > Activités > Programme */}
       <header className="sticky top-0 z-30 border-b border-border bg-canvas-card/95 backdrop-blur">
-        <div className="mx-auto max-w-7xl px-4 h-16 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-4">
+        <div className="mx-auto max-w-[1440px] px-4 h-16 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 xl:gap-3 min-w-0">
             <Link
               to="/"
-              className="flex items-center gap-2 text-ink font-semibold text-h2 tracking-tight focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 rounded-md"
+              data-testid="header-brand-link"
+              className="flex items-center gap-2 text-ink font-semibold text-h2 tracking-tight whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 rounded-md"
             >
-              <span className="flex h-9 w-9 items-center justify-center rounded-card bg-brand-700 text-white">
+              <span className="flex h-8 w-8 xl:h-9 xl:w-9 items-center justify-center rounded-card bg-brand-700 text-white shrink-0">
                 <Plane className="h-4 w-4" />
               </span>
               <span>TravelMate</span>
             </Link>
 
-            {/* Barre de progression sur ordinateur */}
+            {/* Barre de progression sur ordinateur (>= 1280px) */}
             <nav
               aria-label="Étapes de votre voyage"
               data-testid="step-progress-bar"
-              className="hidden lg:flex items-center gap-0.5"
+              className="hidden xl:flex items-center gap-0.5 shrink-0"
             >
               {progressSteps.map((step, index) => (
                 <React.Fragment key={step.to}>
@@ -1750,21 +1751,21 @@ export function TravelMateShell({
                     to={step.to}
                     end={step.end}
                     className={({ isActive }) =>
-                      `inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-card text-caption font-semibold transition-colors ${
+                      `inline-flex items-center gap-1 px-2 py-1 rounded-card text-[12px] font-semibold whitespace-nowrap shrink-0 transition-colors ${
                         isActive
                           ? "bg-brand-700 text-white shadow-sm"
                           : "text-ink-secondary hover:text-ink hover:bg-canvas-subtle"
                       }`
                     }
                   >
-                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-black/10 text-[11px] font-bold">
+                    <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-black/10 text-[10px] font-bold shrink-0">
                       {index + 1}
                     </span>
                     <span>{step.label}</span>
                   </NavLink>
                   {index < progressSteps.length - 1 && (
                     <ChevronRight
-                      className="h-3.5 w-3.5 text-ink-muted shrink-0"
+                      className="h-3 w-3 text-ink-muted shrink-0"
                       aria-hidden="true"
                     />
                   )}
@@ -1773,14 +1774,14 @@ export function TravelMateShell({
             </nav>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 shrink-0">
             {activeDestination && (
               <Badge
                 variant="brand"
-                className="hidden sm:inline-flex"
+                className="hidden sm:inline-flex whitespace-nowrap shrink-0 px-2 py-0.5 text-[12px]"
                 data-testid="active-destination-pill"
               >
-                <MapPin className="h-3.5 w-3.5" />
+                <MapPin className="h-3 w-3 shrink-0" />
                 <span>{activeDestination.city_name}</span>
               </Badge>
             )}
@@ -1789,14 +1790,14 @@ export function TravelMateShell({
               to="/trip"
               data-testid="nav-my-trip-link"
               className={({ isActive }) =>
-                `inline-flex items-center gap-1.5 px-3 py-1.5 rounded-card text-caption font-semibold transition-colors ${
+                `inline-flex items-center gap-1 px-2.5 py-1 rounded-card text-[12px] font-semibold whitespace-nowrap shrink-0 transition-colors ${
                   isActive
                     ? "bg-brand-50 text-brand-800 border border-brand-200"
                     : "text-ink-secondary hover:text-ink hover:bg-canvas-subtle"
                 }`
               }
             >
-              <Compass className="h-4 w-4 text-brand-700" />
+              <Compass className="h-3.5 w-3.5 text-brand-700 shrink-0" />
               <span className="hidden sm:inline">Mon voyage</span>
             </NavLink>
 
@@ -1804,10 +1805,11 @@ export function TravelMateShell({
               type="button"
               variant="ghost"
               size="sm"
+              className="whitespace-nowrap shrink-0 px-2.5 py-1 text-[12px]"
               data-testid="open-documents-btn"
               onClick={() => setDocumentsModalOpen(true)}
             >
-              <FileText className="h-4 w-4 text-brand-700" />
+              <FileText className="h-3.5 w-3.5 text-brand-700 shrink-0" />
               <span className="hidden md:inline">Mes documents</span>
             </Button>
 
@@ -1816,7 +1818,7 @@ export function TravelMateShell({
               aria-label="Paramètres"
               data-testid="nav-settings-link"
               className={({ isActive }) =>
-                `rounded-md p-2 transition-colors ${
+                `rounded-md p-1.5 shrink-0 transition-colors ${
                   isActive
                     ? "bg-brand-50 text-brand-800"
                     : "text-ink-muted hover:bg-canvas-subtle hover:text-ink"
@@ -1827,14 +1829,14 @@ export function TravelMateShell({
             </NavLink>
 
             {token && currentUser ? (
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 shrink-0">
                 <Link
                   to="/login"
                   data-testid="header-user-link"
-                  className="inline-flex items-center gap-1.5 rounded-card border border-border bg-canvas-subtle px-2.5 py-1.5 text-caption font-medium text-ink hover:bg-border/40"
+                  className="inline-flex items-center gap-1 rounded-card border border-border bg-canvas-subtle px-2 py-1 text-[12px] font-medium text-ink whitespace-nowrap shrink-0 hover:bg-border/40"
                 >
-                  <User className="h-3.5 w-3.5 text-brand-700" />
-                  <span className="max-w-[96px] truncate hidden sm:inline">
+                  <User className="h-3.5 w-3.5 text-brand-700 shrink-0" />
+                  <span className="max-w-[84px] truncate hidden sm:inline">
                     {currentUser.full_name.split(" ")[0]}
                   </span>
                 </Link>
@@ -1843,7 +1845,7 @@ export function TravelMateShell({
                   onClick={handleLogout}
                   aria-label="Se déconnecter"
                   data-testid="logout-btn"
-                  className="rounded-md p-2 text-ink-muted hover:bg-canvas-subtle hover:text-ink"
+                  className="rounded-md p-1.5 text-ink-muted hover:bg-canvas-subtle hover:text-ink shrink-0"
                 >
                   <LogOut className="h-4 w-4" />
                 </button>
@@ -1853,6 +1855,7 @@ export function TravelMateShell({
                 type="button"
                 variant="secondary"
                 size="sm"
+                className="whitespace-nowrap shrink-0"
                 data-testid="header-login-btn"
                 onClick={() => navigate("/login")}
               >
@@ -1862,11 +1865,11 @@ export function TravelMateShell({
           </div>
         </div>
 
-        {/* Barre de progression mobile / tablette */}
+        {/* Barre de progression mobile / tablette (< 1280px) */}
         <nav
           aria-label="Étapes de votre voyage sur mobile"
           data-testid="mobile-step-progress-bar"
-          className="flex lg:hidden items-center gap-1 overflow-x-auto no-scrollbar px-4 py-2 border-t border-border bg-canvas-card"
+          className="flex xl:hidden items-center gap-1 overflow-x-auto no-scrollbar px-4 py-2 border-t border-border bg-canvas-card"
         >
           {progressSteps.map((step, index) => (
             <React.Fragment key={step.to}>

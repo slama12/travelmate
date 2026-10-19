@@ -16,6 +16,9 @@ async def build_health_payload() -> dict[str, Any]:
     db_health = await check_database_health()
     redis_health = await cache_client.health_check()
     providers_summary = registry.health_summary()
+    ai_conn = await registry.ai.check_connection()
+    if "ai" in providers_summary:
+        providers_summary["ai"].update(ai_conn)
     active_modes = {name: info["mode"] for name, info in providers_summary.items()}
 
     return {
@@ -29,6 +32,7 @@ async def build_health_payload() -> dict[str, Any]:
         "redis": redis_health,
         "active_provider_modes": active_modes,
         "providers": providers_summary,
+        "ai_connection": ai_conn,
         "routing_provider": registry.routing_info(),
     }
 

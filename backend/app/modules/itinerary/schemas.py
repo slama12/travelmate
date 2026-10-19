@@ -35,6 +35,10 @@ class ItineraryItemCreateRequest(BaseModel):
     )
     transit_mode: str = Field(default="METRO", description="WALKING, METRO ou CAR")
     notes: str | None = Field(default=None, max_length=500)
+    allow_duplicate: bool = Field(
+        default=False,
+        description="Autorise explicitement la planification d'un même lieu une deuxième fois dans le séjour",
+    )
 
 
 class ItineraryItemUpdateRequest(BaseModel):

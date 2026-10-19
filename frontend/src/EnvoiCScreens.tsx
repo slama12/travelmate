@@ -2233,8 +2233,12 @@ export function ItineraryScreen({
     if (!trip?.id) return;
     setChatConfirmingId(messageId);
     try {
+      const qs = new URLSearchParams();
+      if (overrideDate) qs.set("override_visit_date", overrideDate);
+      if (overrideStartTime) qs.set("override_local_start_time", overrideStartTime);
+      const querySuffix = qs.toString() ? `?${qs.toString()}` : "";
       const resp = await fetch(
-        `${apiBase}/api/v1/itinerary/trip/${trip.id}/chat/${messageId}/confirm`,
+        `${apiBase}/api/v1/itinerary/trip/${trip.id}/chat/${messageId}/confirm${querySuffix}`,
         {
           method: "POST",
           headers: {
@@ -2291,6 +2295,32 @@ export function ItineraryScreen({
       }
     } finally {
       setChatConfirmingId("");
+    }
+  }
+
+  async function handleResetChatConversation() {
+    if (!trip?.id) return;
+    setChatSending(true);
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/itinerary/trip/${trip.id}/chat`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (resp.ok) {
+        const data: ChatConversationPayload = await resp.json();
+        setChatMessages(data.messages || []);
+        setChatInput("");
+        notify({
+          title: "Nouvelle conversation",
+          description: "L'historique de la discussion a été réinitialisé.",
+          tone: "info",
+        });
+      }
+    } finally {
+      setChatSending(false);
     }
   }
 
@@ -2386,41 +2416,77 @@ export function ItineraryScreen({
   const routingSourceBadgeLabel =
     schedule?.routing_source_label || "Temps estimé";
 
+  const lastAssistantMsg =
+    [...chatMessages].reverse().find((m) => m.role !== "user") || null;
+
+  const pendingChatProposalMsg =
+    lastAssistantMsg &&
+    lastAssistantMsg.proposed_action &&
+    lastAssistantMsg.action_status === "PENDING_CONFIRMATION"
+      ? lastAssistantMsg
+      : null;
+
   return (
     <div
-      className="mx-auto max-w-6xl px-4 py-6 space-y-5 pb-24"
+      className={`px-4 py-6 space-y-5 pb-24 transition-all ${
+        chatOpen
+          ? "mx-auto max-w-6xl xl:max-w-none xl:mx-0 xl:mr-[396px] xl:pl-6 xl:pr-4"
+          : "mx-auto max-w-6xl"
+      }`}
       data-testid="itinerary-screen"
     >
-      {/* En-tête Mon programme */}
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2 mb-2">
-            <Badge variant="brand">
+      {/* En-tête Mon programme :
+          - En colonne (titre pleine largeur, boutons dessous alignés qui passent à la ligne proprement)
+          - Badges sur une seule ligne, aucune coupure de mot dans les titres */}
+      <div
+        className="flex flex-col items-start gap-3.5 w-full"
+        data-testid="itinerary-header"
+      >
+        <div className="w-full min-w-0">
+          <div
+            className="flex flex-nowrap items-center gap-1.5 sm:gap-2 mb-2"
+            data-testid="itinerary-header-badges"
+          >
+            <Badge
+              variant="brand"
+              className="whitespace-nowrap shrink-0 px-2 py-0.5 text-[11px] sm:px-2.5 sm:text-caption"
+            >
               Agenda jour par jour • {cityLabel}
             </Badge>
-            <Badge data-testid="routing-mode-badge">
+            <Badge
+              data-testid="routing-mode-badge"
+              className="whitespace-nowrap shrink-0 px-2 py-0.5 text-[11px] sm:px-2.5 sm:text-caption"
+            >
               Trajets : {routingSourceBadgeLabel}
             </Badge>
           </div>
-          <h1 className="text-h1 text-ink">Mon programme à {cityLabel}</h1>
+          <h1
+            data-testid="itinerary-page-title"
+            className="text-h1 text-ink w-full break-normal [word-break:normal] [overflow-wrap:normal] hyphens-none"
+          >
+            Mon programme à {cityLabel}
+          </h1>
           <p className="text-body text-ink-secondary mt-1">
             Un jour à la fois, avec prévisions météo, itinéraire sur mesure et temps de déplacement.
           </p>
         </div>
 
-        <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 shrink-0">
+        <div
+          className="flex flex-wrap items-center gap-2"
+          data-testid="itinerary-header-actions"
+        >
           <Button
             type="button"
             variant="secondary"
             size="md"
-            className="whitespace-nowrap"
+            className="whitespace-nowrap shrink-0"
             data-testid="open-ai-generator-modal-btn"
             onClick={() => {
               setAiErrorMsg("");
               setAiModalOpen(true);
             }}
           >
-            <Wand2 className="h-4 w-4 text-brand-700" />
+            <Wand2 className="h-4 w-4 text-brand-700 shrink-0" />
             <span>Génère mon programme</span>
           </Button>
 
@@ -2428,12 +2494,12 @@ export function ItineraryScreen({
             type="button"
             variant="secondary"
             size="md"
-            className="whitespace-nowrap"
+            className="whitespace-nowrap shrink-0"
             disabled={optimizing}
             data-testid="optimize-itinerary-btn"
             onClick={handlePreviewOptimization}
           >
-            <Sparkles className="h-4 w-4 text-brand-700" />
+            <Sparkles className="h-4 w-4 text-brand-700 shrink-0" />
             <span>
               {optimizing ? "Calcul en cours..." : "Optimiser mon programme"}
             </span>
@@ -2443,22 +2509,23 @@ export function ItineraryScreen({
             type="button"
             variant="primary"
             size="md"
-            className="whitespace-nowrap"
+            className="whitespace-nowrap shrink-0"
             data-testid="open-schedule-visit-modal-btn"
             onClick={() => {
               setVisitDate(selectedDayDate || tripDays[0] || "2026-11-11");
               setAddModalOpen(true);
             }}
           >
-            <Plus className="h-4 w-4" />
+            <Plus className="h-4 w-4 shrink-0" />
             <span>Planifier une visite</span>
           </Button>
         </div>
       </div>
 
-      {/* Puces horizontales des jours du séjour AVEC météo par jour (UN JOUR À LA FOIS) */}
+      {/* Puces horizontales des jours du séjour AVEC météo par jour (bande défilante horizontale sans coupure) */}
       <div
-        className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1"
+        id="itinerary-day-pills"
+        className="flex flex-nowrap items-stretch gap-2 overflow-x-auto no-scrollbar py-1 w-full max-w-full"
         role="tablist"
         aria-label="Jours du séjour"
         data-testid="itinerary-day-pills"
@@ -2489,17 +2556,17 @@ export function ItineraryScreen({
                   setDraggedVisit(null);
                 }
               }}
-              className={`flex flex-1 min-w-[122px] flex-col items-start gap-1 rounded-card px-2.5 py-2 text-[12px] font-semibold whitespace-nowrap transition-all ${
+              className={`flex shrink-0 flex-col items-start justify-between gap-1 rounded-card px-3.5 py-2 text-[12px] font-semibold whitespace-nowrap transition-all ${
                 isSelected
                   ? "bg-brand-700 text-white shadow-soft"
                   : "bg-canvas-card border border-border text-ink-secondary hover:text-ink"
               }`}
             >
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1.5 whitespace-nowrap">
                 <span>{formatDayPillHuman(dayStr, index)}</span>
                 {countForDay > 0 && (
                   <span
-                    className={`inline-flex h-4 min-w-[18px] items-center justify-center rounded-full px-1 text-[10px] font-bold ${
+                    className={`inline-flex h-4 min-w-[18px] items-center justify-center rounded-full px-1 text-[10px] font-bold shrink-0 ${
                       isSelected
                         ? "bg-white/20 text-white"
                         : "bg-brand-50 text-brand-800"
@@ -2511,7 +2578,7 @@ export function ItineraryScreen({
               </div>
 
               <div
-                className={`inline-flex items-center gap-1 text-[11px] font-medium ${
+                className={`inline-flex items-center gap-1 text-[11px] font-medium whitespace-nowrap ${
                   isSelected ? "text-white/90" : "text-ink-muted"
                 }`}
                 data-testid={`day-pill-weather-${index}`}
@@ -2805,21 +2872,24 @@ export function ItineraryScreen({
       {/* Vue chronologique verticale du jour choisi */}
       <Card className="p-6 space-y-5" data-testid="single-day-timeline-card">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-4">
-          <div>
-            <h2 className="text-h2 text-ink">
+          <div className="min-w-0">
+            <h2 className="text-h2 text-ink break-normal [word-break:normal] [overflow-wrap:normal] hyphens-none">
               {selectedDayDate ? formatFullDateHuman(selectedDayDate) : "Journée sélectionnée"}
             </h2>
             <p className="text-caption text-ink-secondary mt-0.5">
               Glissez une visite sur une autre heure ou sur la puce d'un autre jour pour la déplacer.
             </p>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge data-testid="selected-day-weather-badge">
+          <div className="flex flex-nowrap items-center gap-2 shrink-0">
+            <Badge
+              data-testid="selected-day-weather-badge"
+              className="whitespace-nowrap shrink-0"
+            >
               {selectedDayWeather
                 ? selectedDayWeather.badge_label
                 : "Prévision non disponible"}
             </Badge>
-            <Badge variant="brand">
+            <Badge variant="brand" className="whitespace-nowrap shrink-0">
               {currentDayItems.length}{" "}
               {currentDayItems.length > 1 ? "visites prévues" : "visite prévue"}
             </Badge>
@@ -2840,7 +2910,7 @@ export function ItineraryScreen({
               <CalendarIcon className="h-6 w-6" />
             </div>
             <div className="space-y-1">
-              <h3 className="text-body font-semibold text-ink">
+              <h3 className="text-body font-semibold text-ink break-normal [word-break:normal] [overflow-wrap:normal] hyphens-none">
                 Aucune visite prévue sur cette journée
               </h3>
               <p className="text-caption text-ink-secondary max-w-md mx-auto">
@@ -2903,22 +2973,26 @@ export function ItineraryScreen({
                     <div className="absolute -left-[31px] top-6 h-3.5 w-3.5 rounded-full border-2 border-white bg-brand-700" />
 
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                      <div className="space-y-1">
+                      <div className="space-y-1 min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="inline-flex items-center gap-1 rounded-md bg-brand-700 px-2.5 py-0.5 text-caption font-bold text-white">
-                            <Clock className="h-3 w-3" />
+                          <span className="inline-flex items-center gap-1 rounded-md bg-brand-700 px-2.5 py-0.5 text-caption font-bold text-white whitespace-nowrap shrink-0">
+                            <Clock className="h-3 w-3 shrink-0" />
                             {item.local_start_time} → {item.local_end_time}
                           </span>
-                          <Badge>{categoryLabelFr(item.place_category)}</Badge>
-                          <Badge variant="success">
-                            <CheckCircle2 className="h-3 w-3 mr-1" />
+                          <Badge className="whitespace-nowrap shrink-0">
+                            {categoryLabelFr(item.place_category)}
+                          </Badge>
+                          <Badge variant="success" className="whitespace-nowrap shrink-0">
+                            <CheckCircle2 className="h-3 w-3 mr-1 shrink-0" />
                             Ajouté à Google Agenda
                           </Badge>
                         </div>
 
                         <div className="flex items-center gap-2 pt-1">
                           <GripVertical className="h-4 w-4 text-ink-muted shrink-0" />
-                          <h3 className="text-h2 text-ink">{item.place_name}</h3>
+                          <h3 className="text-h2 text-ink break-normal [word-break:normal] [overflow-wrap:normal] hyphens-none">
+                            {item.place_name}
+                          </h3>
                         </div>
 
                         <div className="text-caption text-ink-secondary pl-6">
@@ -2928,7 +3002,7 @@ export function ItineraryScreen({
                       </div>
 
                       {/* Actions rapides de décalage horaire ou suppression */}
-                      <div className="flex items-center gap-1.5 self-end sm:self-center">
+                      <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-center">
                         <Button
                           type="button"
                           variant="secondary"
@@ -3005,7 +3079,7 @@ export function ItineraryScreen({
       </Card>
 
       {/* Continuer vers le récapitulatif Mon voyage */}
-      <div className="flex justify-end">
+      <div className="flex justify-start">
         <Button
           type="button"
           size="lg"
@@ -3276,12 +3350,15 @@ export function ItineraryScreen({
         )}
       </Modal>
 
-      {/* Étape 4.3 — Bulle flottante Assistant de chat entièrement visible avec 16 px de marge */}
-      <div
-        className="fixed bottom-4 right-4 z-50"
-        style={{ bottom: "16px", right: "16px" }}
-      >
-        {!chatOpen ? (
+      {/* Étape 4.3 — Assistant de chat :
+          - Fermé : bulle flottante entièrement visible avec 16 px de marge
+          - Ouvert : plein écran sur mobile (< lg), panneau latéral ancré à droite sous l'en-tête sur grand écran (lg:)
+          - Boutons Confirmer / Refuser épinglés au-dessus du champ de saisie (hors zone défilante) */}
+      {!chatOpen ? (
+        <div
+          className="fixed bottom-4 right-4 z-40 !mt-0"
+          style={{ bottom: "16px", right: "16px", marginTop: 0 }}
+        >
           <Button
             type="button"
             size="lg"
@@ -3292,23 +3369,44 @@ export function ItineraryScreen({
             <MessageCircle className="h-5 w-5" />
             <span>Assistant voyage</span>
           </Button>
-        ) : (
-          <Card
+        </div>
+      ) : (
+        <>
+          <div
+            data-testid="chat-drawer-backdrop"
+            onClick={() => setChatOpen(false)}
+            style={{ marginTop: 0 }}
+            className="!mt-0 fixed inset-0 z-40 bg-ink/20 hidden md:block xl:hidden"
+            aria-hidden="true"
+          />
+          <aside
+            aria-label={`Assistant ${cityLabel}`}
             data-testid="floating-chat-panel"
-            className="w-[350px] sm:w-[400px] max-h-[540px] flex flex-col shadow-cardHover border-brand-200 overflow-hidden"
+            style={{ marginTop: 0 }}
+            className="!mt-0 fixed inset-0 z-50 w-full h-full md:inset-y-0 md:left-auto md:right-0 md:w-[380px] md:border-l md:border-border xl:top-16 xl:bottom-0 xl:left-auto xl:right-0 xl:z-40 xl:w-[380px] xl:h-[calc(100vh-4rem)] flex flex-col bg-canvas-card shadow-cardHover overflow-hidden"
           >
-            <div className="flex items-center justify-between gap-2 bg-brand-700 px-4 py-3 text-white">
-              <div className="flex items-center gap-2">
-                <MessageCircle className="h-4 w-4" />
-                <div>
-                  <div className="text-caption font-bold">
-                    Assistant {cityLabel}
-                  </div>
-                  <div className="text-[11px] text-white/80">
-                    Programme, météo, budget • Confirmation requise
-                  </div>
+          <div className="shrink-0 flex items-center justify-between gap-2 bg-brand-700 px-4 py-3 text-white">
+            <div className="flex items-center gap-2 min-w-0">
+              <MessageCircle className="h-4 w-4 shrink-0" />
+              <div className="min-w-0">
+                <div className="text-caption font-bold truncate">
+                  Assistant {cityLabel}
+                </div>
+                <div className="text-[11px] text-white/80 truncate">
+                  Programme, météo, budget • Confirmation requise
                 </div>
               </div>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                data-testid="new-chat-conversation-btn"
+                disabled={chatSending}
+                onClick={handleResetChatConversation}
+                className="rounded-md border border-white/25 bg-white/10 px-2 py-1 text-[11px] font-medium text-white hover:bg-white/20 disabled:opacity-50"
+              >
+                Nouvelle conversation
+              </button>
               <button
                 type="button"
                 aria-label="Fermer l'assistant"
@@ -3319,183 +3417,206 @@ export function ItineraryScreen({
                 <X className="h-4 w-4" />
               </button>
             </div>
+          </div>
 
-            <div
-              className="flex-1 overflow-y-auto p-4 space-y-3 bg-canvas max-h-[340px]"
-              data-testid="chat-messages-list"
-            >
-              {chatMessages.length === 0 ? (
-                <div className="space-y-2 text-caption text-ink-secondary">
-                  <p>
-                    Bonjour ! Je connais votre vol, votre budget, la météo et votre programme à {cityLabel}.
-                  </p>
-                  <div className="flex flex-wrap gap-1.5 pt-1">
+          {/* Zone de messages défilante (les boutons Confirmer / Refuser n'y sont jamais enfermés) */}
+          <div
+            className="flex-1 overflow-y-auto p-4 space-y-3 bg-canvas"
+            data-testid="chat-messages-list"
+          >
+            {chatMessages.length === 0 ? (
+              <div className="space-y-2 text-caption text-ink-secondary">
+                <p>
+                  Bonjour ! Je connais votre vol, votre budget, la météo et votre programme à {cityLabel}.
+                </p>
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  <button
+                    type="button"
+                    data-testid="chat-quick-weather-btn"
+                    onClick={() =>
+                      handleSendChatMessage("Quel est le point météo et budget de mon séjour ?")
+                    }
+                    className="rounded-card bg-white border border-border px-2.5 py-1.5 text-[11px] font-medium text-ink hover:border-brand-600"
+                  >
+                    Météo & budget du séjour
+                  </button>
+                  {places[0] && (
                     <button
                       type="button"
-                      data-testid="chat-quick-weather-btn"
+                      data-testid="chat-quick-add-btn"
                       onClick={() =>
-                        handleSendChatMessage("Quel est le point météo et budget de mon séjour ?")
+                        handleSendChatMessage(
+                          `Ajoute ${places[0].name} mercredi à 14h`
+                        )
                       }
                       className="rounded-card bg-white border border-border px-2.5 py-1.5 text-[11px] font-medium text-ink hover:border-brand-600"
                     >
-                      Météo & budget du séjour
+                      Proposer d'ajouter {places[0].name}
                     </button>
-                    {places[0] && (
-                      <button
-                        type="button"
-                        data-testid="chat-quick-add-btn"
-                        onClick={() =>
-                          handleSendChatMessage(
-                            `Ajoute ${places[0].name} le ${
-                              selectedDayDate || tripDays[1] || tripDays[0] || "2026-11-11"
-                            } à 14:00`
-                          )
-                        }
-                        className="rounded-card bg-white border border-border px-2.5 py-1.5 text-[11px] font-medium text-ink hover:border-brand-600"
-                      >
-                        Proposer d'ajouter {places[0].name}
-                      </button>
-                    )}
-                  </div>
+                  )}
                 </div>
-              ) : (
-                chatMessages.map((msg) => (
+              </div>
+            ) : (
+              chatMessages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`space-y-1.5 ${
+                    msg.role === "user" ? "text-right" : "text-left"
+                  }`}
+                >
                   <div
-                    key={msg.id}
-                    className={`space-y-2 ${
-                      msg.role === "user" ? "text-right" : "text-left"
+                    className={`inline-block rounded-card px-3.5 py-2.5 text-caption whitespace-pre-line ${
+                      msg.role === "user"
+                        ? "bg-brand-700 text-white"
+                        : "bg-white border border-border text-ink"
                     }`}
                   >
-                    <div
-                      className={`inline-block rounded-card px-3.5 py-2.5 text-caption ${
-                        msg.role === "user"
-                          ? "bg-brand-700 text-white"
-                          : "bg-white border border-border text-ink"
-                      }`}
-                    >
-                      {msg.content}
-                    </div>
-
-                    {msg.proposed_action &&
-                      msg.action_status === "PENDING_CONFIRMATION" && (
-                        <div
-                          data-testid="chat-proposed-action-card"
-                          className="rounded-card bg-brand-50 border border-brand-200 p-3 text-left space-y-2"
-                        >
-                          <div className="text-[11px] font-bold uppercase tracking-wide text-brand-800">
-                            Modification proposée (en attente de votre accord)
-                          </div>
-                          <div className="text-caption font-semibold text-ink">
-                            {msg.proposed_action.place_name} •{" "}
-                            {formatFullDateHuman(msg.proposed_action.visit_date)} à{" "}
-                            {msg.proposed_action.local_start_time}
-                          </div>
-
-                          {msg.proposed_action.validated_by_engine ? (
-                            <div className="flex items-center gap-2 pt-1">
-                              <Button
-                                type="button"
-                                size="sm"
-                                disabled={chatConfirmingId === msg.id}
-                                data-testid="chat-confirm-action-btn"
-                                onClick={() => handleConfirmChatAction(msg.id)}
-                              >
-                                Confirmer
-                              </Button>
-                              <Button
-                                type="button"
-                                variant="secondary"
-                                size="sm"
-                                disabled={chatConfirmingId === msg.id}
-                                data-testid="chat-reject-action-btn"
-                                onClick={() => handleRejectChatAction(msg.id)}
-                              >
-                                Refuser
-                              </Button>
-                            </div>
-                          ) : (
-                            <div className="space-y-2">
-                              <div className="text-[11px] text-feedback-warning">
-                                {msg.proposed_action.validation_message_fr}
-                              </div>
-                              {msg.proposed_action.suggested_slots?.length > 0 && (
-                                <div className="flex flex-wrap gap-1.5">
-                                  {msg.proposed_action.suggested_slots.map(
-                                    (s, sIdx) => (
-                                      <Button
-                                        key={sIdx}
-                                        type="button"
-                                        size="sm"
-                                        disabled={chatConfirmingId === msg.id}
-                                        onClick={() =>
-                                          handleConfirmChatAction(
-                                            msg.id,
-                                            s.local_date,
-                                            s.local_start_time
-                                          )
-                                        }
-                                      >
-                                        Confirmer {formatFullDateHuman(s.local_date)} • {s.local_start_time}
-                                      </Button>
-                                    )
-                                  )}
-                                </div>
-                              )}
-                              <Button
-                                type="button"
-                                variant="secondary"
-                                size="sm"
-                                data-testid="chat-reject-action-btn"
-                                onClick={() => handleRejectChatAction(msg.id)}
-                              >
-                                Refuser
-                              </Button>
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                    {msg.action_status === "CONFIRMED" && (
-                      <div className="text-[11px] font-semibold text-feedback-success">
-                        ✓ Modification confirmée et appliquée
-                      </div>
-                    )}
-                    {msg.action_status === "REJECTED" && (
-                      <div className="text-[11px] text-ink-muted">
-                        Proposition refusée (programme inchangé)
-                      </div>
-                    )}
+                    {msg.content}
                   </div>
-                ))
+
+                  {msg.action_status === "CONFIRMED" && (
+                    <div className="text-[11px] font-semibold text-feedback-success">
+                      ✓ Modification confirmée et appliquée
+                    </div>
+                  )}
+                  {msg.action_status === "REJECTED" && (
+                    <div className="text-[11px] text-ink-muted">
+                      Proposition refusée (programme inchangé)
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+
+          {/* Zone épinglée au-dessus du champ de saisie : Confirmer / Refuser toujours visibles */}
+          {pendingChatProposalMsg && pendingChatProposalMsg.proposed_action && (
+            <div
+              data-testid="chat-proposed-action-card"
+              className="shrink-0 border-t border-brand-200 bg-brand-50 px-4 py-3 text-left space-y-2"
+            >
+              <div className="text-[11px] font-bold uppercase tracking-wide text-brand-800">
+                Proposition en attente de votre accord
+              </div>
+
+              {pendingChatProposalMsg.proposed_action.validated_by_engine ? (
+                <>
+                  <div className="text-caption font-semibold text-ink">
+                    {pendingChatProposalMsg.proposed_action.place_name} •{" "}
+                    {formatFullDateHuman(
+                      pendingChatProposalMsg.proposed_action.visit_date
+                    )}{" "}
+                    à {pendingChatProposalMsg.proposed_action.local_start_time}
+                  </div>
+                  <div className="flex items-center gap-2 pt-0.5">
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                      data-testid="chat-confirm-action-btn"
+                      onClick={() =>
+                        handleConfirmChatAction(pendingChatProposalMsg.id)
+                      }
+                    >
+                      Confirmer
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                      data-testid="chat-reject-action-btn"
+                      onClick={() =>
+                        handleRejectChatAction(pendingChatProposalMsg.id)
+                      }
+                    >
+                      Refuser
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  {pendingChatProposalMsg.proposed_action.suggested_slots
+                    ?.length > 0 && (
+                    <div className="text-caption font-semibold text-ink">
+                      {pendingChatProposalMsg.proposed_action.place_name} •{" "}
+                      {formatFullDateHuman(
+                        pendingChatProposalMsg.proposed_action.suggested_slots[0]
+                          .local_date
+                      )}{" "}
+                      à{" "}
+                      {
+                        pendingChatProposalMsg.proposed_action.suggested_slots[0]
+                          .local_start_time
+                      }
+                    </div>
+                  )}
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    {pendingChatProposalMsg.proposed_action.suggested_slots
+                      ?.length > 0 && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                        data-testid="chat-confirm-action-btn"
+                        onClick={() => {
+                          const firstSlot =
+                            pendingChatProposalMsg.proposed_action!
+                              .suggested_slots[0];
+                          handleConfirmChatAction(
+                            pendingChatProposalMsg.id,
+                            firstSlot.local_date,
+                            firstSlot.local_start_time
+                          );
+                        }}
+                      >
+                        Confirmer
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                      data-testid="chat-reject-action-btn"
+                      onClick={() =>
+                        handleRejectChatAction(pendingChatProposalMsg.id)
+                      }
+                    >
+                      Refuser
+                    </Button>
+                  </div>
+                </>
               )}
             </div>
+          )}
 
-            <form
-              onSubmit={(e) => {
-                e.preventDefault();
-                handleSendChatMessage();
-              }}
-              className="flex items-center gap-2 border-t border-border bg-white p-3"
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSendChatMessage();
+            }}
+            className="shrink-0 flex items-center gap-2 border-t border-border bg-white p-3"
+          >
+            <Input
+              type="text"
+              placeholder="Ex: Ajoute une visite mercredi à 10h..."
+              data-testid="chat-message-input"
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+            />
+            <Button
+              type="submit"
+              size="sm"
+              disabled={chatSending}
+              data-testid="chat-send-btn"
             >
-              <Input
-                type="text"
-                placeholder="Ex: Ajoute une visite demain à 14h..."
-                data-testid="chat-message-input"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-              />
-              <Button
-                type="submit"
-                size="sm"
-                disabled={chatSending}
-                data-testid="chat-send-btn"
-              >
-                <Send className="h-4 w-4" />
-              </Button>
-            </form>
-          </Card>
-        )}
-      </div>
+              <Send className="h-4 w-4" />
+            </Button>
+          </form>
+          </aside>
+        </>
+      )}
     </div>
   );
 }

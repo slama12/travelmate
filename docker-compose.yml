@@ -48,6 +48,12 @@ services:
       DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER:-travelmate}:${POSTGRES_PASSWORD:-travelmate_dev_password}@postgres:5432/${POSTGRES_DB:-travelmate_db}
       REDIS_URL: redis://redis:6379/0
       FRONTEND_INTERNAL_URL: http://frontend:5173
+      AI_PROVIDER_MODE: ${AI_PROVIDER_MODE:-real}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-mistral}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-90}
+    extra_hosts:
+      - "host.docker.internal:172.27.176.1"
     ports:
       - "8000:8000"
     depends_on:
@@ -61,6 +67,7 @@ services:
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
     volumes:
       - ./backend:/app
+      - ./.env:/app/.env:ro
       - ./frontend:/frontend:ro
 
   frontend:

@@ -574,9 +574,120 @@ class SimulatedAIProvider(BaseAIProvider):
         budget_info = safe_trip_context.get("budget", {})
         weather_list: list[dict[str, Any]] = safe_trip_context.get("weather", [])
 
-        # Extraction éventuelle d'une date (YYYY-MM-DD) et d'une heure (HH:MM ou HhMM)
-        date_match = re.search(r"(20\d{2}-\d{2}-\d{2})", user_message)
-        time_match = re.search(r"\b(\d{1,2})\s*(?:h|:)\s*(\d{2})?\b", msg_lower)
+        # Liste chronologique des dates du séjour
+        trip_dates_iso: list[str] = [
+            str(w["date"])[:10] for w in weather_list if w.get("date")
+        ]
+        if not trip_dates_iso:
+            arr_raw = str(trip_info.get("arrival_at") or "")[:10]
+            dep_raw = str(trip_info.get("departure_at") or "")[:10]
+            try:
+                if arr_raw and dep_raw:
+                    d_cur = date.fromisoformat(arr_raw)
+                    d_end = date.fromisoformat(dep_raw)
+                    while d_cur <= d_end:
+                        trip_dates_iso.append(d_cur.isoformat())
+                        d_cur += timedelta(days=1)
+            except Exception:
+                pass
+        if not trip_dates_iso:
+            trip_dates_iso = [date.today().isoformat()]
+
+        def _resolve_named_date(raw_msg: str) -> str | None:
+            lower = raw_msg.lower()
+            # 1. Date ISO explicite (YYYY-MM-DD)
+            iso_m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", raw_msg)
+            if iso_m:
+                return iso_m.group(1)
+
+            base_d = date.fromisoformat(trip_dates_iso[0])
+            trip_date_objs = [date.fromisoformat(x) for x in trip_dates_iso]
+
+            # 2. Jours relatifs ("après-demain", "demain", "aujourd'hui")
+            if re.search(r"\bapr[èe]s[- ]demain\b", lower):
+                return (
+                    trip_dates_iso[2]
+                    if len(trip_dates_iso) > 2
+                    else (base_d + timedelta(days=2)).isoformat()
+                )
+            if re.search(r"\bdemain\b", lower):
+                return (
+                    trip_dates_iso[1]
+                    if len(trip_dates_iso) > 1
+                    else (base_d + timedelta(days=1)).isoformat()
+                )
+            if re.search(r"\baujourd['’ ]?hui\b", lower):
+                return trip_dates_iso[0]
+
+            # 3. Numéro de jour ("jour 2", "jour 3")
+            jour_m = re.search(r"\bjour\s*(\d{1,2})\b", lower)
+            if jour_m:
+                idx = int(jour_m.group(1)) - 1
+                if 0 <= idx < len(trip_dates_iso):
+                    return trip_dates_iso[idx]
+
+            # 4. Date française "11 novembre", "10 juin"
+            month_map = {
+                "janvier": 1,
+                "février": 2,
+                "fevrier": 2,
+                "mars": 3,
+                "avril": 4,
+                "mai": 5,
+                "juin": 6,
+                "juillet": 7,
+                "août": 8,
+                "aout": 8,
+                "septembre": 9,
+                "octobre": 10,
+                "novembre": 11,
+                "décembre": 12,
+                "decembre": 12,
+            }
+            dm_m = re.search(
+                r"\b(\d{1,2})\s+(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)\b",
+                lower,
+            )
+            if dm_m:
+                day_num = int(dm_m.group(1))
+                month_num = month_map[dm_m.group(2)]
+                for d_obj in trip_date_objs:
+                    if d_obj.day == day_num and d_obj.month == month_num:
+                        return d_obj.isoformat()
+                try:
+                    return date(base_d.year, month_num, day_num).isoformat()
+                except ValueError:
+                    pass
+
+            # 5. Nom de jour de la semaine ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+            weekday_map = {
+                "lundi": 0,
+                "mardi": 1,
+                "mercredi": 2,
+                "jeudi": 3,
+                "vendredi": 4,
+                "samedi": 5,
+                "dimanche": 6,
+            }
+            wd_matches = re.findall(
+                r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b",
+                lower,
+            )
+            if wd_matches:
+                target_wd = weekday_map[wd_matches[-1]]
+                for d_obj in trip_date_objs:
+                    if d_obj.weekday() == target_wd:
+                        return d_obj.isoformat()
+                delta_days = (target_wd - base_d.weekday()) % 7
+                return (base_d + timedelta(days=delta_days)).isoformat()
+
+            return None
+
+        named_date_str = _resolve_named_date(user_message)
+
+        # Extraction d'une heure (HH:MM, HhMM ou Hh) hors dates ISO
+        msg_without_iso = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", " ", msg_lower)
+        time_match = re.search(r"\b(\d{1,2})\s*(?:h|:)\s*(\d{2})?\b", msg_without_iso)
         extracted_time: str | None = None
         if time_match:
             hh = int(time_match.group(1))
@@ -585,35 +696,120 @@ class SimulatedAIProvider(BaseAIProvider):
                 extracted_time = f"{hh:02d}:{mm:02d}"
 
         default_date_str = (
-            date_match.group(1)
-            if date_match
+            named_date_str
+            if named_date_str
             else (
                 itinerary_items[0]["visit_date"]
                 if itinerary_items
-                else (weather_list[0]["date"] if weather_list else date.today().isoformat())
+                else trip_dates_iso[0]
             )
         )
 
-        # Recherche d'un lieu mentionné dans le message
-        def _find_scheduled_item() -> dict[str, Any] | None:
+        # Recherche d'un lieu explicitement mentionné dans le message
+        def _find_explicit_scheduled_item() -> dict[str, Any] | None:
             for item in itinerary_items:
                 p_name = str(item.get("place_name", "")).lower()
                 tokens = [tok for tok in re.split(r"\W+", p_name) if len(tok) >= 4]
                 if p_name and (p_name in msg_lower or any(t in msg_lower for t in tokens)):
                     return item
-            return itinerary_items[0] if itinerary_items else None
+            return None
 
-        def _find_place_in_catalog() -> dict[str, Any] | None:
+        def _find_scheduled_item() -> dict[str, Any] | None:
+            explicit = _find_explicit_scheduled_item()
+            if explicit:
+                return explicit
+            last_pid = safe_trip_context.get("last_place_id")
+            if last_pid:
+                for item in reversed(itinerary_items):
+                    if item.get("place_id") == last_pid:
+                        return item
+            return itinerary_items[-1] if itinerary_items else None
+
+        def _find_explicit_place_in_catalog() -> dict[str, Any] | None:
             for p in available_places:
                 p_name = str(p.get("name", "")).lower()
                 tokens = [tok for tok in re.split(r"\W+", p_name) if len(tok) >= 4]
                 if p_name and (p_name in msg_lower or any(t in msg_lower for t in tokens)):
                     return p
+            return None
+
+        def _find_place_in_catalog() -> dict[str, Any] | None:
+            explicit = _find_explicit_place_in_catalog()
+            if explicit:
+                return explicit
+            last_pid = safe_trip_context.get("last_place_id")
+            if last_pid:
+                for p in available_places:
+                    if p.get("id") == last_pid:
+                        return p
             scheduled_ids = {i.get("place_id") for i in itinerary_items}
             for p in available_places:
                 if p.get("id") not in scheduled_ids:
                     return p
             return available_places[0] if available_places else None
+
+        has_pronoun_ref = bool(
+            re.search(
+                r"\b(on\s+le\s+met|on\s+le\s+mets|on\s+la\s+met|on\s+la\s+mets|mets[- ]le|mets[- ]la|met[- ]le|met[- ]la|d[ée]cale[- ]le|d[ée]cale[- ]la|d[ée]place[- ]le|d[ée]place[- ]la)\b",
+                msg_lower,
+            )
+        )
+        has_explicit_add_verb = bool(
+            re.search(r"\b(ajoute|ajouter|rajoute|rajouter)\b", msg_lower)
+        ) and not any(
+            kw in msg_lower for kw in ("déplace", "deplace", "déplacer", "deplacer", "décale", "decale")
+        )
+
+        # 0. Intention : Question d'information sur les autres lieux à visiter (Action INFO obligatoire)
+        is_places_info_question = bool(
+            re.search(
+                r"(autres?\s+lieux?|pas\s+(encore\s+)?(mis|ajout[ée]|planifi[ée]|pr[ée]vu)?\s*(dans|au)\s+(mon\s+|le\s+)?programme|"
+                r"(quels?|quelles?)\s+(sont\s+les\s+)?(lieux|visites|activit[ée]s|endroits|monuments|mus[ée]es|restaurants)|"
+                r"(que|quoi)\s+(puis[- ]je|je\s+peux|peut[- ]on|on\s+peut)?\s*(visiter|voir|faire)|"
+                r"(donne|donner|montre|montrer|liste|lister|sugg[èe]re|conseille|recommande)\b.*\b(lieux|visites|endroits|id[ée]es|activit[ée]s)|"
+                r"\bid[ée]es?\s+de\s+(visites?|lieux|sorties?)\b)",
+                msg_lower,
+            )
+        )
+        if is_places_info_question:
+            scheduled_ids = {str(it.get("place_id")) for it in itinerary_items if it.get("place_id")}
+            cat_map_fr = {
+                "CULTURE": "Culture",
+                "MUSEUM": "Culture",
+                "MONUMENT": "Culture",
+                "NATURE": "Nature",
+                "PARK": "Nature",
+                "RESTAURANT": "Restaurant",
+                "FOOD": "Restaurant",
+                "NIGHTLIFE": "Vie nocturne",
+                "NIGHT": "Vie nocturne",
+            }
+            unscheduled_lines: list[str] = []
+            for p in available_places:
+                if str(p.get("id")) in scheduled_ids:
+                    continue
+                cat_fr = cat_map_fr.get(str(p.get("category", "")).upper(), str(p.get("category", "Culture")).capitalize())
+                env_fr = "Extérieur" if p.get("is_outdoor") else "Intérieur"
+                dur_min = int(p.get("recommended_duration_min", 90))
+                unscheduled_lines.append(f"• {p.get('name')} — {cat_fr}, durée conseillée : {dur_min} min, {env_fr}")
+
+            if unscheduled_lines:
+                reply_txt = (
+                    f"Voici d'autres lieux à visiter à {city_name} qui ne sont pas dans votre programme :\n"
+                    + "\n".join(unscheduled_lines)
+                    + "\n\nSouhaitez-vous en ajouter un à votre programme ? Indiquez-moi son nom ainsi que le jour et l'heure souhaités."
+                )
+            else:
+                reply_txt = f"Tous les lieux enregistrés à {city_name} figurent déjà dans votre programme."
+
+            return {
+                "action_type": "INFO",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": reply_txt,
+                "proposed_action": None,
+            }
 
         # 1. Intention : Supprimer / retirer une visite
         if any(kw in msg_lower for kw in ("retire", "retirer", "supprime", "supprimer", "enlève", "enlever", "annule")):
@@ -637,11 +833,16 @@ class SimulatedAIProvider(BaseAIProvider):
                     },
                 }
 
-        # 2. Intention : Déplacer / décaler une visite
-        if any(kw in msg_lower for kw in ("déplace", "deplace", "déplacer", "deplacer", "décale", "decale", "change l'heure")):
-            target_item = _find_scheduled_item()
+        # 2. Intention : Déplacer / décaler une visite (ou pronom sur une visite déjà au programme, hors verbe d'ajout explicite)
+        explicit_sched = _find_explicit_scheduled_item()
+        if not has_explicit_add_verb and (
+            any(kw in msg_lower for kw in ("déplace", "deplace", "déplacer", "deplacer", "décale", "decale", "change l'heure"))
+            or (has_pronoun_ref and itinerary_items)
+            or (explicit_sched is not None and extracted_time is not None)
+        ):
+            target_item = explicit_sched or _find_scheduled_item()
             if target_item:
-                new_date = date_match.group(1) if date_match else target_item["visit_date"]
+                new_date = named_date_str if named_date_str else target_item["visit_date"]
                 new_time = extracted_time or "15:00"
                 return {
                     "reply": (
@@ -660,15 +861,73 @@ class SimulatedAIProvider(BaseAIProvider):
                     },
                 }
 
-        # 3. Intention : Ajouter / planifier une visite
-        if any(kw in msg_lower for kw in ("ajoute", "ajouter", "planifie", "planifier", "insère", "insere", "visiter")):
+        # 3. Intention : Ajouter / planifier une visite (ou lorsqu'un jour est explicitement nommé hors question météo/budget)
+        is_info_only = any(kw in msg_lower for kw in ("météo", "meteo", "budget", "quel temps"))
+        if (
+            any(
+                kw in msg_lower
+                for kw in (
+                    "ajoute",
+                    "ajouter",
+                    "rajoute",
+                    "rajouter",
+                    "planifie",
+                    "planifier",
+                    "insère",
+                    "insere",
+                    "visiter",
+                    "visite",
+                    "aller",
+                    "mets",
+                    "mettre",
+                    "programme",
+                    "programmer",
+                    "propose",
+                )
+            )
+            or (named_date_str is not None and not is_info_only)
+        ):
             target_place = _find_place_in_catalog()
             if target_place:
+                existing_for_place = next(
+                    (it for it in reversed(itinerary_items) if it.get("place_id") == target_place["id"]),
+                    None,
+                )
                 new_time = extracted_time or "14:00"
+                # Si ce lieu est déjà au programme et que l'utilisateur n'a pas demandé un ajout explicite, ADD devient MOVE
+                if existing_for_place is not None and not has_explicit_add_verb:
+                    move_date = named_date_str if named_date_str else existing_for_place["visit_date"]
+                    return {
+                        "reply": (
+                            f"Je vous propose de déplacer « {target_place['name']} » au "
+                            f"{_fmt_date_fr(move_date)} à {new_time}. Souhaitez-vous appliquer ce changement ?"
+                        ),
+                        "proposed_action": {
+                            "action_type": "MOVE_VISIT",
+                            "item_id": existing_for_place["item_id"],
+                            "place_id": target_place["id"],
+                            "place_name": target_place["name"],
+                            "visit_date": move_date,
+                            "local_start_time": new_time,
+                            "duration_minutes": int(existing_for_place.get("duration_minutes", 90)),
+                            "transit_mode": existing_for_place.get("transit_mode", "METRO"),
+                        },
+                    }
+                effective_add_date = named_date_str or (
+                    existing_for_place["visit_date"] if existing_for_place is not None else None
+                )
+                if effective_add_date is None:
+                    return {
+                        "reply": (
+                            f"Quel jour souhaitez-vous planifier la visite de « {target_place['name']} » "
+                            f"à {new_time} ?"
+                        ),
+                        "proposed_action": None,
+                    }
                 return {
                     "reply": (
                         f"Je vous propose d'ajouter « {target_place['name']} » le "
-                        f"{_fmt_date_fr(default_date_str)} à {new_time} ({target_place['recommended_duration_min']} min). "
+                        f"{_fmt_date_fr(effective_add_date)} à {new_time} ({target_place['recommended_duration_min']} min). "
                         "Rien n'est modifié tant que vous ne confirmez pas."
                     ),
                     "proposed_action": {
@@ -676,7 +935,7 @@ class SimulatedAIProvider(BaseAIProvider):
                         "item_id": None,
                         "place_id": target_place["id"],
                         "place_name": target_place["name"],
-                        "visit_date": default_date_str,
+                        "visit_date": effective_add_date,
                         "local_start_time": new_time,
                         "duration_minutes": int(target_place.get("recommended_duration_min", 90)),
                         "transit_mode": "METRO",
@@ -697,11 +956,13 @@ class SimulatedAIProvider(BaseAIProvider):
         )
         budget_total = budget_info.get("planned_total", trip_info.get("total_budget_planned", 2000))
         weather_brief = (
-            f"{weather_list[0]['summary']} ({weather_list[0]['temperature_celsius']}°C)"
-            if weather_list and weather_list[0].get("available", True) and weather_list[0].get("temperature_celsius") is not None
+            f"{weather_list[0].get('condition_label_fr') or weather_list[0].get('summary', 'Ensoleillé')} "
+            f"({weather_list[0].get('temp_max_c') or weather_list[0].get('temperature_celsius', 20)}°C)"
+            if weather_list
             else "Prévision non disponible"
         )
         return {
+            "action_type": "INFO",
             "reply": (
                 f"Pour votre séjour à {city_name} : {flight_summary}, {acc_summary}, "
                 f"budget prévu de {budget_total} {trip_info.get('currency', 'EUR')}, "

@@ -257,6 +257,7 @@ class ItineraryValidationEngine:
         exclude_item_id: str | None = None,
         arrival_buffer_hours: float | None = None,
         departure_buffer_hours: float | None = None,
+        allow_duplicate_place: bool = False,
     ) -> ValidationResult:
         start_utc = ensure_utc(start_at_utc)
         end_utc = ensure_utc(end_at_utc)
@@ -385,6 +386,29 @@ class ItineraryValidationEngine:
             if v.item_id != exclude_item_id
         ]
         others.sort(key=lambda x: ensure_utc(x.start_at_utc))
+
+        # Règle 2b : Anti-doublon d'un même lieu dans le séjour (sauf demande explicite "ajoute-le une deuxième fois")
+        duplicate_visit = next((v for v in others if v.place_id == place_id), None)
+        if duplicate_visit is not None and not allow_duplicate_place:
+            dup_local_s = to_destination_local(ensure_utc(duplicate_visit.start_at_utc), destination_tz_name)
+            dup_local_e = to_destination_local(ensure_utc(duplicate_visit.end_at_utc), destination_tz_name)
+            return ValidationResult(
+                valid=False,
+                reason_code="DUPLICATE_PLACE",
+                message=(
+                    f"« {place_name} » est déjà prévu dans votre programme "
+                    f"({dup_local_s.strftime('%H:%M')}-{dup_local_e.strftime('%H:%M')}). "
+                    "Un même lieu ne peut pas être planifié deux fois dans le séjour, "
+                    "sauf demande explicite (« ajoute-le une deuxième fois »)."
+                ),
+                conflict_details={
+                    "existing_item_id": duplicate_visit.item_id,
+                    "existing_place_id": duplicate_visit.place_id,
+                    "existing_place_name": duplicate_visit.place_name,
+                    "existing_start_local": dup_local_s.isoformat(),
+                    "existing_end_local": dup_local_e.isoformat(),
+                },
+            )
 
         # Règle 3 : Aucun chevauchement avec une autre visite
         for other in others:
@@ -584,6 +608,7 @@ class ItineraryValidationEngine:
                     exclude_item_id=exclude_item_id,
                     arrival_buffer_hours=arr_buf_h,
                     departure_buffer_hours=dep_buf_h,
+                    allow_duplicate_place=True,
                 )
                 if check.valid:
                     loc_s = to_destination_local(cand_start_utc, destination_tz_name)
@@ -626,10 +651,11 @@ class ItineraryValidationEngine:
         exclude_item_id: str | None = None,
         arrival_buffer_hours: float | None = None,
         departure_buffer_hours: float | None = None,
+        allow_duplicate_place: bool = False,
     ) -> ValidationResult:
         """
-        Valide une visite et, en cas de refus, enrichit automatiquement le résultat
-        avec 2 à 3 créneaux libres suggérés.
+        Valide une visite et, en cas de refus (hors doublon de lieu), enrichit automatiquement
+        le résultat avec 2 à 3 créneaux libres suggérés.
         """
         start_utc = ensure_utc(start_at_utc)
         end_utc = start_utc + timedelta(minutes=duration_minutes)
@@ -650,8 +676,9 @@ class ItineraryValidationEngine:
             exclude_item_id=exclude_item_id,
             arrival_buffer_hours=arrival_buffer_hours,
             departure_buffer_hours=departure_buffer_hours,
+            allow_duplicate_place=allow_duplicate_place,
         )
-        if not result.valid:
+        if not result.valid and result.reason_code != "DUPLICATE_PLACE":
             result.suggested_slots = cls.suggest_free_slots(
                 trip_arrival_utc=trip_arrival_utc,
                 trip_departure_utc=trip_departure_utc,

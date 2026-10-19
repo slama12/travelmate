@@ -413,6 +413,14 @@ async def create_itinerary_item(
     existing_items, places_map = await _load_trip_items_with_places(db, trip.id)
     snapshots = _build_snapshots(existing_items, places_map)
 
+    notes_lower = (payload.notes or "").lower()
+    explicit_second_time = bool(
+        payload.allow_duplicate
+        or any(
+            phrase in notes_lower
+            for phrase in ("deuxième fois", "deuxieme fois", "2e fois", "2ème fois", "seconde fois")
+        )
+    )
     validation = ItineraryValidationEngine.validate_visit(
         trip_arrival_utc=trip.arrival_at,
         trip_departure_utc=trip.departure_at,
@@ -426,6 +434,7 @@ async def create_itinerary_item(
         duration_minutes=duration_min,
         transit_mode=norm_mode,
         existing_visits=snapshots,
+        allow_duplicate_place=explicit_second_time,
     )
     if not validation.valid:
         raise HTTPException(

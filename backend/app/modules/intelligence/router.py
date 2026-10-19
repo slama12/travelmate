@@ -1,11 +1,13 @@
 from datetime import date, datetime, timedelta
 import json
+import logging
 import re
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.core.config import get_settings
 from app.core.database import AsyncSession, get_db
@@ -18,7 +20,7 @@ from app.core.itinerary_validator import (
     parse_local_slot_to_utc,
     to_destination_local,
 )
-from app.core.providers import get_provider_registry
+from app.core.providers import build_chat_assistant_prompt, get_provider_registry
 from app.core.redis import cache_client
 from app.models.entities import (
     Accommodation,
@@ -62,6 +64,8 @@ from app.modules.itinerary.schemas import (
     TripItineraryScheduleResponse,
 )
 
+logger = logging.getLogger("travelmate.intelligence.chat")
+
 router = APIRouter(prefix="/itinerary", tags=["Intelligence Étape 4 (Météo, IA, Chat, Trajets)"])
 
 
@@ -80,6 +84,7 @@ def _validate_slot(
     existing_items: list[ScheduledVisitSnapshot],
     transit_mode: str = "METRO",
     exclude_item_id: str | None = None,
+    allow_duplicate_place: bool = False,
 ) -> ValidationResult:
     return ItineraryValidationEngine.validate_visit(
         trip_arrival_utc=trip_arrival_utc,
@@ -95,6 +100,7 @@ def _validate_slot(
         transit_mode=transit_mode,
         existing_visits=existing_items,
         exclude_item_id=exclude_item_id,
+        allow_duplicate_place=allow_duplicate_place,
     )
 
 
@@ -1489,6 +1495,301 @@ async def get_trip_chat_history(
     )
 
 
+@router.delete("/trip/{trip_id}/chat", response_model=ChatConversationResponse)
+@router.post("/trip/{trip_id}/chat/reset", response_model=ChatConversationResponse)
+async def reset_trip_chat_history(
+    trip_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ChatConversationResponse:
+    """
+    Réinitialise la conversation de l'assistant pour ce voyage ("Nouvelle conversation") :
+    supprime l'historique des messages du chat sans toucher aux visites du programme.
+    """
+    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    await db.execute(delete(ChatMessage).where(ChatMessage.trip_id == trip.id))
+    await db.commit()
+    return ChatConversationResponse(
+        trip_id=trip.id,
+        destination_city=destination.city_name,
+        messages=[],
+        security_audit={
+            "scoped_to_trip_id": trip.id,
+            "owner_user_id": current_user.id,
+            "vault_documents_exposed_to_model": False,
+            "google_oauth_tokens_exposed_to_model": False,
+            "external_place_content_delimited_as_data": True,
+        },
+    )
+
+
+def _is_informational_places_request(raw_msg: str) -> bool:
+    """Détecte une question d'information demandant d'autres lieux à visiter qui ne sont pas au programme."""
+    msg_lower = raw_msg.strip().lower()
+    return bool(
+        re.search(
+            r"(autres?\s+lieux?|pas\s+(encore\s+)?(mis|ajout[ée]|planifi[ée]|pr[ée]vu)?\s*(dans|au)\s+(mon\s+|le\s+)?programme|"
+            r"(quels?|quelles?)\s+(sont\s+les\s+)?(autres?\s+)?(lieux|visites|activit[ée]s|endroits|monuments|mus[ée]es|restaurants)|"
+            r"(que|quoi)\s+(puis[- ]je|je\s+peux|peut[- ]on|on\s+peut)?\s*(visiter|voir|faire)|"
+            r"(donne|donner|montre|montrer|liste|lister|sugg[èe]re|conseille|recommande)\b.*\b(lieux|visites|endroits|id[ée]es|activit[ée]s)|"
+            r"\bid[ée]es?\s+de\s+(visites?|lieux|sorties?)\b)",
+            msg_lower,
+        )
+    )
+
+
+def _format_unscheduled_places_info(
+    city_name: str,
+    places_by_id: dict[str, Place],
+    existing_items: list[ItineraryItem],
+) -> str:
+    """
+    Construit la réponse INFO obligatoire avec la liste des lieux de la ville présents en base,
+    en excluant ceux déjà au programme (nom, catégorie, durée, intérieur/extérieur),
+    et la proposition d'en ajouter un.
+    """
+    scheduled_place_ids = {str(it.place_id) for it in existing_items if it.place_id}
+    cat_map_fr = {
+        "CULTURE": "Culture",
+        "MUSEUM": "Culture",
+        "MONUMENT": "Culture",
+        "NATURE": "Nature",
+        "PARK": "Nature",
+        "RESTAURANT": "Restaurant",
+        "FOOD": "Restaurant",
+        "NIGHTLIFE": "Vie nocturne",
+        "NIGHT": "Vie nocturne",
+    }
+    lines: list[str] = []
+    for p in places_by_id.values():
+        if str(p.id) in scheduled_place_ids:
+            continue
+        cat_fr = cat_map_fr.get(str(p.category or "").upper(), str(p.category or "Culture").capitalize())
+        env_fr = "Extérieur" if p.is_outdoor else "Intérieur"
+        dur_min = int(p.recommended_duration_min or 90)
+        lines.append(f"• {p.name} — {cat_fr}, durée conseillée : {dur_min} min, {env_fr}")
+
+    if not lines:
+        return f"Tous les lieux enregistrés à {city_name} figurent déjà dans votre programme."
+
+    return (
+        f"Voici d'autres lieux à visiter à {city_name} qui ne sont pas dans votre programme :\n"
+        + "\n".join(lines)
+        + "\n\nSouhaitez-vous en ajouter un à votre programme ? Indiquez-moi son nom ainsi que le jour et l'heure souhaités."
+    )
+
+
+def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
+    """
+    Valide strictement la réponse brute du fournisseur IA (Ollama/mistral ou simulé) :
+    - Rejette tout JSON malformé, tout type non-dict ou toute clé/valeur hors schéma.
+    - Actions autorisées uniquement : ADD, ADD_VISIT, MOVE, MOVE_VISIT, REMOVE, REMOVE_VISIT, INFO, ASK, NONE, None.
+    - Format de date strict : YYYY-MM-DD (si fourni).
+    - Format d'heure strict : HH:MM ou HhMM entre 00:00 et 23:59 (si fourni).
+    """
+    if isinstance(raw_res, str):
+        try:
+            raw_res = json.loads(raw_res)
+        except Exception as exc:
+            raise ValueError(f"JSON invalide renvoyé par le modèle : {exc}") from exc
+
+    if not isinstance(raw_res, dict) or not raw_res:
+        raise ValueError("Réponse hors schéma : un objet JSON non vide est requis.")
+
+    allowed_keys = {
+        "reply",
+        "message",
+        "proposed_action",
+        "action_type",
+        "action",
+        "type",
+        "item_id",
+        "place_id",
+        "place_name",
+        "place",
+        "lieu",
+        "visit_date",
+        "date",
+        "local_start_time",
+        "start_time",
+        "time",
+        "heure",
+        "duration_minutes",
+        "duration",
+        "transit_mode",
+    }
+    unknown_top = set(raw_res.keys()) - allowed_keys
+    if unknown_top:
+        raise ValueError(f"Clés hors schéma au premier niveau : {sorted(unknown_top)}")
+
+    if not any(k in raw_res for k in ("reply", "message", "proposed_action", "action_type", "action", "type")):
+        raise ValueError("Réponse hors schéma : aucune clé d'action ou de réponse reconnue.")
+
+    reply_val = raw_res.get("reply") if "reply" in raw_res else raw_res.get("message")
+    if reply_val is not None and not isinstance(reply_val, str):
+        raise ValueError("Champ 'reply' hors schéma (doit être une chaîne).")
+
+    has_nested = "proposed_action" in raw_res
+    nested_pa = raw_res.get("proposed_action")
+    if has_nested and nested_pa is not None and not isinstance(nested_pa, dict):
+        raise ValueError("Champ 'proposed_action' hors schéma (doit être un objet ou null).")
+
+    if isinstance(nested_pa, dict):
+        unknown_nested = set(nested_pa.keys()) - allowed_keys
+        if unknown_nested:
+            raise ValueError(f"Clés hors schéma dans proposed_action : {sorted(unknown_nested)}")
+        act_src = nested_pa
+    elif has_nested and nested_pa is None and not any(k in raw_res for k in ("action_type", "action", "type")):
+        return {
+            "action_type": "NONE",
+            "reply": str(reply_val or "Pouvez-vous préciser votre demande ?"),
+            "proposed_action": None,
+        }
+    else:
+        act_src = raw_res
+
+    raw_act = (
+        act_src.get("action_type")
+        if "action_type" in act_src
+        else (act_src.get("action") if "action" in act_src else act_src.get("type"))
+    )
+    if raw_act is None:
+        return {
+            "action_type": "NONE",
+            "reply": str(reply_val or "Pouvez-vous préciser votre demande ?"),
+            "proposed_action": None,
+        }
+    if not isinstance(raw_act, str):
+        raise ValueError(f"action_type hors schéma (type invalide) : {raw_act!r}")
+
+    act_upper = raw_act.strip().upper()
+    action_map = {
+        "ADD": "ADD_VISIT",
+        "ADD_VISIT": "ADD_VISIT",
+        "MOVE": "MOVE_VISIT",
+        "MOVE_VISIT": "MOVE_VISIT",
+        "REMOVE": "REMOVE_VISIT",
+        "REMOVE_VISIT": "REMOVE_VISIT",
+        "DELETE": "REMOVE_VISIT",
+        "INFO": "INFO",
+        "INFO_PLACES": "INFO",
+        "LIST": "INFO",
+        "SUGGEST": "INFO",
+        "ASK": "ASK",
+        "QUESTION": "ASK",
+        "NONE": "NONE",
+        "": "NONE",
+    }
+    if act_upper not in action_map:
+        raise ValueError(f"Valeur action_type hors schéma : {raw_act!r}")
+    norm_act = action_map[act_upper]
+
+    if norm_act == "INFO":
+        return {
+            "action_type": "INFO",
+            "reply": str(reply_val or ""),
+            "proposed_action": None,
+        }
+
+    raw_date = act_src.get("visit_date") if "visit_date" in act_src else act_src.get("date")
+    norm_date: str | None = None
+    if raw_date is not None and raw_date != "":
+        if not isinstance(raw_date, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date.strip()):
+            raise ValueError(f"visit_date hors schéma : {raw_date!r}")
+        try:
+            date.fromisoformat(raw_date.strip())
+        except ValueError as exc:
+            raise ValueError(f"visit_date invalide : {raw_date!r}") from exc
+        norm_date = raw_date.strip()
+
+    raw_time = (
+        act_src.get("local_start_time")
+        if "local_start_time" in act_src
+        else (
+            act_src.get("start_time")
+            if "start_time" in act_src
+            else (act_src.get("time") if "time" in act_src else act_src.get("heure"))
+        )
+    )
+    norm_time: str | None = None
+    if raw_time is not None and raw_time != "":
+        if not isinstance(raw_time, str):
+            raise ValueError(f"local_start_time hors schéma : {raw_time!r}")
+        tm = re.match(r"^(\d{1,2})(?::|[hH])(\d{2})?$", raw_time.strip())
+        if not tm:
+            raise ValueError(f"local_start_time hors schéma : {raw_time!r}")
+        hh = int(tm.group(1))
+        mm = int(tm.group(2) or 0)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError(f"local_start_time hors plage 00:00-23:59 : {raw_time!r}")
+        norm_time = f"{hh:02d}:{mm:02d}"
+
+    raw_dur = act_src.get("duration_minutes") if "duration_minutes" in act_src else act_src.get("duration")
+    norm_dur: int | None = None
+    if raw_dur is not None:
+        if isinstance(raw_dur, bool) or not isinstance(raw_dur, int) or not (15 <= raw_dur <= 720):
+            raise ValueError(f"duration_minutes hors schéma : {raw_dur!r}")
+        norm_dur = raw_dur
+
+    raw_tmode = act_src.get("transit_mode")
+    norm_tmode = "METRO"
+    if raw_tmode is not None and raw_tmode != "":
+        if not isinstance(raw_tmode, str) or raw_tmode.strip().upper() not in {
+            "WALKING",
+            "METRO",
+            "CAR",
+            "BUS",
+            "TRANSIT",
+            "TAXI",
+            "BIKE",
+            "TRAIN",
+            "TRAM",
+        }:
+            raise ValueError(f"transit_mode hors schéma : {raw_tmode!r}")
+        norm_tmode = normalize_transit_mode(raw_tmode.strip().upper())
+
+    raw_pname = (
+        act_src.get("place_name")
+        if "place_name" in act_src
+        else (act_src.get("place") if "place" in act_src else act_src.get("lieu"))
+    )
+    if raw_pname is not None and not isinstance(raw_pname, str):
+        raise ValueError(f"place_name hors schéma : {raw_pname!r}")
+
+    raw_pid = act_src.get("place_id")
+    if raw_pid is not None and not isinstance(raw_pid, str):
+        raise ValueError(f"place_id hors schéma : {raw_pid!r}")
+
+    raw_iid = act_src.get("item_id")
+    if raw_iid is not None and not isinstance(raw_iid, str):
+        raise ValueError(f"item_id hors schéma : {raw_iid!r}")
+
+    if norm_act in {"ASK", "NONE"}:
+        return {
+            "action_type": norm_act,
+            "reply": str(
+                reply_val
+                or "Quel lieu souhaitez-vous planifier ou modifier, et pour quel jour du séjour ?"
+            ),
+            "proposed_action": None,
+        }
+
+    return {
+        "action_type": norm_act,
+        "reply": str(reply_val or ""),
+        "proposed_action": {
+            "action_type": norm_act,
+            "item_id": raw_iid,
+            "place_id": raw_pid,
+            "place_name": raw_pname.strip() if isinstance(raw_pname, str) and raw_pname.strip() else None,
+            "visit_date": norm_date,
+            "local_start_time": norm_time,
+            "duration_minutes": norm_dur,
+            "transit_mode": norm_tmode,
+        },
+    }
+
+
 @router.post("/trip/{trip_id}/chat", response_model=ChatConversationResponse)
 async def send_trip_chat_message(
     trip_id: str,
@@ -1499,12 +1800,14 @@ async def send_trip_chat_message(
     """
     Envoie un message à l'assistant du voyage :
     - Contrôle d'accès strict (403 si le voyage appartient à un autre utilisateur),
-    - Historique limité à ce seul voyage,
-    - Aucune exposition des documents du coffre-fort ni des jetons Google,
-    - Si l'assistant propose d'ajouter, déplacer ou retirer une visite, l'action passe par le
-      moteur de validation et reste en statut 'PENDING_CONFIRMATION' (rien n'est modifié sans accord).
+    - Historique limité aux 6 derniers échanges envoyés au modèle,
+    - Résumé du séjour (visites, budget, météo) toujours recalculé en direct à chaque demande,
+    - Action INFO obligatoire pour les questions sur d'autres lieux à visiter (sans modification ni carte Confirmer/Refuser),
+    - Anti-doublon : refuse un même lieu deux fois sauf demande explicite ("ajoute-le une deuxième fois"),
+    - Journalisation fournisseur/modèle/durée à chaque message et aucun repli silencieux vers le simulateur quand AI_PROVIDER_MODE=real.
     """
     registry = get_provider_registry()
+    settings = get_settings()
     trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
     dest_tz = destination.timezone or "UTC"
 
@@ -1514,10 +1817,73 @@ async def send_trip_chat_message(
         .order_by(ChatMessage.created_at.asc())
     )
     history_rows = list(hist_res.all())
-    history_for_ai = [{"role": m.sender_role, "content": m.content} for m in history_rows[-10:]]
 
+    # Historique limité aux 6 derniers échanges envoyés au modèle
+    recent_history_rows = history_rows[-6:]
+    history_for_ai = [{"role": m.sender_role, "content": m.content} for m in recent_history_rows]
+
+    # Résumé du séjour (visites, budget, météo) toujours recalculé en direct depuis la base
     safe_context, places_by_id, existing_items = await _build_safe_trip_context_for_chat(
         db, trip, destination
+    )
+
+    # Détermination du dernier lieu évoqué dans les derniers échanges ou planifié au programme
+    last_context_place: Place | None = None
+    last_context_date: str | None = None
+    last_context_time: str | None = None
+
+    for prev_msg in reversed(recent_history_rows):
+        if isinstance(prev_msg.proposed_action, dict):
+            prev_pid = prev_msg.proposed_action.get("place_id")
+            prev_pname = prev_msg.proposed_action.get("place_name")
+            if prev_pid and str(prev_pid) in places_by_id:
+                last_context_place = places_by_id[str(prev_pid)]
+                last_context_date = prev_msg.proposed_action.get("visit_date")
+                last_context_time = prev_msg.proposed_action.get("local_start_time")
+                break
+            if prev_pname:
+                for p in places_by_id.values():
+                    if p.name.lower() == str(prev_pname).strip().lower():
+                        last_context_place = p
+                        last_context_date = prev_msg.proposed_action.get("visit_date")
+                        last_context_time = prev_msg.proposed_action.get("local_start_time")
+                        break
+            if last_context_place is not None:
+                break
+        msg_txt_low = (prev_msg.content or "").lower()
+        for p in places_by_id.values():
+            if p.name.lower() in msg_txt_low:
+                last_context_place = p
+                break
+        if last_context_place is not None:
+            break
+
+    if last_context_place is None and existing_items:
+        last_item = existing_items[-1]
+        last_context_place = places_by_id.get(last_item.place_id)
+        loc_last = to_destination_local(ensure_utc(last_item.start_at), dest_tz)
+        last_context_date = loc_last.strftime("%Y-%m-%d")
+        last_context_time = loc_last.strftime("%H:%M")
+
+    if last_context_place is not None:
+        # Toujours recalculer la date/heure réelle si le lieu est déjà au programme
+        sched_for_last = next(
+            (it for it in reversed(existing_items) if it.place_id == last_context_place.id),
+            None,
+        )
+        if sched_for_last is not None:
+            loc_sched = to_destination_local(ensure_utc(sched_for_last.start_at), dest_tz)
+            last_context_date = loc_sched.strftime("%Y-%m-%d")
+            last_context_time = loc_sched.strftime("%H:%M")
+        safe_context["last_place_id"] = last_context_place.id
+        safe_context["last_place_name"] = last_context_place.name
+        safe_context["last_place_date"] = last_context_date
+        safe_context["last_place_time"] = last_context_time
+
+    safe_context["prompt"] = build_chat_assistant_prompt(
+        user_message=payload.message.strip(),
+        safe_trip_context=safe_context,
+        chat_history=history_for_ai,
     )
 
     user_msg = ChatMessage(
@@ -1529,16 +1895,250 @@ async def send_trip_chat_message(
     )
     db.add(user_msg)
 
-    ai_result = await registry.ai.generate_chat_reply(
-        user_message=payload.message.strip(),
-        safe_trip_context=safe_context,
-        chat_history=history_for_ai,
+    trip_dates = _compute_trip_dates_local(trip, dest_tz)
+
+    def _resolve_named_trip_date(raw_msg: str) -> date | None:
+        lower = raw_msg.lower()
+        iso_m = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", raw_msg)
+        if iso_m:
+            try:
+                return date.fromisoformat(iso_m.group(1))
+            except ValueError:
+                pass
+
+        base_d = trip_dates[0]
+        if re.search(r"\bapr[èe]s[- ]demain\b", lower):
+            return trip_dates[2] if len(trip_dates) > 2 else base_d + timedelta(days=2)
+        if re.search(r"\bdemain\b", lower):
+            return trip_dates[1] if len(trip_dates) > 1 else base_d + timedelta(days=1)
+        if re.search(r"\baujourd['’ ]?hui\b", lower):
+            return trip_dates[0]
+
+        jour_m = re.search(r"\bjour\s*(\d{1,2})\b", lower)
+        if jour_m:
+            idx = int(jour_m.group(1)) - 1
+            if 0 <= idx < len(trip_dates):
+                return trip_dates[idx]
+
+        month_map = {
+            "janvier": 1,
+            "février": 2,
+            "fevrier": 2,
+            "mars": 3,
+            "avril": 4,
+            "mai": 5,
+            "juin": 6,
+            "juillet": 7,
+            "août": 8,
+            "aout": 8,
+            "septembre": 9,
+            "octobre": 10,
+            "novembre": 11,
+            "décembre": 12,
+            "decembre": 12,
+        }
+        dm_m = re.search(
+            r"\b(\d{1,2})\s+(janvier|février|fevrier|mars|avril|mai|juin|juillet|août|aout|septembre|octobre|novembre|décembre|decembre)\b",
+            lower,
+        )
+        if dm_m:
+            day_num = int(dm_m.group(1))
+            month_num = month_map[dm_m.group(2)]
+            for d_obj in trip_dates:
+                if d_obj.day == day_num and d_obj.month == month_num:
+                    return d_obj
+            try:
+                return date(base_d.year, month_num, day_num)
+            except ValueError:
+                pass
+
+        weekday_map = {
+            "lundi": 0,
+            "mardi": 1,
+            "mercredi": 2,
+            "jeudi": 3,
+            "vendredi": 4,
+            "samedi": 5,
+            "dimanche": 6,
+        }
+        wd_matches = re.findall(
+            r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\b",
+            lower,
+        )
+        if wd_matches:
+            target_wd = weekday_map[wd_matches[-1]]
+            for d_obj in trip_dates:
+                if d_obj.weekday() == target_wd:
+                    return d_obj
+            delta_days = (target_wd - base_d.weekday()) % 7
+            return base_d + timedelta(days=delta_days)
+
+        return None
+
+    def _extract_time_from_msg(raw_msg: str) -> str | None:
+        m = re.search(r"\b(\d{1,2})\s*(?:h|:)\s*(\d{2})?\b", raw_msg.lower())
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mm = int(m.group(2) or 0)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return f"{hh:02d}:{mm:02d}"
+        return None
+
+    def _fmt_short_time_fr(hm: str) -> str:
+        try:
+            parts = str(hm).strip().split(":")
+            hh = int(parts[0])
+            mm = int(parts[1]) if len(parts) > 1 else 0
+            return f"{hh}h" if mm == 0 else f"{hh}h{mm:02d}"
+        except Exception:
+            return str(hm)
+
+    def _resolve_place_obj(raw_action_dict: dict[str, Any], raw_msg: str) -> Place | None:
+        pid = str(raw_action_dict.get("place_id") or "").strip()
+        if pid and pid in places_by_id:
+            return places_by_id[pid]
+
+        pname = str(raw_action_dict.get("place_name") or "").strip().lower()
+        if pname:
+            for p in places_by_id.values():
+                if p.name.lower() == pname:
+                    return p
+            for p in places_by_id.values():
+                if pname in p.name.lower() or p.name.lower() in pname:
+                    return p
+
+        iid = str(raw_action_dict.get("item_id") or "").strip()
+        if iid:
+            for it in existing_items:
+                if it.id == iid and it.place_id in places_by_id:
+                    return places_by_id[it.place_id]
+
+        msg_low = raw_msg.lower()
+        for p in places_by_id.values():
+            p_low = p.name.lower()
+            tokens = [tok for tok in re.split(r"\W+", p_low) if len(tok) >= 4]
+            if p_low in msg_low or any(t in msg_low for t in tokens):
+                return p
+
+        if last_context_place is not None:
+            return last_context_place
+        return None
+
+    named_trip_date = _resolve_named_trip_date(payload.message)
+    msg_extracted_time = _extract_time_from_msg(payload.message)
+    is_info_places_question = _is_informational_places_request(payload.message)
+
+    provider_cls_name = type(registry.ai).__name__
+    provider_mode = str(getattr(registry.ai, "mode", settings.AI_PROVIDER_MODE or "simulated"))
+    model_name = (
+        settings.OLLAMA_MODEL
+        if provider_mode == "real"
+        else "simulated-deterministic"
     )
-    reply_text = str(ai_result.get("reply") or "Je suis à votre disposition pour votre voyage.")
-    raw_action = ai_result.get("proposed_action")
+
+    # Appel du modèle IA avec validation stricte du schéma (2 essais max) et journalisation obligatoire
+    max_attempts = 2
+    validated_ai: dict[str, Any] | None = None
+    last_provider_runtime_error: Exception | None = None
+
+    for _attempt in range(1, max_attempts + 1):
+        t0 = time.perf_counter()
+        try:
+            raw_ai_result = await registry.ai.generate_chat_reply(
+                user_message=payload.message.strip(),
+                safe_trip_context=safe_context,
+                chat_history=history_for_ai,
+            )
+            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+            logger.info(
+                "[CHAT_AI] provider=%s | mode=%s | model=%s | duration_ms=%.2f | attempt=%d | trip_id=%s",
+                provider_cls_name,
+                provider_mode,
+                model_name,
+                duration_ms,
+                _attempt,
+                trip.id,
+            )
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - t0) * 1000, 2)
+            logger.error(
+                "[CHAT_AI] provider=%s | mode=%s | model=%s | duration_ms=%.2f | attempt=%d | trip_id=%s | error=%s",
+                provider_cls_name,
+                provider_mode,
+                model_name,
+                duration_ms,
+                _attempt,
+                trip.id,
+                exc,
+            )
+            last_provider_runtime_error = exc
+            if provider_mode == "real":
+                # Interdiction stricte du repli silencieux vers le simulateur quand AI_PROVIDER_MODE=real
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        f"Fournisseur IA réel ({provider_cls_name}, modèle={model_name}) indisponible "
+                        f"(repli vers le simulateur interdit) : {exc}"
+                    ),
+                ) from exc
+            validated_ai = None
+            continue
+
+        try:
+            validated_ai = _validate_and_normalize_chat_llm_payload(raw_ai_result)
+            break
+        except ValueError as val_exc:
+            logger.warning(
+                "[CHAT_AI_SCHEMA] provider=%s | mode=%s | model=%s | attempt=%d | schema_error=%s",
+                provider_cls_name,
+                provider_mode,
+                model_name,
+                _attempt,
+                val_exc,
+            )
+            validated_ai = None
+            continue
+
+    # Point 1 : Question d'information sur les autres lieux à visiter -> Action INFO obligatoire
+    if is_info_places_question or (validated_ai is not None and validated_ai.get("action_type") == "INFO"):
+        reply_text = _format_unscheduled_places_info(
+            destination.city_name, places_by_id, existing_items
+        )
+        raw_action = None
+    elif validated_ai is None:
+        reply_text = (
+            "Je n'ai pas pu interpréter cette demande. "
+            "Pouvez-vous préciser le lieu, le jour et l'heure souhaités ?"
+        )
+        raw_action = None
+    else:
+        reply_text = str(validated_ai.get("reply") or "Je suis à votre disposition pour votre voyage.")
+        raw_action = validated_ai.get("proposed_action")
+
+    # Point 3 : Le message "Modification confirmée et appliquée" ne doit JAMAIS apparaître avant un clic sur Confirmer
+    reply_text = re.sub(
+        r"modification\s+confirm[ée]e\s+et\s+appliqu[ée]e\.?",
+        "",
+        reply_text,
+        flags=re.IGNORECASE,
+    ).strip()
 
     proposed_action_dict: dict[str, Any] | None = None
     action_status = "NONE"
+
+    msg_lower_clean = payload.message.strip().lower()
+    explicit_second_time = bool(
+        re.search(
+            r"\b(deuxi[èe]me\s+fois|2\s*e\s+fois|2\s*[èe]me\s+fois|seconde\s+fois|encore\s+une\s+fois)\b",
+            msg_lower_clean,
+        )
+    )
+    has_explicit_add_verb = bool(
+        re.search(r"\b(ajoute|ajouter|rajoute|rajouter)\b", msg_lower_clean)
+    ) and not any(
+        kw in msg_lower_clean for kw in ("déplace", "deplace", "déplacer", "deplacer", "décale", "decale")
+    )
 
     if isinstance(raw_action, dict) and raw_action.get("action_type") in {
         "ADD_VISIT",
@@ -1546,19 +2146,81 @@ async def send_trip_chat_message(
         "REMOVE_VISIT",
     }:
         act_type = str(raw_action["action_type"])
-        place_id = str(raw_action.get("place_id") or "")
-        place_obj = places_by_id.get(place_id)
-        v_date_str = str(
-            raw_action.get("visit_date") or _compute_trip_dates_local(trip, dest_tz)[0].isoformat()
-        )
-        v_time_str = str(raw_action.get("local_start_time") or "14:00")
+        place_obj = _resolve_place_obj(raw_action, payload.message)
+        place_id = place_obj.id if place_obj is not None else str(raw_action.get("place_id") or "")
+        item_id = raw_action.get("item_id")
+
+        # Recherche d'une visite existante au programme pour ce lieu ou cet item_id
+        matching_existing_item: ItineraryItem | None = None
+        if item_id:
+            matching_existing_item = next(
+                (it for it in existing_items if it.id == str(item_id)),
+                None,
+            )
+        if matching_existing_item is None and place_obj is not None:
+            matching_existing_item = next(
+                (it for it in reversed(existing_items) if it.place_id == place_obj.id),
+                None,
+            )
+
+        # Règles côté code (Point 2) :
+        # - Si l'utilisateur demande explicitement "ajoute-le une deuxième fois", on garde ADD_VISIT avec allow_duplicate=True.
+        # - Si l'utilisateur utilise un verbe d'ajout explicite ("ajoute ...") pour un lieu déjà au programme sans dire
+        #   "une deuxième fois", on garde ADD_VISIT avec allow_duplicate=False afin que le moteur de validation refuse le doublon.
+        # - Dans tous les autres cas où le lieu est déjà au programme (ex. "on le mets à 12h", "déplace le Met à 14h"),
+        #   ADD devient MOVE_VISIT sur la visite existante.
+        if matching_existing_item is not None and act_type in {"ADD_VISIT", "MOVE_VISIT"}:
+            if explicit_second_time:
+                act_type = "ADD_VISIT"
+                item_id = None
+            elif has_explicit_add_verb and act_type == "ADD_VISIT":
+                act_type = "ADD_VISIT"
+                item_id = None
+            else:
+                act_type = "MOVE_VISIT"
+                item_id = matching_existing_item.id
+
+        v_time_str = str(msg_extracted_time or raw_action.get("local_start_time") or last_context_time or "14:00")
         dur_min = int(
             raw_action.get("duration_minutes") or (place_obj.recommended_duration_min if place_obj else 90)
         )
         t_mode = normalize_transit_mode(str(raw_action.get("transit_mode") or "METRO"))
-        item_id = raw_action.get("item_id")
 
+        # Règle côté code 2 : une date absente du message n'est jamais acceptée telle quelle
+        # (reprendre la date de la visite existante, sinon poser une question)
+        v_date_str: str | None = None
         if act_type == "REMOVE_VISIT":
+            if matching_existing_item is not None:
+                v_date_str = to_destination_local(
+                    ensure_utc(matching_existing_item.start_at), dest_tz
+                ).strftime("%Y-%m-%d")
+                item_id = matching_existing_item.id
+            else:
+                v_date_str = (
+                    named_trip_date.isoformat()
+                    if named_trip_date is not None
+                    else str(raw_action.get("visit_date") or trip_dates[0].isoformat())
+                )
+        elif named_trip_date is not None:
+            v_date_str = named_trip_date.isoformat()
+        elif matching_existing_item is not None:
+            v_date_str = to_destination_local(
+                ensure_utc(matching_existing_item.start_at), dest_tz
+            ).strftime("%Y-%m-%d")
+        else:
+            # Date absente du message et aucune visite existante au programme pour ce lieu -> poser une question (ASK)
+            v_date_str = None
+            if place_obj is not None:
+                reply_text = (
+                    f"Quel jour souhaitez-vous planifier la visite de « {place_obj.name} » "
+                    f"à {_fmt_short_time_fr(v_time_str)} ?"
+                )
+            else:
+                reply_text = (
+                    "Quel lieu souhaitez-vous planifier ou modifier, et pour quel jour du séjour ?"
+                )
+
+        if act_type == "REMOVE_VISIT" and v_date_str is not None:
             proposed_action_dict = {
                 "action_type": "REMOVE_VISIT",
                 "item_id": item_id,
@@ -1575,7 +2237,7 @@ async def send_trip_chat_message(
                 "suggested_slots": [],
             }
             action_status = "PENDING_CONFIRMATION"
-        elif place_obj is not None:
+        elif place_obj is not None and v_date_str is not None:
             v_date_obj = date.fromisoformat(v_date_str)
             req_start_utc, req_end_utc = parse_local_slot_to_utc(
                 visit_date=v_date_obj,
@@ -1602,40 +2264,185 @@ async def send_trip_chat_message(
                 existing_items=snapshots,
                 transit_mode=t_mode,
                 exclude_item_id=item_id if act_type == "MOVE_VISIT" else None,
+                allow_duplicate_place=explicit_second_time if act_type == "ADD_VISIT" else True,
             )
-            sug_dicts = [
-                SuggestedSlotSchema(**s.to_dict()).model_dump(mode="json")
-                for s in val_res.suggested_slots
-            ]
-            if not val_res.valid:
-                reply_text = (
-                    f"Le créneau demandé ({_format_date_fr(v_date_obj)} à {v_time_str}) pour « {place_obj.name} » "
-                    f"ne respecte pas les règles du séjour : {val_res.message}"
-                )
-                if sug_dicts:
-                    first_s = sug_dicts[0]
-                    sug_date_fr = _format_date_fr(date.fromisoformat(str(first_s["local_date"])))
-                    reply_text += (
-                        f" Je vous suggère plutôt le {sug_date_fr} de "
-                        f"{first_s['local_start_time']} à {first_s['local_end_time']}."
-                    )
 
-            proposed_action_dict = {
-                "action_type": act_type,
-                "item_id": item_id,
-                "place_id": place_obj.id,
-                "place_name": place_obj.name,
-                "visit_date": v_date_str,
-                "local_start_time": v_time_str,
-                "local_end_time": loc_end_str,
-                "duration_minutes": dur_min,
-                "transit_mode": t_mode,
-                "validated_by_engine": val_res.valid,
-                "validation_error_code": val_res.reason_code if not val_res.valid else None,
-                "validation_message_fr": val_res.message if not val_res.valid else None,
-                "suggested_slots": sug_dicts,
-            }
-            action_status = "PENDING_CONFIRMATION"
+            # Si le moteur de validation refuse un doublon de lieu, on renvoie un message de refus clair sans carte de confirmation
+            if not val_res.valid and val_res.reason_code == "DUPLICATE_PLACE":
+                reply_text = val_res.message
+                proposed_action_dict = None
+                action_status = "NONE"
+            else:
+                sug_dicts = [
+                    SuggestedSlotSchema(**s.to_dict()).model_dump(mode="json")
+                    for s in val_res.suggested_slots
+                ]
+
+                if val_res.valid:
+                    if act_type == "MOVE_VISIT":
+                        reply_text = (
+                            f"Je vous propose de déplacer « {place_obj.name} » au "
+                            f"{_format_date_fr(v_date_obj)} à {_fmt_short_time_fr(v_time_str)}. "
+                            "Souhaitez-vous appliquer ce changement ?"
+                        )
+                    elif (
+                        not reply_text
+                        or re.search(r"\b20\d{2}-\d{2}-\d{2}\b", reply_text)
+                        or place_obj.name.lower() not in reply_text.lower()
+                    ):
+                        reply_text = (
+                            f"Je vous propose d'ajouter « {place_obj.name} » le "
+                            f"{_format_date_fr(v_date_obj)} à {_fmt_short_time_fr(v_time_str)} ({dur_min} min). "
+                            "Rien n'est modifié tant que vous ne confirmez pas."
+                        )
+
+                if not val_res.valid:
+                    # Si l'horaire demandé est libre un autre jour du séjour (ex. la veille ou le lendemain),
+                    # le placer en tête des propositions alternatives.
+                    other_days = sorted(
+                        [d for d in trip_dates if d != v_date_obj],
+                        key=lambda d: (0 if (d - v_date_obj).days == -1 else 1, abs((d - v_date_obj).days), d),
+                    )
+                    for cand_day in other_days:
+                        cand_s_utc, cand_e_utc = parse_local_slot_to_utc(
+                            visit_date=cand_day,
+                            local_start_time_str=v_time_str,
+                            duration_minutes=dur_min,
+                            timezone_name=dest_tz,
+                        )
+                        cand_check = _validate_slot(
+                            requested_start_utc=cand_s_utc,
+                            duration_minutes=dur_min,
+                            destination_timezone=dest_tz,
+                            place_id=place_obj.id,
+                            place_name=place_obj.name,
+                            place_latitude=place_obj.latitude,
+                            place_longitude=place_obj.longitude,
+                            place_opening_hours=place_obj.opening_hours or {},
+                            trip_arrival_utc=ensure_utc(trip.arrival_at) if trip.arrival_at else None,
+                            trip_departure_utc=ensure_utc(trip.departure_at) if trip.departure_at else None,
+                            existing_items=snapshots,
+                            transit_mode=t_mode,
+                            exclude_item_id=item_id if act_type == "MOVE_VISIT" else None,
+                            allow_duplicate_place=True,
+                        )
+                        if cand_check.valid:
+                            loc_s = to_destination_local(cand_s_utc, dest_tz)
+                            loc_e = to_destination_local(cand_e_utc, dest_tz)
+                            same_hour_slot = SuggestedSlotSchema(
+                                start_at=cand_s_utc.isoformat(),
+                                end_at=cand_e_utc.isoformat(),
+                                local_date=loc_s.strftime("%Y-%m-%d"),
+                                local_start_time=loc_s.strftime("%H:%M"),
+                                local_end_time=loc_e.strftime("%H:%M"),
+                                timezone=dest_tz,
+                                label=f"{_format_date_fr(cand_day)} de {loc_s.strftime('%H:%M')} à {loc_e.strftime('%H:%M')}",
+                            ).model_dump(mode="json")
+                            sug_dicts = [
+                                same_hour_slot,
+                                *[
+                                    s
+                                    for s in sug_dicts
+                                    if not (
+                                        s["local_date"] == same_hour_slot["local_date"]
+                                        and s["local_start_time"] == same_hour_slot["local_start_time"]
+                                    )
+                                ],
+                            ][:3]
+                            break
+
+                    day_cap = _FR_WEEKDAYS[v_date_obj.weekday()].capitalize()
+                    req_t = _fmt_short_time_fr(v_time_str)
+                    cd = val_res.conflict_details or {}
+
+                    if val_res.reason_code == "OVERLAPPING_VISIT":
+                        c_name = str(cd.get("conflicting_place_name") or "une autre visite")
+                        c_s_iso = str(cd.get("conflicting_start_local") or "")
+                        c_e_iso = str(cd.get("conflicting_end_local") or "")
+                        c_s_hm = datetime.fromisoformat(c_s_iso).strftime("%H:%M") if c_s_iso else "09:00"
+                        c_e_hm = datetime.fromisoformat(c_e_iso).strftime("%H:%M") if c_e_iso else "11:00"
+                        reason_sentence = (
+                            f"{day_cap} à {req_t}, vous avez déjà {c_name} "
+                            f"({_fmt_short_time_fr(c_s_hm)}-{_fmt_short_time_fr(c_e_hm)})."
+                        )
+                    elif val_res.reason_code == "OUTSIDE_OPENING_HOURS":
+                        oh = str(cd.get("opening_hours") or "")
+                        if oh.lower() in ("fermé", "ferme", "closed"):
+                            reason_sentence = f"{day_cap} à {req_t}, {place_obj.name} est fermé ce jour-là."
+                        elif "-" in oh:
+                            oh_parts = oh.split("-", 1)
+                            reason_sentence = (
+                                f"{day_cap} à {req_t}, {place_obj.name} est ouvert de "
+                                f"{_fmt_short_time_fr(oh_parts[0])} à {_fmt_short_time_fr(oh_parts[1])}."
+                            )
+                        else:
+                            reason_sentence = f"{day_cap} à {req_t}, {place_obj.name} est fermé sur ce créneau."
+                    elif val_res.reason_code == "INSUFFICIENT_TRAVEL_TIME":
+                        req_min = int(cd.get("required_travel_minutes") or 15)
+                        other_p = str(
+                            cd.get("from_place")
+                            if cd.get("direction") == "from_previous"
+                            else cd.get("to_place") or "votre autre visite"
+                        )
+                        reason_sentence = (
+                            f"{day_cap} à {req_t}, il faut compter {req_min} min de trajet avec {other_p}."
+                        )
+                    else:
+                        phase = str(cd.get("violation_phase") or "")
+                        if phase in ("BEFORE_ARRIVAL", "ARRIVAL_BUFFER"):
+                            eff_s = str(cd.get("effective_window_start_local") or "")
+                            eff_hm = datetime.fromisoformat(eff_s).strftime("%H:%M") if eff_s else "11:00"
+                            reason_sentence = (
+                                f"{day_cap} à {req_t}, les visites commencent à partir de "
+                                f"{_fmt_short_time_fr(eff_hm)} après votre arrivée."
+                            )
+                        else:
+                            eff_e = str(cd.get("effective_window_end_local") or "")
+                            eff_hm = datetime.fromisoformat(eff_e).strftime("%H:%M") if eff_e else "16:00"
+                            reason_sentence = (
+                                f"{day_cap} à {req_t}, les visites se terminent à "
+                                f"{_fmt_short_time_fr(eff_hm)} avant votre départ."
+                            )
+
+                    if sug_dicts:
+                        first_s = sug_dicts[0]
+                        sug_d = date.fromisoformat(str(first_s["local_date"]))
+                        sug_day_fr = _FR_WEEKDAYS[sug_d.weekday()]
+                        sug_t = _fmt_short_time_fr(str(first_s["local_start_time"]))
+                        reply_text = f"{reason_sentence} Je vous propose {sug_day_fr} à {sug_t}."
+                    else:
+                        reply_text = reason_sentence
+                elif named_trip_date is not None:
+                    if act_type == "MOVE_VISIT":
+                        reply_text = (
+                            f"Je vous propose de déplacer « {place_obj.name} » au "
+                            f"{_format_date_fr(v_date_obj)} à {_fmt_short_time_fr(v_time_str)}. "
+                            "Souhaitez-vous appliquer ce changement ?"
+                        )
+                    else:
+                        reply_text = (
+                            f"Je vous propose d'ajouter « {place_obj.name} » le "
+                            f"{_format_date_fr(v_date_obj)} à {_fmt_short_time_fr(v_time_str)} ({dur_min} min). "
+                            "Rien n'est modifié tant que vous ne confirmez pas."
+                        )
+
+                proposed_action_dict = {
+                    "action_type": act_type,
+                    "item_id": item_id,
+                    "place_id": place_obj.id,
+                    "place_name": place_obj.name,
+                    "visit_date": v_date_str,
+                    "local_start_time": v_time_str,
+                    "local_end_time": loc_end_str,
+                    "duration_minutes": dur_min,
+                    "transit_mode": t_mode,
+                    "allow_duplicate": explicit_second_time,
+                    "validated_by_engine": val_res.valid,
+                    "validation_error_code": val_res.reason_code if not val_res.valid else None,
+                    "validation_message_fr": reply_text if not val_res.valid else None,
+                    "suggested_slots": sug_dicts,
+                }
+                action_status = "PENDING_CONFIRMATION"
 
     assistant_msg = ChatMessage(
         trip_id=trip.id,
@@ -1693,6 +2500,7 @@ async def confirm_chat_proposed_action(
     place_id = str(action.get("place_id"))
     dur_min = int(action.get("duration_minutes") or 90)
     t_mode = normalize_transit_mode(str(action.get("transit_mode") or "METRO"))
+    allow_dup = bool(action.get("allow_duplicate", False))
 
     if act_type == "REMOVE_VISIT":
         if not item_id:
@@ -1719,7 +2527,7 @@ async def confirm_chat_proposed_action(
             applied_change=True,
             updated_item=None,
             deleted_item_id=item_id,
-            detail_fr=f"La visite « {action.get('place_name')} » a bien été retirée de votre programme.",
+            detail_fr=f"Modification confirmée et appliquée : la visite « {action.get('place_name')} » a bien été retirée de votre programme.",
         )
 
     place = await db.scalar(
@@ -1728,8 +2536,13 @@ async def confirm_chat_proposed_action(
     if not place:
         raise HTTPException(status_code=404, detail="Lieu introuvable pour cette destination.")
 
-    v_date = override_visit_date or date.fromisoformat(str(action["visit_date"]))
-    v_time = override_local_start_time or str(action["local_start_time"])
+    sug_list = action.get("suggested_slots") or []
+    if override_visit_date is None and not action.get("validated_by_engine") and sug_list:
+        v_date = date.fromisoformat(str(sug_list[0]["local_date"]))
+        v_time = str(sug_list[0]["local_start_time"])
+    else:
+        v_date = override_visit_date or date.fromisoformat(str(action["visit_date"]))
+        v_time = override_local_start_time or str(action["local_start_time"])
     req_start_utc, req_end_utc = parse_local_slot_to_utc(
         visit_date=v_date,
         local_start_time_str=v_time,
@@ -1738,6 +2551,20 @@ async def confirm_chat_proposed_action(
     )
 
     existing_items, places_map = await _load_trip_items_with_places(db, trip.id)
+
+    # Si l'action est MOVE_VISIT (ou ADD_VISIT sans allow_duplicate sur un lieu déjà présent),
+    # on résout systématiquement la visite existante afin de ne JAMAIS créer de doublon
+    target_existing_item: ItineraryItem | None = None
+    if item_id:
+        target_existing_item = next((it for it in existing_items if it.id == str(item_id)), None)
+    if target_existing_item is None and (act_type == "MOVE_VISIT" or not allow_dup):
+        target_existing_item = next(
+            (it for it in reversed(existing_items) if it.place_id == place.id),
+            None,
+        )
+        if target_existing_item is not None and act_type == "MOVE_VISIT":
+            item_id = target_existing_item.id
+
     snapshots = _build_snapshots(existing_items, places_map)
     if act_type == "MOVE_VISIT" and item_id:
         snapshots = [s for s in snapshots if s.item_id != item_id]
@@ -1756,13 +2583,16 @@ async def confirm_chat_proposed_action(
         existing_items=snapshots,
         transit_mode=t_mode,
         exclude_item_id=item_id if act_type == "MOVE_VISIT" else None,
+        allow_duplicate_place=True if act_type == "MOVE_VISIT" else allow_dup,
     )
     if not val_res.valid:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={
                 "code": val_res.reason_code,
-                "message": val_res.message,
+                "message": str(action.get("validation_message_fr") or val_res.message).replace(
+                    "Visite refusée : ", ""
+                ),
                 "suggested_slots": [
                     SuggestedSlotSchema(**s.to_dict()).model_dump(mode="json")
                     for s in val_res.suggested_slots
@@ -1770,27 +2600,27 @@ async def confirm_chat_proposed_action(
             },
         )
 
-    if act_type == "MOVE_VISIT" and item_id:
-        target_item = await db.scalar(
-            select(ItineraryItem).where(ItineraryItem.id == item_id, ItineraryItem.trip_id == trip.id)
-        )
-        if not target_item:
+    if act_type == "MOVE_VISIT":
+        if target_existing_item is None:
             raise HTTPException(status_code=404, detail="Visite à déplacer introuvable.")
-        target_item.visit_date = v_date
-        target_item.start_at = req_start_utc
-        target_item.end_at = req_end_utc
-        target_item.duration_minutes = dur_min
-        target_item.transit_mode_to_next = t_mode
+        target_existing_item.visit_date = v_date
+        target_existing_item.start_at = req_start_utc
+        target_existing_item.end_at = req_end_utc
+        target_existing_item.duration_minutes = dur_min
+        target_existing_item.transit_mode_to_next = t_mode
         msg.action_status = "CONFIRMED"
         await db.commit()
         await _recompute_trip_day_transits(db, trip.id, dest_tz)
-        await _sync_item_with_google_calendar(db, target_item, place, dest_tz, action="update")
+        await _sync_item_with_google_calendar(db, target_existing_item, place, dest_tz, action="update")
         return ChatActionDecisionResponse(
             message=_serialize_chat_message(msg),
             applied_change=True,
-            updated_item=_to_item_response(target_item, place, dest_tz),
+            updated_item=_to_item_response(target_existing_item, place, dest_tz),
             deleted_item_id=None,
-            detail_fr=f"Visite « {place.name} » déplacée au {_format_date_fr(v_date)} à {v_time}.",
+            detail_fr=(
+                f"Modification confirmée et appliquée : visite « {place.name} » "
+                f"déplacée au {_format_date_fr(v_date)} à {v_time}."
+            ),
         )
 
     new_item = ItineraryItem(
@@ -1821,7 +2651,10 @@ async def confirm_chat_proposed_action(
         applied_change=True,
         updated_item=_to_item_response(new_item, place, dest_tz),
         deleted_item_id=None,
-        detail_fr=f"Visite « {place.name} » ajoutée le {_format_date_fr(v_date)} à {v_time}.",
+        detail_fr=(
+            f"Modification confirmée et appliquée : visite « {place.name} » "
+            f"ajoutée le {_format_date_fr(v_date)} à {v_time}."
+        ),
     )
 
 

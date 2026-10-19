@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     AI_PROVIDER_MODE: ProviderMode = Field(default="simulated")
     AI_API_KEY: str = Field(default="")
     AI_MODEL_NAME: str = Field(default="gemini-2.5-flash")
+    OLLAMA_BASE_URL: str = Field(default="http://host.docker.internal:11434")
+    OLLAMA_MODEL: str = Field(default="mistral")
+    OLLAMA_TIMEOUT_SECONDS: float = Field(default=90.0, ge=1.0)
 
     PLACES_PROVIDER_MODE: ProviderMode = Field(default="simulated")
     GOOGLE_PLACES_API_KEY: str = Field(default="")

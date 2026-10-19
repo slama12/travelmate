@@ -4,9 +4,24 @@ from httpx import ASGITransport, AsyncClient
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from app.core.config import get_settings
 from app.core.database import AsyncSession, Base, build_async_engine, get_db
+from app.core.providers import reset_provider_registry
 from app.core.seed import seed_initial_data
 from app.main import app
+
+
+@pytest.fixture(autouse=True)
+def default_simulated_ai_provider_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Par défaut, les tests unitaires/d'intégration s'exécutent en mode simulé déterministe,
+    tandis que les tests dédiés au mode réel basculent explicitement AI_PROVIDER_MODE=real.
+    """
+    monkeypatch.setenv("AI_PROVIDER_MODE", "simulated")
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+    monkeypatch.setenv("OLLAMA_MODEL", "mistral")
+    get_settings.cache_clear()
+    reset_provider_registry()
 
 
 @pytest.fixture

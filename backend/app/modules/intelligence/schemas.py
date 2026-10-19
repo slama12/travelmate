@@ -186,6 +186,7 @@ class ChatProposedActionSchema(BaseModel):
     local_end_time: str | None = None
     duration_minutes: int = 90
     transit_mode: str = "METRO"
+    allow_duplicate: bool = False
     validated_by_engine: bool = True
     validation_error_code: str | None = None
     validation_message_fr: str | None = None

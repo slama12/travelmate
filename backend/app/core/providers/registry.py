@@ -110,11 +110,22 @@ class ProviderRegistry:
 _DEFAULT_REGISTRY: ProviderRegistry | None = None
 
 
+def reset_provider_registry() -> None:
+    global _DEFAULT_REGISTRY
+    _DEFAULT_REGISTRY = None
+
+
 def get_provider_registry(settings: Settings | None = None) -> ProviderRegistry:
     global _DEFAULT_REGISTRY
     if settings is not None:
         return ProviderRegistry(settings=settings)
-    if _DEFAULT_REGISTRY is None:
-        _DEFAULT_REGISTRY = ProviderRegistry()
+    current_settings = get_settings()
+    if (
+        _DEFAULT_REGISTRY is None
+        or _DEFAULT_REGISTRY.settings.AI_PROVIDER_MODE != current_settings.AI_PROVIDER_MODE
+        or _DEFAULT_REGISTRY.settings.OLLAMA_BASE_URL != current_settings.OLLAMA_BASE_URL
+        or _DEFAULT_REGISTRY.settings.OLLAMA_MODEL != current_settings.OLLAMA_MODEL
+    ):
+        _DEFAULT_REGISTRY = ProviderRegistry(settings=current_settings)
     return _DEFAULT_REGISTRY
 
