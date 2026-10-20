@@ -32,6 +32,7 @@ from app.core.redis import cache_client
 from app.models.entities import (
     Accommodation,
     ChatMessage,
+    ChatUnrecognized,
     Destination,
     FlightBooking,
     ItineraryItem,
@@ -2113,7 +2114,11 @@ async def send_trip_chat_message(
             p_norm = _norm_txt_local(p.name)
             p_space = _spaceless_local(p.name)
             p_core = [t for t in p_norm.split() if t not in stopwords and len(t) >= 2]
-            p_spec = [t for t in p_core if t not in heads and len(t) >= 3] or p_core
+            p_spec = [t for t in p_core if t not in heads and len(t) >= 3] or list(p_core)
+            for i in range(len(p_core) - 1):
+                comp = p_core[i] + p_core[i + 1]
+                if len(comp) >= 5 and comp not in p_spec:
+                    p_spec.append(comp)
             sc = 0.0
             if p_norm in msg_norm_local:
                 sc = 1.0
@@ -2247,6 +2252,9 @@ async def send_trip_chat_message(
                 validated_ai = None
                 continue
 
+    is_info_reply = False
+    is_duplicate_refusal = False
+
     # Point 1 : Question d'information (autres lieux, horaires, météo, budget) -> Action INFO sans modification
     if is_info_places_question or (
         validated_ai is not None
@@ -2258,6 +2266,7 @@ async def send_trip_chat_message(
             destination.city_name, places_by_id, existing_items
         )
         raw_action = None
+        is_info_reply = True
     elif validated_ai is not None and validated_ai.get("action_type") == "INFO":
         if validated_ai.get("info_subtype") == "PLACES":
             reply_text = _format_unscheduled_places_info(
@@ -2268,6 +2277,7 @@ async def send_trip_chat_message(
                 destination.city_name, places_by_id, existing_items
             )
         raw_action = None
+        is_info_reply = True
     elif validated_ai is None:
         reply_text = "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?"
         raw_action = None
@@ -2434,6 +2444,7 @@ async def send_trip_chat_message(
                 reply_text = val_res.message
                 proposed_action_dict = None
                 action_status = "NONE"
+                is_duplicate_refusal = True
             else:
                 sug_dicts = [
                     SuggestedSlotSchema(**s.to_dict()).model_dump(mode="json")
@@ -2605,6 +2616,27 @@ async def send_trip_chat_message(
                     "suggested_slots": sug_dicts,
                 }
                 action_status = "PENDING_CONFIRMATION"
+
+    # Journalisation de chaque phrase non comprise ou incomplète dans la table chat_unrecognized
+    if proposed_action_dict is None and not is_info_reply and not is_duplicate_refusal:
+        unrec_reason = (
+            "SCHEMA_OR_PARSE_FAILURE"
+            if validated_ai is None
+            else (
+                "MISSING_DATE_OR_TIME"
+                if (validated_ai.get("place_name") or isinstance(raw_action, dict))
+                else "UNRECOGNIZED_INTENT"
+            )
+        )
+        db.add(
+            ChatUnrecognized(
+                trip_id=trip.id,
+                user_id=current_user.id,
+                raw_message=payload.message.strip(),
+                reason=unrec_reason,
+                assistant_reply=reply_text,
+            )
+        )
 
     assistant_msg = ChatMessage(
         trip_id=trip.id,

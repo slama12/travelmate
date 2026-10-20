@@ -201,6 +201,25 @@ async def test_postgres_alembic_upgrade_head_from_empty_db_and_idempotent_seed()
                 ).fetchall()
             }
             assert {"proposed_action", "action_status"}.issubset(step4_chat_cols)
+
+            chat_unrec_cols = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'chat_unrecognized'"
+                    )
+                ).fetchall()
+            }
+            assert {
+                "id",
+                "trip_id",
+                "user_id",
+                "raw_message",
+                "reason",
+                "assistant_reply",
+                "created_at",
+            }.issubset(chat_unrec_cols)
         verify_engine.dispose()
 
         # 2. Exécute le seed une 1re fois puis une 2de fois sur PostgreSQL et vérifie l'idempotence

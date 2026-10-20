@@ -786,7 +786,7 @@ class SimulatedAIProvider(BaseAIProvider):
         }
         non_place_words = {
             "ajouter", "ajoute", "ajoutes", "rajouter", "rajoute", "rajoutes", "mettre",
-            "mets", "met", "planifier", "planifie", "programmer", "programme", "inserer",
+            "mets", "planifier", "planifie", "programmer", "programme", "inserer",
             "insere", "visiter", "visite", "visites", "aller", "voir", "faire", "deplacer",
             "deplace", "deplaces", "decaler", "decale", "decales", "changer", "change",
             "changes", "modifier", "modifie", "modifies", "reporter", "reporte",
@@ -806,15 +806,22 @@ class SimulatedAIProvider(BaseAIProvider):
             "montre", "montrer", "liste", "lister", "suggere", "recommande", "conseille",
             "reste", "depense", "cout", "coute", "sejour", "voyage", "prevu", "prevue",
             "prevus", "prevues", "ouverture", "duree", "dure", "blablabla", "sais", "rien",
+            "new", "york", "paris", "tokyo", "rome", "marrakech",
         }
 
+        verb_met_used = bool(
+            re.search(r"\b(?:on|il|elle|qui|ça|ca)(?:\s+(?:le|la|les|l['’]|y|en))?\s+met\b", msg_lower)
+        )
         msg_tokens = [
             t for t in msg_norm.split()
             if t and not t.isdigit() and not re.match(r"^\d+h\d*$", t)
         ]
         meaningful_msg_tokens = [
             t for t in msg_tokens
-            if t not in place_stopwords and t not in non_place_words and len(t) >= 3
+            if t not in place_stopwords
+            and t not in non_place_words
+            and not (t == "met" and verb_met_used)
+            and len(t) >= 3
         ]
 
         def _score_place_candidate(cand_name: str) -> float:
@@ -827,6 +834,12 @@ class SimulatedAIProvider(BaseAIProvider):
             if not p_specific_tokens:
                 p_specific_tokens = list(p_core_tokens)
             p_core_spaceless = "".join(p_core_tokens)
+
+            # Synonymes et variantes locales courantes (ex: "sensoji" pour "senso-ji")
+            for i in range(len(p_core_tokens) - 1):
+                compound_tok = p_core_tokens[i] + p_core_tokens[i + 1]
+                if len(compound_tok) >= 5 and compound_tok not in p_specific_tokens:
+                    p_specific_tokens.append(compound_tok)
 
             # 1. Sous-chaîne exacte normalisée
             if p_norm in msg_norm:
@@ -986,11 +999,14 @@ class SimulatedAIProvider(BaseAIProvider):
                 msg_lower,
             )
         ) and not has_move_verb and not has_remove_verb
-        has_put_or_go_verb = bool(
-            re.search(
-                r"\b(mettre|mets|met|mettez|aller\s+voir|aller\s+[àa]|aller\s+au|aller\s+aux|on\s+va\s+voir)\b",
-                msg_lower,
+        has_put_or_go_verb = (
+            bool(
+                re.search(
+                    r"\b(mettre|mets|mettez|aller\s+voir|aller\s+[àa]|aller\s+au|aller\s+aux|on\s+va\s+voir)\b",
+                    msg_lower,
+                )
             )
+            or verb_met_used
         ) and not has_move_verb and not has_remove_verb
 
         # ---------------------------------------------------------------------

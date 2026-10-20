@@ -1934,4 +1934,324 @@ async def test_rules_mode_default_40_real_french_sentences_and_health_strategy(
     assert passed_count == 40, "Échecs sur le jeu de 40 phrases :\n" + "\n".join(failures)
 
 
+@pytest.mark.asyncio
+async def test_rules_mode_30_sentences_new_york_paris_tokyo_and_chat_unrecognized_table(
+    client: AsyncClient,
+    db_session,
+) -> None:
+    """
+    Avant l'Étape 5A :
+    1. Teste le mode rules sur New York, Paris et Tokyo avec 10 phrases par ville
+       (noms de lieux locaux : Met, Empire State, Tour Eiffel, Louvre, Senso-ji, Shibuya)
+       et vérifie 30/30 (100% de réussite).
+    2. Vérifie que chaque phrase non comprise ou incomplète envoyée au chat est journalisée
+       dans la table chat_unrecognized.
+    """
+    from sqlalchemy import select
+    from app.core.config import get_settings
+    from app.core.providers import SimulatedAIProvider
+    from app.models.entities import ChatUnrecognized
+
+    rules_provider = SimulatedAIProvider(get_settings())
+
+    # ------------------------------------------------------------------
+    # 1. NEW YORK (10 phrases, incluant Met, Empire State, MoMA, High Line, Central Park)
+    # ------------------------------------------------------------------
+    ny_places = [
+        {"id": "ny-met", "name": "Metropolitan Museum of Art (The Met)", "category": "MUSEUM", "recommended_duration_min": 180, "indoor": True, "opening_hours": {"default": "10:00-17:00"}},
+        {"id": "ny-esb", "name": "Empire State Building", "category": "MONUMENT", "recommended_duration_min": 90, "indoor": False, "opening_hours": {"default": "09:00-23:00"}},
+        {"id": "ny-moma", "name": "MoMA (Museum of Modern Art)", "category": "MUSEUM", "recommended_duration_min": 150, "indoor": True, "opening_hours": {"default": "10:30-17:30"}},
+        {"id": "ny-statue", "name": "Statue de la Liberté & Ellis Island", "category": "MONUMENT", "recommended_duration_min": 240, "indoor": False, "opening_hours": {"default": "09:00-17:00"}},
+        {"id": "ny-cp", "name": "Central Park", "category": "PARK", "recommended_duration_min": 120, "indoor": False, "opening_hours": {"default": "06:00-01:00"}},
+        {"id": "ny-hl", "name": "The High Line", "category": "PARK", "recommended_duration_min": 90, "indoor": False, "opening_hours": {"default": "07:00-22:00"}},
+    ]
+    ny_context = {
+        "trip": {
+            "id": "trip-ny-rules",
+            "title": "Séjour New York",
+            "city_name": "New York",
+            "timezone": "America/New_York",
+            "arrival_at": "2026-11-11T08:00:00Z",
+            "departure_at": "2026-11-15T20:00:00Z",
+            "total_budget_planned": 3200.0,
+            "currency": "USD",
+        },
+        "itinerary": [
+            {
+                "item_id": "item-ny-met",
+                "place_id": "ny-met",
+                "place_name": "Metropolitan Museum of Art (The Met)",
+                "visit_date": "2026-11-11",
+                "local_start_time": "10:00",
+                "local_end_time": "13:00",
+                "duration_minutes": 180,
+                "transit_mode": "METRO",
+            },
+            {
+                "item_id": "item-ny-esb",
+                "place_id": "ny-esb",
+                "place_name": "Empire State Building",
+                "visit_date": "2026-11-12",
+                "local_start_time": "15:00",
+                "local_end_time": "16:30",
+                "duration_minutes": 90,
+                "transit_mode": "METRO",
+            },
+        ],
+        "available_places": ny_places,
+        "last_place_id": "ny-met",
+        "last_place_name": "Metropolitan Museum of Art (The Met)",
+        "last_visit_date": "2026-11-11",
+        "last_start_time": "10:00",
+        "budget": {"planned_total": 3200.0, "committed_total": 1400.0, "remaining_total": 1800.0},
+        "weather": [
+            {"date": "2026-11-11", "condition_label_fr": "Ensoleillé", "temp_max_c": 16},
+            {"date": "2026-11-12", "condition_label_fr": "Nuageux", "temp_max_c": 14},
+            {"date": "2026-11-13", "condition_label_fr": "Ensoleillé", "temp_max_c": 17},
+            {"date": "2026-11-14", "condition_label_fr": "Ensoleillé", "temp_max_c": 18},
+            {"date": "2026-11-15", "condition_label_fr": "Ensoleillé", "temp_max_c": 15},
+        ],
+    }
+    ny_sentences: list[tuple[str, str, str | None, str | None, str | None]] = [
+        ("déplacer le Met au jeudi à 14h", "MOVE_VISIT", "Metropolitan Museum of Art (The Met)", "2026-11-12", "14:00"),
+        ("modifier Empire State le 13 novembre à 11h", "MOVE_VISIT", "Empire State Building", "2026-11-13", "11:00"),
+        ("ajouter MoMA mercredi à 15h", "ADD_VISIT", "MoMA (Museum of Modern Art)", "2026-11-11", "15:00"),
+        ("mettre Central Park vendredi à 10h", "ADD_VISIT", "Central Park", "2026-11-13", "10:00"),
+        ("rajouter High Line samedi à 16h30", "ADD_VISIT", "The High Line", "2026-11-14", "16:30"),
+        ("retirer Empire State", "REMOVE_VISIT", "Empire State Building", "2026-11-12", "15:00"),
+        ("on le met à 11h", "MOVE_VISIT", "Metropolitan Museum of Art (The Met)", "2026-11-11", "11:00"),
+        ("quels sont les horaires du Met ?", "INFO", "Metropolitan Museum of Art (The Met)", None, None),
+        ("tu peux me donner d'autres lieux à visiter ?", "INFO", None, None, None),
+        ("on change un truc", "ASK", None, None, None),
+    ]
+
+    # ------------------------------------------------------------------
+    # 2. PARIS (10 phrases, incluant Tour Eiffel, Louvre, Orsay, Sainte-Chapelle, Pompidou)
+    # ------------------------------------------------------------------
+    paris_places = [
+        {"id": "par-louvre", "name": "Musée du Louvre", "category": "MUSEUM", "recommended_duration_min": 180, "indoor": True, "opening_hours": {"default": "09:00-18:00"}},
+        {"id": "par-eiffel", "name": "Le Jules Verne (Tour Eiffel)", "category": "RESTAURANT", "recommended_duration_min": 120, "indoor": True, "opening_hours": {"default": "12:00-22:00"}},
+        {"id": "par-orsay", "name": "Musée d'Orsay", "category": "MUSEUM", "recommended_duration_min": 150, "indoor": True, "opening_hours": {"default": "09:30-18:00"}},
+        {"id": "par-chapelle", "name": "Sainte-Chapelle", "category": "MONUMENT", "recommended_duration_min": 60, "indoor": True, "opening_hours": {"default": "09:00-17:00"}},
+        {"id": "par-pompidou", "name": "Centre Pompidou", "category": "MUSEUM", "recommended_duration_min": 120, "indoor": True, "opening_hours": {"default": "11:00-21:00"}},
+        {"id": "par-lux", "name": "Jardin du Luxembourg", "category": "PARK", "recommended_duration_min": 90, "indoor": False, "opening_hours": {"default": "08:00-19:30"}},
+    ]
+    paris_context = {
+        "trip": {
+            "id": "trip-paris-rules",
+            "title": "Séjour Paris",
+            "city_name": "Paris",
+            "timezone": "Europe/Paris",
+            "arrival_at": "2026-11-11T08:00:00Z",
+            "departure_at": "2026-11-15T20:00:00Z",
+            "total_budget_planned": 1800.0,
+            "currency": "EUR",
+        },
+        "itinerary": [
+            {
+                "item_id": "item-par-louvre",
+                "place_id": "par-louvre",
+                "place_name": "Musée du Louvre",
+                "visit_date": "2026-11-11",
+                "local_start_time": "10:00",
+                "local_end_time": "13:00",
+                "duration_minutes": 180,
+                "transit_mode": "METRO",
+            },
+            {
+                "item_id": "item-par-eiffel",
+                "place_id": "par-eiffel",
+                "place_name": "Le Jules Verne (Tour Eiffel)",
+                "visit_date": "2026-11-12",
+                "local_start_time": "19:00",
+                "local_end_time": "21:00",
+                "duration_minutes": 120,
+                "transit_mode": "METRO",
+            },
+        ],
+        "available_places": paris_places,
+        "last_place_id": "par-louvre",
+        "last_place_name": "Musée du Louvre",
+        "last_visit_date": "2026-11-11",
+        "last_start_time": "10:00",
+        "budget": {"planned_total": 1800.0, "committed_total": 600.0, "remaining_total": 1200.0},
+        "weather": [
+            {"date": "2026-11-11", "condition_label_fr": "Ensoleillé", "temp_max_c": 15},
+            {"date": "2026-11-12", "condition_label_fr": "Pluvieux", "temp_max_c": 12},
+            {"date": "2026-11-13", "condition_label_fr": "Ensoleillé", "temp_max_c": 16},
+            {"date": "2026-11-14", "condition_label_fr": "Ensoleillé", "temp_max_c": 15},
+            {"date": "2026-11-15", "condition_label_fr": "Ensoleillé", "temp_max_c": 14},
+        ],
+    }
+    paris_sentences: list[tuple[str, str, str | None, str | None, str | None]] = [
+        ("déplacer le Louvre à jeudi 14h", "MOVE_VISIT", "Musée du Louvre", "2026-11-12", "14:00"),
+        ("décaler Tour Eiffel au 13 novembre à 20h", "MOVE_VISIT", "Le Jules Verne (Tour Eiffel)", "2026-11-13", "20:00"),
+        ("ajouter Musée d'Orsay vendredi à 10h30", "ADD_VISIT", "Musée d'Orsay", "2026-11-13", "10:30"),
+        ("mettre Sainte-Chapelle samedi à 11h", "ADD_VISIT", "Sainte-Chapelle", "2026-11-14", "11:00"),
+        ("planifier Centre Pompidou dimanche à 14h", "ADD_VISIT", "Centre Pompidou", "2026-11-15", "14:00"),
+        ("supprimer Tour Eiffel", "REMOVE_VISIT", "Le Jules Verne (Tour Eiffel)", "2026-11-12", "19:00"),
+        ("on le décale à 15h", "MOVE_VISIT", "Musée du Louvre", "2026-11-11", "15:00"),
+        ("quelle est la météo prévue demain ?", "INFO", None, None, None),
+        ("quels sont les horaires du Louvre ?", "INFO", "Musée du Louvre", None, None),
+        ("ajoute Orsay", "ASK", "Musée d'Orsay", None, None),
+    ]
+
+    # ------------------------------------------------------------------
+    # 3. TOKYO (10 phrases, incluant Senso-ji, Shibuya, Skytree, Meiji Jingu, teamLab)
+    # ------------------------------------------------------------------
+    tokyo_places = [
+        {"id": "tyo-sensoji", "name": "Temple Senso-ji (Asakusa)", "category": "MONUMENT", "recommended_duration_min": 90, "indoor": False, "opening_hours": {"default": "06:00-17:00"}},
+        {"id": "tyo-shibuya", "name": "Ichiran Ramen Shibuya", "category": "RESTAURANT", "recommended_duration_min": 60, "indoor": True, "opening_hours": {"default": "10:00-23:00"}},
+        {"id": "tyo-skytree", "name": "Tour Tokyo Skytree", "category": "MONUMENT", "recommended_duration_min": 120, "indoor": True, "opening_hours": {"default": "10:00-21:00"}},
+        {"id": "tyo-meiji", "name": "Sanctuaire Meiji Jingu (Harajuku)", "category": "MONUMENT", "recommended_duration_min": 90, "indoor": False, "opening_hours": {"default": "06:00-18:00"}},
+        {"id": "tyo-teamlab", "name": "teamLab Planets Tokyo", "category": "MUSEUM", "recommended_duration_min": 120, "indoor": True, "opening_hours": {"default": "09:00-21:00"}},
+        {"id": "tyo-tsukiji", "name": "Marché Extérieur de Tsukiji", "category": "FOOD", "recommended_duration_min": 90, "indoor": False, "opening_hours": {"default": "07:00-14:00"}},
+    ]
+    tokyo_context = {
+        "trip": {
+            "id": "trip-tokyo-rules",
+            "title": "Séjour Tokyo",
+            "city_name": "Tokyo",
+            "timezone": "Asia/Tokyo",
+            "arrival_at": "2026-11-11T08:00:00Z",
+            "departure_at": "2026-11-15T20:00:00Z",
+            "total_budget_planned": 3500.0,
+            "currency": "EUR",
+        },
+        "itinerary": [
+            {
+                "item_id": "item-tyo-sensoji",
+                "place_id": "tyo-sensoji",
+                "place_name": "Temple Senso-ji (Asakusa)",
+                "visit_date": "2026-11-11",
+                "local_start_time": "09:00",
+                "local_end_time": "10:30",
+                "duration_minutes": 90,
+                "transit_mode": "METRO",
+            },
+            {
+                "item_id": "item-tyo-shibuya",
+                "place_id": "tyo-shibuya",
+                "place_name": "Ichiran Ramen Shibuya",
+                "visit_date": "2026-11-12",
+                "local_start_time": "19:30",
+                "local_end_time": "20:30",
+                "duration_minutes": 60,
+                "transit_mode": "METRO",
+            },
+        ],
+        "available_places": tokyo_places,
+        "last_place_id": "tyo-sensoji",
+        "last_place_name": "Temple Senso-ji (Asakusa)",
+        "last_visit_date": "2026-11-11",
+        "last_start_time": "09:00",
+        "budget": {"planned_total": 3500.0, "committed_total": 1500.0, "remaining_total": 2000.0},
+        "weather": [
+            {"date": "2026-11-11", "condition_label_fr": "Ensoleillé", "temp_max_c": 19},
+            {"date": "2026-11-12", "condition_label_fr": "Ensoleillé", "temp_max_c": 20},
+            {"date": "2026-11-13", "condition_label_fr": "Nuageux", "temp_max_c": 18},
+            {"date": "2026-11-14", "condition_label_fr": "Ensoleillé", "temp_max_c": 19},
+            {"date": "2026-11-15", "condition_label_fr": "Ensoleillé", "temp_max_c": 17},
+        ],
+    }
+    tokyo_sentences: list[tuple[str, str, str | None, str | None, str | None]] = [
+        ("déplacer Senso-ji à jeudi 10h", "MOVE_VISIT", "Temple Senso-ji (Asakusa)", "2026-11-12", "10:00"),
+        ("modifier Shibuya le 13 novembre à 12h30", "MOVE_VISIT", "Ichiran Ramen Shibuya", "2026-11-13", "12:30"),
+        ("ajouter Skytree vendredi à 16h", "ADD_VISIT", "Tour Tokyo Skytree", "2026-11-13", "16:00"),
+        ("mettre Meiji Jingu samedi à 9h30", "ADD_VISIT", "Sanctuaire Meiji Jingu (Harajuku)", "2026-11-14", "09:30"),
+        ("rajouter teamLab dimanche à 14h", "ADD_VISIT", "teamLab Planets Tokyo", "2026-11-15", "14:00"),
+        ("retirer Sensoji", "REMOVE_VISIT", "Temple Senso-ji (Asakusa)", "2026-11-11", "09:00"),
+        ("annuler Shibuya", "REMOVE_VISIT", "Ichiran Ramen Shibuya", "2026-11-12", "19:30"),
+        ("combien il me reste dans mon budget ?", "INFO", None, None, None),
+        ("d'autres lieux à visiter à Tokyo ?", "INFO", None, None, None),
+        ("blablabla rien", "ASK", None, None, None),
+    ]
+
+    all_city_benchmarks = [
+        ("New York", ny_context, ny_sentences),
+        ("Paris", paris_context, paris_sentences),
+        ("Tokyo", tokyo_context, tokyo_sentences),
+    ]
+
+    total_passed = 0
+    failures: list[str] = []
+
+    for city_label, ctx, sentences in all_city_benchmarks:
+        assert len(sentences) == 10
+        for idx, (sentence, exp_action, exp_place, exp_date, exp_time) in enumerate(sentences, start=1):
+            res = await rules_provider.generate_chat_reply(
+                user_message=sentence,
+                safe_trip_context=ctx,
+                chat_history=[],
+            )
+            pa = res.get("proposed_action")
+            got_action = pa["action_type"] if isinstance(pa, dict) else res.get("action_type")
+            got_place = pa.get("place_name") if isinstance(pa, dict) else res.get("place_name")
+            got_date = pa.get("visit_date") if isinstance(pa, dict) else res.get("visit_date")
+            got_time = pa.get("local_start_time") if isinstance(pa, dict) else res.get("local_start_time")
+
+            if (
+                got_action == exp_action
+                and got_place == exp_place
+                and got_date == exp_date
+                and got_time == exp_time
+            ):
+                total_passed += 1
+            else:
+                failures.append(
+                    f"[{city_label} #{idx}] {sentence!r} -> attendu=({exp_action}, {exp_place}, {exp_date}, {exp_time}) | "
+                    f"obtenu=({got_action}, {got_place}, {got_date}, {got_time})"
+                )
+
+    assert total_passed == 30, "Échecs sur les 30 phrases NY/Paris/Tokyo :\n" + "\n".join(failures)
+
+    # ------------------------------------------------------------------
+    # 4. Vérification de la journalisation dans la table chat_unrecognized
+    # ------------------------------------------------------------------
+    headers, trip_id, _ = await _register_user_and_create_tokyo_trip(
+        client, email="chat_unrecognized@travelmate.app"
+    )
+
+    # Une phrase comprise (ADD_VISIT) ne doit PAS créer d'entrée dans chat_unrecognized
+    ok_res = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "ajouter Senso-ji vendredi à 10h"},
+    )
+    assert ok_res.status_code == 200
+
+    # Deux phrases non comprises / incomplètes doivent être journalisées dans chat_unrecognized
+    unrec_1 = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "on change un truc"},
+    )
+    assert unrec_1.status_code == 200
+
+    unrec_2 = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "ajoute Senso-ji"},
+    )
+    assert unrec_2.status_code == 200
+
+    logged_rows = list(
+        (
+            await db_session.scalars(
+                select(ChatUnrecognized)
+                .where(ChatUnrecognized.trip_id == trip_id)
+                .order_by(ChatUnrecognized.created_at.asc())
+            )
+        ).all()
+    )
+    assert len(logged_rows) == 2
+    assert logged_rows[0].raw_message == "on change un truc"
+    assert logged_rows[0].reason == "UNRECOGNIZED_INTENT"
+    assert logged_rows[1].raw_message == "ajoute Senso-ji"
+    assert logged_rows[1].reason == "MISSING_DATE_OR_TIME"
+
+
+
+
+
 
