@@ -2251,6 +2251,203 @@ async def test_rules_mode_30_sentences_new_york_paris_tokyo_and_chat_unrecognize
     assert logged_rows[1].reason == "MISSING_DATE_OR_TIME"
 
 
+@pytest.mark.asyncio
+async def test_chat_place_recognition_similarity_ambiguity_pronoun_and_closed_hours(
+    client: AsyncClient,
+) -> None:
+    """
+    Vérifie la correction du bug de reconnaissance des lieux dans le chat :
+    1. Nom contenant des mots en plus ("Medina", "Marrakech", "de la"), sans article ou avec faute -> lieu le plus proche via score de similarité >= seuil.
+    2. Lieu inconnu (< seuil) -> pose une question, ne propose jamais un autre lieu ni le dernier lieu cité.
+    3. Lieu ambigu (deux lieux proches : "le Jardin") -> pose la question "Vous parlez du Jardin Secret ou du Jardin Majorelle ?".
+    4. Pronom ("mets-le", "on le met") -> utilise le dernier lieu cité uniquement s'il y a un vrai pronom (et jamais sur "mets le <Lieu>").
+    5. Heure impossible (lieu fermé) -> propose des créneaux d'ouverture pour CE lieu, jamais un autre lieu.
+    """
+    reg = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "email": "marrakech_jardin_secret_bug@travelmate.app",
+            "password": "StrongPassword!123",
+            "full_name": "Voyageur Marrakech",
+            "preferred_currency": "EUR",
+            "preferred_language": "fr",
+            "travel_style": "STANDARD",
+        },
+    )
+    assert reg.status_code == 201, reg.text
+    headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
+
+    dest_resp = await client.get("/api/v1/destinations")
+    assert dest_resp.status_code == 200
+    marrakech = next(d for d in dest_resp.json() if d["city_name"] == "Marrakech")
+
+    trip_resp = await client.post(
+        "/api/v1/trips",
+        headers=headers,
+        json={
+            "destination_id": marrakech["id"],
+            "title": "Séjour Marrakech Médina",
+            "travel_style": "STANDARD",
+            "total_budget": 1200.0,
+        },
+    )
+    assert trip_resp.status_code == 201, trip_resp.text
+    trip_id = trip_resp.json()["id"]
+
+    # Réservation d'un vol aller-retour du mercredi 11 novembre 2026 au dimanche 15 novembre 2026
+    book_resp = await client.post(
+        "/api/v1/flights/book",
+        headers=headers,
+        json={
+            "trip_id": trip_id,
+            "idempotency_key": "idem-marrakech-jardin-secret-bug",
+            "airline": "Royal Air Maroc",
+            "flight_number_outbound": "AT749",
+            "flight_number_inbound": "AT748",
+            "origin_iata": "ORY",
+            "destination_iata": "RAK",
+            "departure_outbound_at": "2026-11-11T06:00:00Z",
+            "arrival_outbound_at": "2026-11-11T08:00:00Z",
+            "departure_inbound_at": "2026-11-15T21:00:00Z",
+            "arrival_inbound_at": "2026-11-15T23:55:00Z",
+            "price_amount": "280.00",
+            "currency": "EUR",
+            "cabin_class": "ECONOMY",
+        },
+    )
+    assert book_resp.status_code == 201, book_resp.text
+
+    places_resp = await client.get("/api/v1/places/city/Marrakech", headers=headers)
+    assert places_resp.status_code == 200
+    marrakech_places = places_resp.json()["places"]
+    jardin_secret = next(p for p in marrakech_places if "Jardin Secret" in p["name"])
+    grande_table = next(p for p in marrakech_places if "Grande Table" in p["name"])
+
+    # Ajout préalable de La Grande Table Marocaine au programme en dernière position (état exact de la capture)
+    add_dinner = await client.post(
+        "/api/v1/itinerary/items",
+        headers=headers,
+        json={
+            "trip_id": trip_id,
+            "place_id": grande_table["id"],
+            "visit_date": "2026-11-12",
+            "local_start_time": "19:30",
+            "duration_minutes": 120,
+            "transit_mode": "WALKING",
+        },
+    )
+    assert add_dinner.status_code == 201, add_dinner.text
+
+    # 1. Phrase exacte de la capture + variantes ("Medina", "Marrakech", "de la", sans article, avec faute)
+    variant_phrases = [
+        ("mets le Jardin Secret Medina le 13 novembre à 10h", "Le Jardin Secret (Médina)", "2026-11-13", "10:00"),
+        ("mets Jardin Secret de la Medina Marrakech le 13 novembre à 10h", "Le Jardin Secret (Médina)", "2026-11-13", "10:00"),
+        ("ajoute Jardin Secrt Medina vendredi à 10h30", "Le Jardin Secret (Médina)", "2026-11-13", "10:30"),
+        ("planifie Jardin Secret Marrakech samedi à 11h", "Le Jardin Secret (Médina)", "2026-11-14", "11:00"),
+        ("mets Majorele de Marrakech samedi à 15h", "Jardin Majorelle & Musée Yves Saint Laurent", "2026-11-14", "15:00"),
+    ]
+    for phrase, expected_place_name, expected_date, expected_time in variant_phrases:
+        resp = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/chat",
+            headers=headers,
+            json={"message": phrase},
+        )
+        assert resp.status_code == 200, f"Échec HTTP sur {phrase!r}: {resp.text}"
+        assistant_msg = resp.json()["messages"][-1]
+        prop = assistant_msg["proposed_action"]
+        assert prop is not None, f"Aucune proposition générée pour {phrase!r}: {assistant_msg}"
+        assert prop["place_name"] == expected_place_name, (
+            f"Pour {phrase!r}, lieu proposé={prop['place_name']!r} au lieu de {expected_place_name!r}"
+        )
+        assert "Grande Table" not in prop["place_name"]
+        assert prop["visit_date"] == expected_date
+        assert prop["local_start_time"] == expected_time
+        assert prop["validated_by_engine"] is True
+
+    # 2. Lieu inconnu (< seuil) -> pose une question, ne propose JAMAIS un autre lieu ni le dernier lieu cité
+    unknown_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "mets la Tour de Pise le 13 novembre à 10h"},
+    )
+    assert unknown_resp.status_code == 200
+    unknown_msg = unknown_resp.json()["messages"][-1]
+    assert unknown_msg["proposed_action"] is None
+    assert unknown_msg["action_status"] == "NONE"
+    assert "?" in unknown_msg["content"]
+    assert "Grande Table" not in unknown_msg["content"]
+    assert "Jardin Secret" not in unknown_msg["content"]
+
+    # 3. Lieu ambigu ("mets le Jardin le 13 novembre à 10h") -> pose la question entre les deux jardins proches
+    ambiguous_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "mets le Jardin le 13 novembre à 10h"},
+    )
+    assert ambiguous_resp.status_code == 200
+    ambiguous_msg = ambiguous_resp.json()["messages"][-1]
+    assert ambiguous_msg["proposed_action"] is None
+    assert ambiguous_msg["action_status"] == "NONE"
+    assert "Vous parlez du Jardin Secret ou du Jardin Majorelle ?" in ambiguous_msg["content"]
+
+    # 4. Pronom -> utilise le dernier lieu cité UNIQUEMENT s'il y a un pronom
+    # D'abord on cite explicitement Palais de la Bahia
+    bahia_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "ajoute Palais de la Bahia vendredi à 11h"},
+    )
+    assert bahia_resp.status_code == 200
+    assert bahia_resp.json()["messages"][-1]["proposed_action"]["place_name"] == "Palais de la Bahia"
+
+    # Avec pronom ("on le met samedi à 14h") -> reprend bien Palais de la Bahia
+    pronoun_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "on le met samedi à 14h"},
+    )
+    assert pronoun_resp.status_code == 200
+    pronoun_prop = pronoun_resp.json()["messages"][-1]["proposed_action"]
+    assert pronoun_prop is not None
+    assert pronoun_prop["place_name"] == "Palais de la Bahia"
+    assert pronoun_prop["visit_date"] == "2026-11-14"
+    assert pronoun_prop["local_start_time"] == "14:00"
+
+    # Sans pronom, avec un lieu inconnu ("mets le Musée Inconnu samedi à 14h") -> ne reprend PAS Palais de la Bahia
+    no_pronoun_unknown = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "mets le Musée Inconnu samedi à 14h"},
+    )
+    assert no_pronoun_unknown.status_code == 200
+    assert no_pronoun_unknown.json()["messages"][-1]["proposed_action"] is None
+    assert "?" in no_pronoun_unknown.json()["messages"][-1]["content"]
+
+    # 5. Quand l'heure demandée est impossible (lieu fermé : Le Jardin Secret à 21h),
+    # propose des créneaux pour CE lieu (Le Jardin Secret), jamais un autre lieu (ex: La Grande Table ouverte à 21h)
+    closed_resp = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/chat",
+        headers=headers,
+        json={"message": "mets le Jardin Secret Medina le 13 novembre à 21h"},
+    )
+    assert closed_resp.status_code == 200
+    closed_msg = closed_resp.json()["messages"][-1]
+    closed_prop = closed_msg["proposed_action"]
+    assert closed_prop is not None
+    assert closed_prop["place_name"] == "Le Jardin Secret (Médina)"
+    assert closed_prop["place_id"] == str(jardin_secret["id"])
+    assert closed_prop["validated_by_engine"] is False
+    assert closed_prop["validation_error_code"] == "OUTSIDE_OPENING_HOURS"
+    assert "Le Jardin Secret (Médina)" in closed_msg["content"]
+    assert "Grande Table" not in closed_msg["content"]
+    assert len(closed_prop["suggested_slots"]) >= 1
+    for slot in closed_prop["suggested_slots"]:
+        assert slot["local_date"] == "2026-11-13"
+        assert "09:30" <= slot["local_start_time"] <= "17:15"
+
+
+
+
 
 
 

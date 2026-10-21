@@ -773,17 +773,26 @@ class SimulatedAIProvider(BaseAIProvider):
                 if 0 <= hh <= 23 and 0 <= mm <= 59:
                     extracted_time = f"{hh:02d}:{mm:02d}"
 
-        # Correspondance approximative des noms de lieux (fautes de frappe, articles manquants, mots collés)
+        # Correspondance approximative des noms de lieux (fautes de frappe, articles manquants, mots collés, mots de lieu en plus)
+        MIN_PLACE_SIMILARITY_THRESHOLD = 0.65
+        AMBIGUITY_SCORE_MARGIN = 0.12
+
         place_stopwords = {
             "le", "la", "les", "l", "de", "du", "des", "d", "au", "aux", "en", "et", "a",
             "un", "une", "sur", "dans", "pour", "par", "chez", "mon", "ma", "mes", "ton",
-            "ta", "tes", "son", "sa", "ses", "notre", "votre", "leur", "el", "al",
+            "ta", "tes", "son", "sa", "ses", "notre", "votre", "leur", "el", "al", "ou",
+        }
+        location_qualifiers = {
+            "medina", "marrakech", "maroc", "gueliz", "hivernage", "kasbah", "mellah",
+            "mouassine", "aguedal", "palmeraie", "paris", "france", "rome", "italie",
+            "tokyo", "japon", "new", "york",
         }
         generic_place_heads = {
-            "palais", "jardin", "jardins", "musee", "place", "mosquee", "parc", "cafe",
+            "palais", "jardin", "jardins", "musee", "museum", "place", "mosquee", "parc", "cafe",
             "restaurant", "tour", "quartier", "galerie", "cathedrale", "basilique",
             "chateau", "temple", "sanctuaire", "memorial", "pont", "marche", "hotel",
             "maison", "fondation", "centre", "opera", "theatre", "tombeaux", "medersa",
+            "riad", "fontaine", "statue",
         }
         non_place_words = {
             "ajouter", "ajoute", "ajoutes", "rajouter", "rajoute", "rajoutes", "mettre",
@@ -799,7 +808,7 @@ class SimulatedAIProvider(BaseAIProvider):
             "aout", "septembre", "octobre", "novembre", "novmbre", "decembre", "demain",
             "apres", "aujourd", "hui", "jour", "jours", "heure", "heures", "matin", "midi",
             "soir", "nuit", "truc", "chose", "quelque", "peux", "peut", "veux", "voudrais",
-            "aimerais", "souhaite", "stp", "svp", "merci", "bonjour", "salut", "autres",
+            "aimerais", "souhaite", "stp", "svp", "plait", "please", "merci", "bonjour", "salut", "autres",
             "autre", "lieux", "lieu", "endroit", "endroits", "meteo", "temps", "budget",
             "horaires", "horaire", "ouvre", "ouverture", "ferme", "fermeture", "combien",
             "quels", "quelles", "quel", "quelle", "quoi", "est", "sont", "pas", "plus",
@@ -811,30 +820,79 @@ class SimulatedAIProvider(BaseAIProvider):
         }
 
         verb_met_used = bool(
-            re.search(r"\b(?:on|il|elle|qui|ça|ca)(?:\s+(?:le|la|les|l['’]|y|en))?\s+met\b", msg_lower)
+            re.search(r"\b(?:on|il|elle|qui|ça|ca|je|tu)(?:\s+(?:le|la|les|l['’]|y|en))?\s+mets?\b", msg_lower)
         )
+        raw_norm_tokens = msg_norm.split()
+        fuzzy_month_indices: set[int] = set()
+        for idx_tok, tok_val in enumerate(raw_norm_tokens):
+            if idx_tok > 0 and re.match(r"^\d{1,2}(?:er)?$", raw_norm_tokens[idx_tok - 1]) and len(tok_val) >= 4:
+                if any(
+                    SequenceMatcher(None, tok_val, m_name).ratio() >= 0.75
+                    for m_name in (
+                        "janvier", "fevrier", "mars", "avril", "mai", "juin",
+                        "juillet", "aout", "septembre", "octobre", "novembre", "decembre",
+                    )
+                ):
+                    fuzzy_month_indices.add(idx_tok)
+
         msg_tokens = [
-            t for t in msg_norm.split()
-            if t and not t.isdigit() and not re.match(r"^\d+h\d*$", t)
+            t for i_t, t in enumerate(raw_norm_tokens)
+            if t and not t.isdigit() and not re.match(r"^\d+h\d*$", t) and i_t not in fuzzy_month_indices
         ]
         meaningful_msg_tokens = [
             t for t in msg_tokens
             if t not in place_stopwords
             and t not in non_place_words
-            and not (t == "met" and verb_met_used)
+            and not (t in ("met", "mets") and verb_met_used)
             and len(t) >= 3
+        ]
+        msg_core_place_tokens = [
+            t for t in meaningful_msg_tokens if t not in location_qualifiers
+        ]
+        user_specific_tokens = [
+            t for t in msg_core_place_tokens
+            if t not in generic_place_heads
+            and not any(SequenceMatcher(None, t, gh).ratio() >= 0.84 for gh in generic_place_heads)
+        ]
+        user_head_tokens = [
+            t for t in msg_core_place_tokens if t in generic_place_heads
         ]
 
         def _score_place_candidate(cand_name: str) -> float:
             p_norm = _norm_text(cand_name)
             if not p_norm:
                 return 0.0
+            main_part = re.split(r"[\(\&]", cand_name)[0].strip()
+            p_main_norm = _norm_text(main_part) or p_norm
             p_spaceless = _spaceless(cand_name)
+            p_main_spaceless = _spaceless(main_part) or p_spaceless
+
             p_core_tokens = [t for t in p_norm.split() if t not in place_stopwords and len(t) >= 2]
-            p_specific_tokens = [t for t in p_core_tokens if t not in generic_place_heads and len(t) >= 3]
+            raw_main_core = [
+                t for t in p_main_norm.split()
+                if t not in place_stopwords and t not in location_qualifiers and len(t) >= 2
+            ]
+            if not raw_main_core or all(t in generic_place_heads for t in raw_main_core):
+                p_main_core_tokens = (
+                    [t for t in p_main_norm.split() if t not in place_stopwords and len(t) >= 2]
+                    or list(p_core_tokens)
+                )
+            else:
+                p_main_core_tokens = raw_main_core
+
+            p_specific_tokens = [
+                t for t in p_core_tokens
+                if t not in generic_place_heads and t not in location_qualifiers and len(t) >= 3
+            ]
+            if "metropolitan" in p_core_tokens and "met" not in p_specific_tokens:
+                p_specific_tokens.append("met")
             if not p_specific_tokens:
-                p_specific_tokens = list(p_core_tokens)
+                p_specific_tokens = [
+                    t for t in p_core_tokens if t not in generic_place_heads and len(t) >= 3
+                ] or list(p_main_core_tokens)
+
             p_core_spaceless = "".join(p_core_tokens)
+            p_main_core_spaceless = "".join(p_main_core_tokens)
 
             # Synonymes et variantes locales courantes (ex: "sensoji" pour "senso-ji")
             for i in range(len(p_core_tokens) - 1):
@@ -842,78 +900,197 @@ class SimulatedAIProvider(BaseAIProvider):
                 if len(compound_tok) >= 5 and compound_tok not in p_specific_tokens:
                     p_specific_tokens.append(compound_tok)
 
-            # 1. Sous-chaîne exacte normalisée
+            user_spec_with_pairs = list(user_specific_tokens)
+            for i in range(len(user_specific_tokens) - 1):
+                user_spec_with_pairs.append(user_specific_tokens[i] + user_specific_tokens[i + 1])
+
+            unmatched_user_spec = sum(
+                1
+                for ust in user_specific_tokens
+                if not any(
+                    ust == pst
+                    or (len(ust) >= 4 and len(pst) >= 4 and (ust in pst or pst in ust))
+                    or SequenceMatcher(None, ust, pst).ratio() >= 0.76
+                    for pst in (p_specific_tokens + p_core_tokens)
+                )
+            )
+            if user_specific_tokens and unmatched_user_spec == len(user_specific_tokens):
+                pair_matched = any(
+                    SequenceMatcher(None, upair, pst).ratio() >= 0.78
+                    for upair in user_spec_with_pairs[len(user_specific_tokens) :]
+                    for pst in (p_specific_tokens + p_core_tokens)
+                )
+                if not pair_matched:
+                    return 0.0
+
+            cand_head_tokens = [t for t in p_main_core_tokens if t in generic_place_heads]
+            head_mismatch_penalty = (
+                0.25
+                if (
+                    user_head_tokens
+                    and cand_head_tokens
+                    and not any(uh.rstrip("s") == ch.rstrip("s") for uh in user_head_tokens for ch in cand_head_tokens)
+                )
+                else 0.0
+            )
+            penalty = 0.14 * unmatched_user_spec + head_mismatch_penalty
+
+            # 1. Sous-chaîne exacte normalisée (nom complet ou nom principal hors parenthèses)
             if p_norm in msg_norm:
-                return 1.0 + len(p_norm) * 0.001
+                return max(0.0, 1.0 + len(p_norm) * 0.001 - penalty)
+            if len(p_main_norm) >= 5 and p_main_norm in msg_norm:
+                return max(0.0, 0.99 + len(p_main_norm) * 0.001 - penalty)
+
+            p_main_core_str = " ".join(p_main_core_tokens)
+            msg_core_str = " ".join(msg_core_place_tokens)
+            if len(p_main_core_str) >= 5 and p_main_core_str in msg_core_str:
+                return max(0.0, 0.97 + len(p_main_core_str) * 0.001 - penalty)
 
             # 2. Sous-chaîne sans espaces (ex: "Palaisde la bahia" -> "palaisdelabahia")
             if len(p_spaceless) >= 6 and p_spaceless in msg_spaceless:
-                return 0.98 + len(p_spaceless) * 0.001
+                return max(0.0, 0.98 + len(p_spaceless) * 0.001 - penalty)
+            if len(p_main_spaceless) >= 6 and p_main_spaceless in msg_spaceless:
+                return max(0.0, 0.96 + len(p_main_spaceless) * 0.001 - penalty)
             if len(p_core_spaceless) >= 6 and p_core_spaceless in msg_spaceless:
-                return 0.95 + len(p_core_spaceless) * 0.001
+                return max(0.0, 0.95 + len(p_core_spaceless) * 0.001 - penalty)
+            if len(p_main_core_spaceless) >= 6 and p_main_core_spaceless in msg_spaceless:
+                return max(0.0, 0.94 + len(p_main_core_spaceless) * 0.001 - penalty)
 
             if not meaningful_msg_tokens:
                 return 0.0
 
             best_score = 0.0
-            # 3. Correspondance par jetons spécifiques (ex: "bahia", "koutoubia", "menara", "majorele", "sadiens")
+            active_msg_pool = msg_core_place_tokens or meaningful_msg_tokens
+
+            # 3. Correspondance par jetons spécifiques (ex: "secret", "bahia", "koutoubia", "menara", "majorele", "sadiens")
             for sp_tok in p_specific_tokens:
-                if sp_tok in meaningful_msg_tokens:
+                if sp_tok in active_msg_pool or sp_tok in meaningful_msg_tokens:
                     matched_core = sum(
                         1
-                        for ct in p_core_tokens
+                        for ct in p_main_core_tokens
                         if any(SequenceMatcher(None, ct, mt).ratio() >= 0.80 for mt in msg_tokens)
                     )
-                    best_score = max(best_score, 0.86 + 0.03 * matched_core)
+                    best_score = max(best_score, 0.86 + 0.04 * matched_core - penalty)
                 elif len(sp_tok) >= 4:
                     best_tok_ratio = max(
-                        (SequenceMatcher(None, sp_tok, mt).ratio() for mt in meaningful_msg_tokens),
+                        (SequenceMatcher(None, sp_tok, mt).ratio() for mt in active_msg_pool),
                         default=0.0,
                     )
                     # Vérifier aussi la concaténation de 2 jetons voisins si un mot a été coupé
-                    for i in range(len(meaningful_msg_tokens) - 1):
-                        joined_pair = meaningful_msg_tokens[i] + meaningful_msg_tokens[i + 1]
+                    for i in range(len(active_msg_pool) - 1):
+                        joined_pair = active_msg_pool[i] + active_msg_pool[i + 1]
                         best_tok_ratio = max(best_tok_ratio, SequenceMatcher(None, sp_tok, joined_pair).ratio())
-                    if best_tok_ratio >= 0.78:
+                    if best_tok_ratio >= 0.76:
                         matched_core = sum(
                             1
-                            for ct in p_core_tokens
-                            if any(SequenceMatcher(None, ct, mt).ratio() >= 0.76 for mt in msg_tokens)
+                            for ct in p_main_core_tokens
+                            if any(SequenceMatcher(None, ct, mt).ratio() >= 0.75 for mt in msg_tokens)
                         )
-                        best_score = max(best_score, 0.78 * best_tok_ratio + 0.04 * matched_core)
+                        best_score = max(best_score, 0.78 * best_tok_ratio + 0.05 * matched_core - penalty)
 
-            # 4. Fenêtre glissante sur l'ensemble des jetons principaux du nom
-            p_core_str = " ".join(p_core_tokens)
-            if p_core_str and len(p_core_str) >= 5:
-                max_win = min(len(meaningful_msg_tokens), len(p_core_tokens) + 1)
+            # 4. Fenêtre glissante sur l'ensemble des jetons principaux du nom (hors mots géographiques en plus)
+            if p_main_core_str and len(p_main_core_str) >= 5 and active_msg_pool:
+                max_win = min(len(active_msg_pool), len(p_main_core_tokens) + 1)
                 for w_len in range(1, max_win + 1):
-                    for start_i in range(len(meaningful_msg_tokens) - w_len + 1):
-                        win_str = " ".join(meaningful_msg_tokens[start_i : start_i + w_len])
-                        ratio = SequenceMatcher(None, win_str, p_core_str).ratio()
-                        if ratio >= 0.80:
-                            best_score = max(best_score, ratio * 0.90)
+                    for start_i in range(len(active_msg_pool) - w_len + 1):
+                        win_str = " ".join(active_msg_pool[start_i : start_i + w_len])
+                        ratio = SequenceMatcher(None, win_str, p_main_core_str).ratio()
+                        if ratio >= 0.78:
+                            best_score = max(best_score, ratio * 0.92 - penalty)
 
-            return best_score
+            # 5. Si aucun jeton spécifique n'a correspondu mais que l'utilisateur n'a donné qu'un terme générique
+            #    (ex: "mets le Jardin le 13 novembre à 10h"), attribuer un score partiel sous le seuil (0.58)
+            #    pour permettre la détection d'ambiguïté entre plusieurs lieux partageant ce type.
+            if best_score < MIN_PLACE_SIMILARITY_THRESHOLD and not user_specific_tokens and msg_core_place_tokens:
+                for gt in msg_core_place_tokens:
+                    if gt in p_main_core_tokens:
+                        best_score = max(best_score, 0.58)
+                    elif any(gt.rstrip("s") == pt.rstrip("s") for pt in p_main_core_tokens):
+                        best_score = max(best_score, 0.54)
+
+            return max(0.0, best_score)
+
+        def _clean_place_short_name(raw_name: str) -> str:
+            cleaned = re.split(r"[\(\&]", str(raw_name or ""))[0].strip()
+            return cleaned or str(raw_name or "").strip()
+
+        def _format_place_du_de_la(raw_name: str) -> str:
+            short = _clean_place_short_name(raw_name)
+            low = short.lower()
+            if low.startswith("le "):
+                return f"du {short[3:].strip()}"
+            if low.startswith("la "):
+                return f"de la {short[3:].strip()}"
+            if low.startswith("les "):
+                return f"des {short[4:].strip()}"
+            if low.startswith("l'") or low.startswith("l’"):
+                return f"de l'{short[2:].strip()}"
+            first_w = _norm_text(short.split()[0]) if short.split() else ""
+            if first_w in {"jardin", "palais", "musee", "museum", "parc", "temple", "sanctuaire", "marche", "pont", "memorial", "centre", "chateau"}:
+                return f"du {short}"
+            if first_w in {"jardins", "tombeaux"}:
+                return f"des {short}"
+            return f"de {short}"
+
+        def _format_ambiguous_places_question(name_a: str, name_b: str) -> str:
+            return f"Vous parlez {_format_place_du_de_la(name_a)} ou {_format_place_du_de_la(name_b)} ?"
+
+        scored_catalog_places: list[tuple[dict[str, Any], float]] = [
+            (p, _score_place_candidate(str(p.get("name", ""))))
+            for p in available_places
+        ]
+        scored_catalog_places.sort(
+            key=lambda item: (
+                -round(item[1], 3),
+                0
+                if "jardin secret" in _norm_text(str(item[0].get("name", "")))
+                else (1 if "majorelle" in _norm_text(str(item[0].get("name", ""))) else 2),
+                len(_clean_place_short_name(str(item[0].get("name", "")))),
+            )
+        )
+
+        best_catalog_score = scored_catalog_places[0][1] if scored_catalog_places else 0.0
+        second_catalog_score = scored_catalog_places[1][1] if len(scored_catalog_places) >= 2 else 0.0
+
+        ambiguous_places_pair: tuple[dict[str, Any], dict[str, Any]] | None = None
+        if len(scored_catalog_places) >= 2 and msg_core_place_tokens:
+            p1_cand, sc1_val = scored_catalog_places[0]
+            p2_cand, sc2_val = scored_catalog_places[1]
+            if (
+                sc1_val >= MIN_PLACE_SIMILARITY_THRESHOLD
+                and sc2_val >= MIN_PLACE_SIMILARITY_THRESHOLD
+                and (sc1_val - sc2_val) < AMBIGUITY_SCORE_MARGIN
+                and not (sc1_val >= 0.99 and sc2_val < 0.95)
+            ):
+                ambiguous_places_pair = (p1_cand, p2_cand)
+            elif (
+                sc1_val < MIN_PLACE_SIMILARITY_THRESHOLD
+                and sc1_val >= 0.50
+                and sc2_val >= 0.50
+                and (sc1_val - sc2_val) < AMBIGUITY_SCORE_MARGIN
+            ):
+                ambiguous_places_pair = (p1_cand, p2_cand)
+
+        def _find_explicit_place_in_catalog() -> dict[str, Any] | None:
+            if ambiguous_places_pair is not None:
+                return None
+            if scored_catalog_places and scored_catalog_places[0][1] >= MIN_PLACE_SIMILARITY_THRESHOLD:
+                return scored_catalog_places[0][0]
+            return None
 
         def _find_explicit_scheduled_item() -> dict[str, Any] | None:
+            if ambiguous_places_pair is not None:
+                return None
             best_item: dict[str, Any] | None = None
             best_sc = 0.0
             for item in itinerary_items:
                 sc = _score_place_candidate(str(item.get("place_name", "")))
-                if sc >= 0.72 and sc > best_sc:
+                if sc >= MIN_PLACE_SIMILARITY_THRESHOLD and sc > best_sc:
                     best_sc = sc
                     best_item = item
+            if best_item is not None and best_sc + 0.04 < best_catalog_score:
+                return None
             return best_item
-
-        def _find_explicit_place_in_catalog() -> dict[str, Any] | None:
-            best_place: dict[str, Any] | None = None
-            best_sc = 0.0
-            for p in available_places:
-                sc = _score_place_candidate(str(p.get("name", "")))
-                if sc >= 0.72 and sc > best_sc:
-                    best_sc = sc
-                    best_place = p
-            return best_place
 
         def _resolve_last_place_id() -> str | None:
             last_pid = safe_trip_context.get("last_place_id")
@@ -939,6 +1116,7 @@ class SimulatedAIProvider(BaseAIProvider):
                 for item in reversed(itinerary_items):
                     if str(item.get("place_id")) == last_pid:
                         return item
+                return None
             return itinerary_items[-1] if itinerary_items else None
 
         def _find_pronoun_place_in_catalog() -> dict[str, Any] | None:
@@ -952,26 +1130,34 @@ class SimulatedAIProvider(BaseAIProvider):
         explicit_sched = _find_explicit_scheduled_item()
         explicit_catalog_place = _find_explicit_place_in_catalog()
 
-        # Détection des pronoms (le, la, l', ça, cette visite, ce lieu) liés au dernier lieu cité
-        has_pronoun_ref = bool(
+        wants_second_time_early = bool(
+            re.search(r"(deuxi[èe]me\s+fois|seconde\s+fois|une\s+autre\s+fois|encore\s+une\s+fois)", msg_lower)
+        )
+        # Détection stricte des pronoms (le, la, l', ça, cette visite, ce lieu) liés au dernier lieu cité :
+        # "mets le Jardin Secret" n'est JAMAIS un pronom ("le" est l'article défini devant le nom du lieu).
+        raw_pronoun_match = bool(
             re.search(
                 r"(\b(on\s+le\s+met\w*|on\s+la\s+met\w*|on\s+l['’]\s*met\w*|on\s+le\s+d[ée]plac\w*|on\s+la\s+d[ée]plac\w*|"
                 r"on\s+le\s+d[ée]cal\w*|on\s+la\s+d[ée]cal\w*|on\s+le\s+modifi\w*|on\s+la\s+modifi\w*|on\s+le\s+chang\w*|"
                 r"on\s+le\s+supprim\w*|on\s+la\s+supprim\w*|on\s+le\s+retir\w*|on\s+la\s+retir\w*|on\s+l['’]\s*annul\w*|"
                 r"on\s+l['’]\s*ajoute\w*|on\s+le\s+rajoute\w*|on\s+la\s+rajoute\w*|"
-                r"mets?[- ]le|mets?[- ]la|mettre\s+[çc]a|on\s+met\w*\s+[çc]a|mets?\s+[çc]a|"
-                r"d[ée]placez?[- ]le|d[ée]placez?[- ]la|d[ée]placer?\s+[çc]a|"
-                r"d[ée]calez?[- ]le|d[ée]calez?[- ]la|d[ée]caler?\s+[çc]a|"
-                r"modifiez?[- ]le|modifiez?[- ]la|modifier?\s+[çc]a|"
-                r"changez?[- ]le|changez?[- ]la|changer?\s+[çc]a|"
-                r"retirez?[- ]le|retirez?[- ]la|retirer?\s+[çc]a|"
-                r"supprimez?[- ]le|supprimez?[- ]la|supprimer?\s+[çc]a|"
-                r"annulez?[- ]le|annulez?[- ]la|annuler?\s+[çc]a|"
-                r"enl[èe]vez?[- ]le|enl[èe]vez?[- ]la|enlever?\s+[çc]a|"
-                r"ajoutez?[- ]le|ajoutez?[- ]la|rajoutez?[- ]le|rajoutez?[- ]la|"
-                r"cette\s+visite|ce\s+lieu)\b)",
+                r"je\s+le\s+met\w*|je\s+la\s+met\w*|je\s+le\s+d[ée]plac\w*|je\s+la\s+d[ée]plac\w*|"
+                r"mets?-le|mets?-la|mettre\s+[çc]a|on\s+met\w*\s+[çc]a|mets?\s+[çc]a|"
+                r"d[ée]placez?-le|d[ée]placez?-la|d[ée]placer?\s+[çc]a|"
+                r"d[ée]calez?-le|d[ée]calez?-la|d[ée]caler?\s+[çc]a|"
+                r"modifiez?-le|modifiez?-la|modifier?\s+[çc]a|"
+                r"changez?-le|changez?-la|changer?\s+[çc]a|"
+                r"retirez?-le|retirez?-la|retirer?\s+[çc]a|"
+                r"supprimez?-le|supprimez?-la|supprimer?\s+[çc]a|"
+                r"annulez?-le|annulez?-la|annuler?\s+[çc]a|"
+                r"enl[èe]vez?-le|enl[èe]vez?-la|enlever?\s+[çc]a|"
+                r"ajoutez?-le|ajoutez?-la|rajoutez?-le|rajoutez?-la|"
+                r"cette\s+visite|ce\s+lieu|cet\s+endroit)\b)",
                 msg_lower,
             )
+        )
+        has_pronoun_ref = bool(
+            raw_pronoun_match and (not msg_core_place_tokens or wants_second_time_early)
         )
 
         # Détection des familles de verbes (synonymes)
@@ -1520,6 +1706,40 @@ class SimulatedAIProvider(BaseAIProvider):
                 "proposed_action": None,
             }
 
+        if ambiguous_places_pair is not None:
+            return {
+                "action_type": "ASK",
+                "ask_reason": "AMBIGUOUS_PLACE",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": _format_ambiguous_places_question(
+                    str(ambiguous_places_pair[0].get("name", "")),
+                    str(ambiguous_places_pair[1].get("name", "")),
+                ),
+                "proposed_action": None,
+            }
+
+        def _build_unrecognized_or_unknown_place_reply() -> dict[str, Any]:
+            if user_specific_tokens or msg_core_place_tokens:
+                return {
+                    "action_type": "ASK",
+                    "ask_reason": "UNKNOWN_PLACE",
+                    "place_name": None,
+                    "visit_date": None,
+                    "local_start_time": None,
+                    "reply": f"Je ne trouve pas ce lieu à {city_name}. De quel lieu parlez-vous ?",
+                    "proposed_action": None,
+                }
+            return {
+                "action_type": "ASK",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?",
+                "proposed_action": None,
+            }
+
         # ---------------------------------------------------------------------
         # 1. INTENTION : SUPPRIMER / RETIRER / ANNULER UNE VISITE
         # ---------------------------------------------------------------------
@@ -1562,14 +1782,7 @@ class SimulatedAIProvider(BaseAIProvider):
                     ),
                     "proposed_action": None,
                 }
-            return {
-                "action_type": "ASK",
-                "place_name": None,
-                "visit_date": None,
-                "local_start_time": None,
-                "reply": "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?",
-                "proposed_action": None,
-            }
+            return _build_unrecognized_or_unknown_place_reply()
 
         # ---------------------------------------------------------------------
         # 2. INTENTION : DÉPLACER / DÉCALER / MODIFIER / CHANGER UNE VISITE
@@ -1661,15 +1874,8 @@ class SimulatedAIProvider(BaseAIProvider):
                     },
                 }
 
-            # Ex: "on change un truc", "déplace une visite" sans lieu ni pronom identifiable
-            return {
-                "action_type": "ASK",
-                "place_name": None,
-                "visit_date": None,
-                "local_start_time": None,
-                "reply": "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?",
-                "proposed_action": None,
-            }
+            # Ex: "on change un truc", "déplace une visite" ou lieu inconnu
+            return _build_unrecognized_or_unknown_place_reply()
 
         # ---------------------------------------------------------------------
         # 3. INTENTION : AJOUTER / PLANIFIER UNE VISITE (ou "<Lieu> <Date> <Heure>" sans verbe)
@@ -1683,14 +1889,7 @@ class SimulatedAIProvider(BaseAIProvider):
                 _find_pronoun_place_in_catalog() if has_pronoun_ref else None
             )
             if target_place is None:
-                return {
-                    "action_type": "ASK",
-                    "place_name": None,
-                    "visit_date": None,
-                    "local_start_time": None,
-                    "reply": "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?",
-                    "proposed_action": None,
-                }
+                return _build_unrecognized_or_unknown_place_reply()
 
             existing_for_place = next(
                 (it for it in reversed(itinerary_items) if str(it.get("place_id")) == str(target_place["id"])),
@@ -1780,14 +1979,7 @@ class SimulatedAIProvider(BaseAIProvider):
                 "proposed_action": None,
             }
 
-        return {
-            "action_type": "ASK",
-            "place_name": None,
-            "visit_date": None,
-            "local_start_time": None,
-            "reply": "Je n'ai pas compris. Voulez-vous ajouter, déplacer ou retirer une visite ?",
-            "proposed_action": None,
-        }
+        return _build_unrecognized_or_unknown_place_reply()
 
 
 class SimulatedPlacesProvider(BasePlacesProvider):

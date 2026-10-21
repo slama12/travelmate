@@ -1711,6 +1711,7 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         "confirmation_steps_required",
         "confirmation_step",
         "spoken_summary_fr",
+        "ask_reason",
     }
     unknown_top = set(raw_res.keys()) - allowed_keys
     if unknown_top:
@@ -1876,6 +1877,7 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
     if norm_act in {"ASK", "NONE"}:
         return {
             "action_type": norm_act,
+            "ask_reason": raw_res.get("ask_reason"),
             "place_name": raw_pname.strip() if isinstance(raw_pname, str) and raw_pname.strip() else None,
             "visit_date": norm_date,
             "local_start_time": norm_time,
@@ -2178,28 +2180,167 @@ async def send_trip_chat_message(
         except Exception:
             return str(hm)
 
+    def _has_pronoun_ref_in_msg(raw_msg: str) -> bool:
+        m_low = raw_msg.strip().lower()
+        m_norm = _norm_txt_local(raw_msg)
+        stopwords_p = {
+            "le", "la", "les", "l", "de", "du", "des", "d", "au", "aux", "en", "et", "a",
+            "un", "une", "sur", "dans", "pour", "par", "chez", "mon", "ma", "mes", "ton",
+            "ta", "tes", "son", "sa", "ses", "notre", "votre", "leur", "el", "al", "ou",
+        }
+        loc_quals_p = {
+            "medina", "marrakech", "maroc", "gueliz", "hivernage", "kasbah", "mellah",
+            "mouassine", "aguedal", "palmeraie", "paris", "france", "rome", "italie",
+            "tokyo", "japon", "new", "york",
+        }
+        non_place_p = {
+            "ajouter", "ajoute", "ajoutes", "rajouter", "rajoute", "rajoutes", "mettre",
+            "mets", "met", "planifier", "planifie", "programmer", "programme", "inserer",
+            "insere", "visiter", "visite", "visites", "aller", "voir", "faire", "deplacer",
+            "deplace", "deplaces", "decaler", "decale", "decales", "changer", "change",
+            "changes", "modifier", "modifie", "modifies", "reporter", "reporte",
+            "reprogrammer", "reprogramme", "retirer", "retire", "retires", "supprimer",
+            "supprime", "supprimes", "annuler", "annule", "annules", "enlever", "enleve",
+            "enleves", "effacer", "efface", "oter", "ote", "avancer", "avance", "reculer",
+            "recule", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi",
+            "dimanche", "janvier", "fevrier", "mars", "avril", "mai", "juin", "juillet",
+            "aout", "septembre", "octobre", "novembre", "novmbre", "decembre", "demain",
+            "apres", "aujourd", "hui", "jour", "jours", "heure", "heures", "matin", "midi",
+            "soir", "nuit", "truc", "chose", "quelque", "peux", "peut", "veux", "voudrais",
+            "aimerais", "souhaite", "stp", "svp", "plait", "please", "merci", "bonjour", "salut", "fois",
+            "deuxieme", "seconde", "encore", "autre",
+        }
+        core_toks = [
+            t for t in m_norm.split()
+            if t and not t.isdigit() and not re.match(r"^\d+h\d*$", t)
+            and t not in stopwords_p and t not in loc_quals_p and t not in non_place_p
+            and len(t) >= 3
+        ]
+        wants_second = bool(
+            re.search(r"(deuxi[èe]me\s+fois|seconde\s+fois|une\s+autre\s+fois|encore\s+une\s+fois)", m_low)
+        )
+        raw_pron = bool(
+            re.search(
+                r"(\b(on\s+le\s+met\w*|on\s+la\s+met\w*|on\s+l['’]\s*met\w*|on\s+le\s+d[ée]plac\w*|on\s+la\s+d[ée]plac\w*|"
+                r"on\s+le\s+d[ée]cal\w*|on\s+la\s+d[ée]cal\w*|on\s+le\s+modifi\w*|on\s+la\s+modifi\w*|on\s+le\s+chang\w*|"
+                r"on\s+le\s+supprim\w*|on\s+la\s+supprim\w*|on\s+le\s+retir\w*|on\s+la\s+retir\w*|on\s+l['’]\s*annul\w*|"
+                r"on\s+l['’]\s*ajoute\w*|on\s+le\s+rajoute\w*|on\s+la\s+rajoute\w*|"
+                r"je\s+le\s+met\w*|je\s+la\s+met\w*|je\s+le\s+d[ée]plac\w*|je\s+la\s+d[ée]plac\w*|"
+                r"mets?-le|mets?-la|mettre\s+[çc]a|on\s+met\w*\s+[çc]a|mets?\s+[çc]a|"
+                r"d[ée]placez?-le|d[ée]placez?-la|d[ée]placer?\s+[çc]a|"
+                r"d[ée]calez?-le|d[ée]calez?-la|d[ée]caler?\s+[çc]a|"
+                r"modifiez?-le|modifiez?-la|modifier?\s+[çc]a|"
+                r"changez?-le|changez?-la|changer?\s+[çc]a|"
+                r"retirez?-le|retirez?-la|retirer?\s+[çc]a|"
+                r"supprimez?-le|supprimez?-la|supprimer?\s+[çc]a|"
+                r"annulez?-le|annulez?-la|annuler?\s+[çc]a|"
+                r"enl[èe]vez?-le|enl[èe]vez?-la|enlever?\s+[çc]a|"
+                r"ajoutez?-le|ajoutez?-la|rajoutez?-le|rajoutez?-la|"
+                r"cette\s+visite|ce\s+lieu|cet\s+endroit)\b)",
+                m_low,
+            )
+        )
+        return bool(raw_pron and (not core_toks or wants_second))
+
+    def _score_place_text_similarity(cand_name: str, query_text: str) -> float:
+        p_norm = _norm_txt_local(cand_name)
+        q_norm = _norm_txt_local(query_text)
+        if not p_norm or not q_norm:
+            return 0.0
+        stopwords = {
+            "le", "la", "les", "l", "de", "du", "des", "d", "au", "aux", "en", "et", "a",
+            "un", "une", "sur", "dans", "pour", "par", "chez", "el", "al", "ou",
+        }
+        loc_quals = {
+            "medina", "marrakech", "maroc", "gueliz", "hivernage", "kasbah", "mellah",
+            "mouassine", "aguedal", "palmeraie", "paris", "france", "rome", "italie",
+            "tokyo", "japon", "new", "york",
+        }
+        heads = {
+            "palais", "jardin", "jardins", "musee", "museum", "place", "mosquee", "parc",
+            "cafe", "restaurant", "tour", "quartier", "galerie", "cathedrale", "basilique",
+            "chateau", "temple", "sanctuaire", "memorial", "pont", "marche", "hotel",
+            "maison", "fondation", "centre", "opera", "theatre", "tombeaux", "medersa",
+            "riad", "fontaine", "statue",
+        }
+        main_part = re.split(r"[\(\&]", cand_name)[0].strip()
+        p_main_norm = _norm_txt_local(main_part) or p_norm
+        p_space = _spaceless_local(cand_name)
+        p_main_space = _spaceless_local(main_part) or p_space
+        q_space = _spaceless_local(query_text)
+
+        p_core = [t for t in p_norm.split() if t not in stopwords and len(t) >= 2]
+        p_main_core = [
+            t for t in p_main_norm.split() if t not in stopwords and t not in loc_quals and len(t) >= 2
+        ] or list(p_core)
+        p_spec = [
+            t for t in p_core if t not in heads and t not in loc_quals and len(t) >= 3
+        ]
+        if "metropolitan" in p_core and "met" not in p_spec:
+            p_spec.append("met")
+        if not p_spec:
+            p_spec = [t for t in p_core if t not in heads and len(t) >= 3] or list(p_main_core)
+        for i in range(len(p_core) - 1):
+            comp = p_core[i] + p_core[i + 1]
+            if len(comp) >= 5 and comp not in p_spec:
+                p_spec.append(comp)
+
+        if p_norm in q_norm or q_norm in p_norm:
+            return 1.0
+        if len(p_main_norm) >= 5 and (p_main_norm in q_norm or q_norm in p_main_norm):
+            return 0.99
+        p_main_core_str = " ".join(p_main_core)
+        q_core_toks = [
+            t for t in q_norm.split()
+            if len(t) >= 3 and not t.isdigit() and not re.match(r"^\d+h\d*$", t)
+            and t not in stopwords and t not in loc_quals
+        ]
+        q_core_str = " ".join(q_core_toks)
+        if len(p_main_core_str) >= 5 and p_main_core_str in q_core_str:
+            return 0.97
+        if len(p_space) >= 6 and (p_space in q_space or q_space in p_space):
+            return 0.96
+        if len(p_main_space) >= 6 and (p_main_space in q_space or q_space in p_main_space):
+            return 0.95
+
+        sc = 0.0
+        for sp in p_spec:
+            if sp in q_core_toks or sp in q_norm.split():
+                matched_main = sum(
+                    1 for ct in p_main_core if any(SequenceMatcher(None, ct, qt).ratio() >= 0.80 for qt in q_norm.split())
+                )
+                sc = max(sc, 0.86 + 0.04 * matched_main)
+            elif len(sp) >= 4 and q_core_toks:
+                best_r = max((SequenceMatcher(None, sp, qt).ratio() for qt in q_core_toks), default=0.0)
+                if best_r >= 0.76:
+                    matched_main = sum(
+                        1 for ct in p_main_core if any(SequenceMatcher(None, ct, qt).ratio() >= 0.75 for qt in q_norm.split())
+                    )
+                    sc = max(sc, 0.78 * best_r + 0.05 * matched_main)
+        return sc
+
     def _resolve_place_obj(raw_action_dict: dict[str, Any], raw_msg: str) -> Place | None:
+        MIN_SIM_THRESHOLD = 0.65
         pid = str(raw_action_dict.get("place_id") or "").strip()
         if pid and pid in places_by_id:
             return places_by_id[pid]
 
-        pname = str(raw_action_dict.get("place_name") or "").strip().lower()
+        pname = str(raw_action_dict.get("place_name") or "").strip()
         if pname:
+            pname_low = pname.lower()
             pname_norm = _norm_txt_local(pname)
-            pname_space = _spaceless_local(pname)
             for p in places_by_id.values():
-                if p.name.lower() == pname or _norm_txt_local(p.name) == pname_norm:
+                if p.name.lower() == pname_low or _norm_txt_local(p.name) == pname_norm:
                     return p
+            best_by_name: Place | None = None
+            best_name_sc = 0.0
             for p in places_by_id.values():
-                p_norm = _norm_txt_local(p.name)
-                p_space = _spaceless_local(p.name)
-                if (
-                    pname in p.name.lower()
-                    or p.name.lower() in pname
-                    or (pname_space and (pname_space in p_space or p_space in pname_space))
-                    or SequenceMatcher(None, pname_norm, p_norm).ratio() >= 0.76
-                ):
-                    return p
+                sc = _score_place_text_similarity(p.name, pname)
+                if sc >= MIN_SIM_THRESHOLD and sc > best_name_sc:
+                    best_name_sc = sc
+                    best_by_name = p
+            if best_by_name is not None:
+                return best_by_name
 
         iid = str(raw_action_dict.get("item_id") or "").strip()
         if iid:
@@ -2207,42 +2348,17 @@ async def send_trip_chat_message(
                 if it.id == iid and it.place_id in places_by_id:
                     return places_by_id[it.place_id]
 
-        msg_norm_local = _norm_txt_local(raw_msg)
-        msg_space_local = _spaceless_local(raw_msg)
-        best_p: Place | None = None
-        best_sc = 0.0
-        stopwords = {"le", "la", "les", "l", "de", "du", "des", "d", "au", "aux", "el", "al"}
-        heads = {"palais", "jardin", "jardins", "musee", "place", "mosquee", "parc", "cafe", "tombeaux", "medersa"}
-        msg_toks = [t for t in msg_norm_local.split() if len(t) >= 3 and not t.isdigit()]
-        for p in places_by_id.values():
-            p_norm = _norm_txt_local(p.name)
-            p_space = _spaceless_local(p.name)
-            p_core = [t for t in p_norm.split() if t not in stopwords and len(t) >= 2]
-            p_spec = [t for t in p_core if t not in heads and len(t) >= 3] or list(p_core)
-            for i in range(len(p_core) - 1):
-                comp = p_core[i] + p_core[i + 1]
-                if len(comp) >= 5 and comp not in p_spec:
-                    p_spec.append(comp)
-            sc = 0.0
-            if p_norm in msg_norm_local:
-                sc = 1.0
-            elif len(p_space) >= 6 and p_space in msg_space_local:
-                sc = 0.98
-            else:
-                for sp in p_spec:
-                    if sp in msg_toks:
-                        sc = max(sc, 0.88)
-                    else:
-                        best_r = max((SequenceMatcher(None, sp, mt).ratio() for mt in msg_toks), default=0.0)
-                        if best_r >= 0.78:
-                            sc = max(sc, 0.80 * best_r)
-            if sc >= 0.72 and sc > best_sc:
-                best_sc = sc
-                best_p = p
-        if best_p is not None:
-            return best_p
+        scored_from_msg: list[tuple[Place, float]] = [
+            (p, _score_place_text_similarity(p.name, raw_msg))
+            for p in places_by_id.values()
+        ]
+        scored_from_msg.sort(key=lambda item: -round(item[1], 3))
+        if scored_from_msg and scored_from_msg[0][1] >= MIN_SIM_THRESHOLD:
+            if len(scored_from_msg) >= 2 and (scored_from_msg[0][1] - scored_from_msg[1][1]) < 0.12:
+                return None
+            return scored_from_msg[0][0]
 
-        if last_context_place is not None:
+        if last_context_place is not None and _has_pronoun_ref_in_msg(raw_msg):
             return last_context_place
         return None
 
@@ -2297,6 +2413,7 @@ async def send_trip_chat_message(
                 "OPEN_PRACTICAL_INFO",
                 "INFO",
             }
+            or raw_rules_hyb.get("ask_reason") in {"AMBIGUOUS_PLACE", "UNKNOWN_PLACE"}
             or provider_mode != "real"
         ):
             validated_ai = cand_hyb
@@ -2553,12 +2670,17 @@ async def send_trip_chat_message(
                     "Quel lieu souhaitez-vous planifier ou modifier, et pour quel jour du séjour ?"
                 )
 
-        if act_type == "REMOVE_VISIT" and v_date_str is not None:
+        if place_obj is None:
+            proposed_action_dict = None
+            action_status = "NONE"
+            if "?" not in reply_text:
+                reply_text = f"Je ne trouve pas ce lieu à {destination.city_name}. De quel lieu parlez-vous ?"
+        elif act_type == "REMOVE_VISIT" and v_date_str is not None:
             proposed_action_dict = {
                 "action_type": "REMOVE_VISIT",
                 "item_id": item_id,
                 "place_id": place_id,
-                "place_name": place_obj.name if place_obj else str(raw_action.get("place_name") or "Visite"),
+                "place_name": place_obj.name,
                 "visit_date": v_date_str,
                 "local_start_time": v_time_str,
                 "local_end_time": None,

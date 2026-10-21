@@ -3343,32 +3343,6 @@ export function ItineraryScreen({
           </p>
         </div>
 
-        {/* Étape 5V — Barre d'accessibilité vocale & lecture à voix haute */}
-        <div className="w-full">
-          <VoiceAccessibilityToolbar
-            apiBase={apiBase}
-            token={token}
-            tripId={trip?.id}
-            defaultSummaryFr={
-              currentDayItems.length > 0
-                ? `Programme du ${formatFullDateHuman(
-                    selectedDayDate
-                  )} à ${cityLabel} : ${currentDayItems
-                    .map(
-                      (it) =>
-                        `${it.local_start_time} ${it.place_name}`
-                    )
-                    .join(", ")}.`
-                : `Programme à ${cityLabel} : aucune visite planifiée pour ce jour.`
-            }
-            onSelectDayNumber={(dayNum) => {
-              const targetDate = tripDays[dayNum - 1];
-              if (targetDate) setSelectedDayDate(targetDate);
-            }}
-          />
-        </div>
-
-
         <div
           className="flex flex-wrap items-center gap-2"
           data-testid="itinerary-header-actions"
@@ -3989,6 +3963,28 @@ export function ItineraryScreen({
         </Button>
       </div>
 
+      {/* Étape 5V — Barre d'accessibilité vocale & lecture à voix haute */}
+      <div className="w-full pt-2">
+        <VoiceAccessibilityToolbar
+          apiBase={apiBase}
+          token={token}
+          tripId={trip?.id}
+          defaultSummaryFr={
+            currentDayItems.length > 0
+              ? `Programme du ${formatFullDateHuman(
+                  selectedDayDate
+                )} à ${cityLabel} : ${currentDayItems
+                  .map((it) => `${it.local_start_time} ${it.place_name}`)
+                  .join(", ")}.`
+              : `Programme à ${cityLabel} : aucune visite planifiée pour ce jour.`
+          }
+          onSelectDayNumber={(dayNum) => {
+            const targetDate = tripDays[dayNum - 1];
+            if (targetDate) setSelectedDayDate(targetDate);
+          }}
+        />
+      </div>
+
       {/* Modale Étape 4.2 — Itinéraire IA ("Génère mon programme", 3 champs max <= 4) */}
       <Modal
         open={aiModalOpen}
@@ -4281,21 +4277,22 @@ export function ItineraryScreen({
             aria-label={`Assistant ${cityLabel}`}
             data-testid="floating-chat-panel"
             style={{ marginTop: 0 }}
-            className="!mt-0 fixed inset-0 z-50 w-full h-full md:inset-y-0 md:left-auto md:right-0 md:w-[380px] md:border-l md:border-border xl:top-16 xl:bottom-0 xl:left-auto xl:right-0 xl:z-40 xl:w-[380px] xl:h-[calc(100vh-4rem)] flex flex-col bg-canvas-card shadow-cardHover overflow-hidden"
+            className="!mt-0 fixed inset-0 z-50 w-full h-full md:inset-y-0 md:left-auto md:right-0 md:w-[400px] md:border-l md:border-border xl:top-16 xl:bottom-0 xl:left-auto xl:right-0 xl:z-40 xl:w-[400px] xl:h-[calc(100vh-4rem)] flex flex-col bg-canvas-card shadow-cardHover overflow-hidden"
           >
-          <div className="shrink-0 flex items-center justify-between gap-2 bg-brand-700 px-4 py-3 text-white">
-            <div className="flex items-center gap-2 min-w-0">
+          <div
+            data-testid="chat-panel-header"
+            className="shrink-0 flex flex-nowrap items-center justify-between gap-2 bg-brand-700 px-3.5 py-2.5 text-white whitespace-nowrap"
+          >
+            <div className="flex items-center gap-1.5 shrink-0 whitespace-nowrap">
               <MessageCircle className="h-4 w-4 shrink-0" />
-              <div className="min-w-0">
-                <div className="text-caption font-bold truncate">
-                  Assistant {cityLabel}
-                </div>
-                <div className="text-[11px] text-white/80 truncate">
-                  Voix fr-FR • Confirmation requise
-                </div>
-              </div>
+              <span
+                data-testid="chat-header-title"
+                className="text-caption font-bold whitespace-nowrap"
+              >
+                Assistant {cityLabel}
+              </span>
             </div>
-            <div className="flex items-center gap-1.5 shrink-0">
+            <div className="flex items-center gap-1 shrink-0 whitespace-nowrap">
               <button
                 type="button"
                 data-testid="chat-tts-toggle-btn"
@@ -4334,7 +4331,7 @@ export function ItineraryScreen({
                   const state = togglePauseSpeechSynthesis();
                   setTtsPaused(state === "paused");
                 }}
-                className="rounded-md border border-white/25 bg-white/10 px-2 py-1 text-[11px] font-medium text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                className="rounded-md border border-white/25 bg-white/10 px-1.5 py-1 text-[11px] font-medium text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white whitespace-nowrap"
               >
                 {ttsPaused ? "Reprendre" : "Pause"}
               </button>
@@ -4353,18 +4350,20 @@ export function ItineraryScreen({
                   setVoiceSettings(next);
                   saveVoiceAccessibilitySettings(next);
                 }}
-                className="rounded-md border border-white/25 bg-white/10 px-2 py-1 text-[11px] font-bold text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                className="rounded-md border border-white/25 bg-white/10 px-1.5 py-1 text-[11px] font-bold text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white whitespace-nowrap"
               >
                 {voiceSettings.ttsRate}x
               </button>
               <button
                 type="button"
                 data-testid="new-chat-conversation-btn"
+                aria-label="Nouvelle conversation"
+                title="Nouvelle conversation"
                 disabled={chatSending}
                 onClick={handleResetChatConversation}
-                className="rounded-md border border-white/25 bg-white/10 px-2 py-1 text-[11px] font-medium text-white hover:bg-white/20 disabled:opacity-50"
+                className="rounded-md border border-white/25 bg-white/10 px-1.5 py-1 text-[11px] font-medium text-white hover:bg-white/20 disabled:opacity-50 whitespace-nowrap"
               >
-                Nouvelle conversation
+                Effacer
               </button>
               <button
                 type="button"

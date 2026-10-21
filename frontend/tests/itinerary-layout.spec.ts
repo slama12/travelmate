@@ -423,4 +423,186 @@ test.describe("Mon programme — Vérification de mise en page aux 5 largeurs (3
       }
     }
   });
+
+  test("Chat réel Marrakech : en-tête sur une seule rangée propre et saisie 'mets le Jardin Secret Medina le 13 novembre à 10h' propose Le Jardin Secret (jamais La Grande Table Marocaine)", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.goto("/");
+
+    // Prépare un séjour à Marrakech du 11 au 15 novembre 2026 avec La Grande Table Marocaine déjà au programme
+    await page.evaluate(async (apiUrl: string) => {
+      const email = `playwright.marrakech.chat.${Date.now()}@travelmate.app`;
+      const regResp = await fetch(`${apiUrl}/api/v1/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          full_name: "Voyageur Marrakech",
+          password: "PasswordStep4!2026",
+          preferred_style: "STANDARD",
+        }),
+      });
+      const regData = await regResp.json();
+      const token = regData.access_token;
+      localStorage.setItem("travelmate_jwt_token", token);
+      localStorage.setItem(
+        "travelmate_user_profile",
+        JSON.stringify(regData.user)
+      );
+
+      const destsResp = await fetch(`${apiUrl}/api/v1/destinations`);
+      const dests = await destsResp.json();
+      const marrakech = dests.find(
+        (d: { city_name: string }) => d.city_name === "Marrakech"
+      );
+      if (!marrakech) {
+        throw new Error("Destination Marrakech introuvable");
+      }
+
+      const tripResp = await fetch(`${apiUrl}/api/v1/trips`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          destination_id: marrakech.id,
+          title: "Séjour à Marrakech",
+          travel_style: "STANDARD",
+          total_budget: 1400,
+        }),
+      });
+      const trip = await tripResp.json();
+      localStorage.setItem("travelmate_active_trip_id", trip.id);
+
+      const bookResp = await fetch(`${apiUrl}/api/v1/flights/book`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          trip_id: trip.id,
+          idempotency_key: `IDEM-PW-MARRAKECH-${Date.now()}`,
+          airline: "Royal Air Maroc",
+          flight_number_outbound: "AT749",
+          flight_number_inbound: "AT748",
+          origin_iata: "ORY",
+          destination_iata: "RAK",
+          departure_outbound_at: "2026-11-11T06:00:00Z",
+          arrival_outbound_at: "2026-11-11T08:00:00Z",
+          departure_inbound_at: "2026-11-15T21:00:00Z",
+          arrival_inbound_at: "2026-11-15T23:55:00Z",
+          price_amount: "280.00",
+          currency: "EUR",
+          cabin_class: "ECONOMY",
+        }),
+      });
+      const bookData = await bookResp.json();
+      localStorage.setItem(
+        "travelmate_last_flight_booking",
+        JSON.stringify(bookData)
+      );
+
+      const placesResp = await fetch(
+        `${apiUrl}/api/v1/places/city/Marrakech`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      const placesData = await placesResp.json();
+      const grandeTable = placesData.places.find((p: { name: string }) =>
+        p.name.includes("Grande Table Marocaine")
+      );
+      if (grandeTable) {
+        await fetch(`${apiUrl}/api/v1/itinerary/items`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            trip_id: trip.id,
+            place_id: grandeTable.id,
+            visit_date: "2026-11-12",
+            local_start_time: "19:30",
+            duration_minutes: 120,
+            transit_mode: "WALKING",
+          }),
+        });
+      }
+    }, API_URL);
+
+    await page.goto("/itinerary");
+    await page.waitForSelector('[data-testid="itinerary-page-title"]');
+
+    // Ouvre le panneau de chat
+    const isChatOpen =
+      (await page.locator('[data-testid="floating-chat-panel"]').count()) > 0;
+    if (!isChatOpen) {
+      await page.locator('[data-testid="floating-chat-bubble-btn"]').click();
+      await page.waitForSelector('[data-testid="floating-chat-panel"]');
+    }
+
+    // Vérifie que l'en-tête du chat est sur une seule rangée propre sans texte coupé ("A…", "Voi…")
+    const headerCheck = await page.evaluate(() => {
+      const header = document.querySelector(
+        '[data-testid="chat-panel-header"]'
+      ) as HTMLElement | null;
+      const title = document.querySelector(
+        '[data-testid="chat-header-title"]'
+      ) as HTMLElement | null;
+      if (!header || !title) {
+        return { found: false, singleRow: false, titleClipped: true, titleText: "", height: 999 };
+      }
+      const headerRect = header.getBoundingClientRect();
+      const children = Array.from(header.children) as HTMLElement[];
+      const centersY = children.map((el) => {
+        const r = el.getBoundingClientRect();
+        return r.top + r.height / 2;
+      });
+      const singleRow =
+        centersY.length <= 1 ||
+        centersY.every((cy) => Math.abs(cy - centersY[0]) <= 8);
+      const titleClipped = title.scrollWidth > title.clientWidth + 1;
+      return {
+        found: true,
+        singleRow,
+        titleClipped,
+        titleText: (title.textContent || "").trim(),
+        height: headerRect.height,
+      };
+    });
+
+    expect(headerCheck.found).toBe(true);
+    expect(headerCheck.singleRow).toBe(true);
+    expect(headerCheck.titleClipped).toBe(false);
+    expect(headerCheck.titleText).toBe("Assistant Marrakech");
+    expect(headerCheck.height).toBeLessThanOrEqual(64);
+
+    // Tape la phrase exacte de la capture dans le champ de saisie réel du chat
+    const chatInput = page.locator('[data-testid="chat-message-input"]');
+    await chatInput.fill("mets le Jardin Secret Medina le 13 novembre à 10h");
+    await page.locator('[data-testid="chat-send-btn"]').click();
+
+    // Attend la carte de proposition d'action dans le chat
+    const proposalCard = page.locator(
+      '[data-testid="chat-proposed-action-card"]'
+    );
+    await expect(proposalCard).toBeVisible({ timeout: 15_000 });
+
+    const proposalText = (await proposalCard.innerText()) || "";
+    expect(proposalText).toContain("Le Jardin Secret (Médina)");
+    expect(proposalText).not.toContain("La Grande Table Marocaine");
+    expect(proposalText.toLowerCase()).toContain("13 novembre");
+    expect(proposalText).toContain("10:00");
+
+    const screenshotPath = path.join(
+      ARTIFACT_DIR,
+      "marrakech_chat_jardin_secret_fix.png"
+    );
+    await page.screenshot({ path: screenshotPath, fullPage: false });
+  });
 });
+

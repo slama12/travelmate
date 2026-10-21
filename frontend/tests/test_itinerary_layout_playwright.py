@@ -476,6 +476,190 @@ def test_mon_programme_layout_5_widths_playwright() -> dict[str, Any]:
     return report
 
 
+def test_real_chat_marrakech_jardin_secret_medina_and_single_row_header() -> None:
+    """
+    Test Playwright qui ouvre le chat réel sur un séjour à Marrakech (avec La Grande Table Marocaine
+    déjà au programme), vérifie que l'en-tête du chat tient sur une seule rangée propre sans troncature,
+    tape "mets le Jardin Secret Medina le 13 novembre à 10h" dans le champ de saisie réel du chat
+    et vérifie que le lieu proposé est bien "Le Jardin Secret (Médina)" (jamais "La Grande Table Marocaine").
+    """
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    bridge_proc = _ensure_wsl_bridge()
+
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(1000)
+
+            page.evaluate(
+                """async (apiUrl) => {
+                  const email = "playwright.marrakech.chat." + Date.now() + "@travelmate.app";
+                  const regResp = await fetch(apiUrl + "/api/v1/auth/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      full_name: "Voyageur Marrakech",
+                      password: "PasswordStep4!2026",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  const token = regData.access_token;
+                  localStorage.setItem("travelmate_jwt_token", token);
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+
+                  const destsResp = await fetch(apiUrl + "/api/v1/destinations");
+                  const dests = await destsResp.json();
+                  const marrakech = dests.find((d) => d.city_name === "Marrakech");
+                  if (!marrakech) {
+                    throw new Error("Destination Marrakech introuvable");
+                  }
+
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_id: marrakech.id,
+                      title: "Séjour à Marrakech",
+                      travel_style: "STANDARD",
+                      total_budget: 1400
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+
+                  const bookResp = await fetch(apiUrl + "/api/v1/flights/book", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      trip_id: trip.id,
+                      idempotency_key: "IDEM-PW-MARRAKECH-" + Date.now(),
+                      airline: "Royal Air Maroc",
+                      flight_number_outbound: "AT749",
+                      flight_number_inbound: "AT748",
+                      origin_iata: "ORY",
+                      destination_iata: "RAK",
+                      departure_outbound_at: "2026-11-11T06:00:00Z",
+                      arrival_outbound_at: "2026-11-11T08:00:00Z",
+                      departure_inbound_at: "2026-11-15T21:00:00Z",
+                      arrival_inbound_at: "2026-11-15T23:55:00Z",
+                      price_amount: "280.00",
+                      currency: "EUR",
+                      cabin_class: "ECONOMY"
+                    })
+                  });
+                  const bookData = await bookResp.json();
+                  localStorage.setItem("travelmate_last_flight_booking", JSON.stringify(bookData));
+
+                  const placesResp = await fetch(apiUrl + "/api/v1/places/city/Marrakech", {
+                    headers: { "Authorization": "Bearer " + token }
+                  });
+                  const placesData = await placesResp.json();
+                  const grandeTable = placesData.places.find((pl) => pl.name.includes("Grande Table Marocaine"));
+                  if (grandeTable) {
+                    await fetch(apiUrl + "/api/v1/itinerary/items", {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + token
+                      },
+                      body: JSON.stringify({
+                        trip_id: trip.id,
+                        place_id: grandeTable.id,
+                        visit_date: "2026-11-12",
+                        local_start_time: "19:30",
+                        duration_minutes: 120,
+                        transit_mode: "WALKING"
+                      })
+                    });
+                  }
+                }""",
+                API_URL,
+            )
+
+            page.goto(f"{BASE_URL}/itinerary", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="itinerary-page-title"]', timeout=15000)
+
+            if page.locator('[data-testid="floating-chat-panel"]').count() == 0:
+                page.locator('[data-testid="floating-chat-bubble-btn"]').click()
+                page.wait_for_selector('[data-testid="floating-chat-panel"]', timeout=10000)
+
+            header_check = page.evaluate(
+                """() => {
+                  const header = document.querySelector('[data-testid="chat-panel-header"]');
+                  const title = document.querySelector('[data-testid="chat-header-title"]');
+                  if (!header || !title) {
+                    return { found: false, singleRow: false, titleClipped: true, titleText: "", height: 999 };
+                  }
+                  const headerRect = header.getBoundingClientRect();
+                  const children = Array.from(header.children);
+                  const centersY = children.map((el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.top + r.height / 2;
+                  });
+                  const singleRow = centersY.length <= 1 || centersY.every((cy) => Math.abs(cy - centersY[0]) <= 8);
+                  const titleClipped = title.scrollWidth > title.clientWidth + 1;
+                  return {
+                    found: true,
+                    singleRow,
+                    titleClipped,
+                    titleText: (title.textContent || "").trim(),
+                    height: headerRect.height
+                  };
+                }"""
+            )
+            assert header_check["found"] is True, f"En-tête du chat introuvable: {header_check}"
+            assert header_check["singleRow"] is True, f"L'en-tête du chat n'est pas sur une seule rangée: {header_check}"
+            assert header_check["titleClipped"] is False, f"Le titre de l'en-tête du chat est tronqué: {header_check}"
+            assert header_check["titleText"] == "Assistant Marrakech", f"Titre inattendu: {header_check}"
+            assert header_check["height"] <= 64, f"Hauteur d'en-tête excessive: {header_check}"
+
+            chat_input = page.locator('[data-testid="chat-message-input"]')
+            chat_input.fill("mets le Jardin Secret Medina le 13 novembre à 10h")
+            page.locator('[data-testid="chat-send-btn"]').click()
+
+            proposal_card = page.locator('[data-testid="chat-proposed-action-card"]')
+            proposal_card.wait_for(state="visible", timeout=15000)
+            proposal_text = proposal_card.inner_text()
+
+            assert "Le Jardin Secret (Médina)" in proposal_text, (
+                f"Le lieu proposé n'est pas Le Jardin Secret (Médina): {proposal_text!r}"
+            )
+            assert "La Grande Table Marocaine" not in proposal_text, (
+                f"La Grande Table Marocaine a été proposée à tort: {proposal_text!r}"
+            )
+            assert "13 novembre" in proposal_text.lower()
+            assert "10:00" in proposal_text
+
+            screenshot_path = ARTIFACT_DIR / "marrakech_chat_jardin_secret_fix.png"
+            page.screenshot(path=str(screenshot_path), full_page=False)
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
 if __name__ == "__main__":
     result = test_mon_programme_layout_5_widths_playwright()
+    test_real_chat_marrakech_jardin_secret_medina_and_single_row_header()
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
