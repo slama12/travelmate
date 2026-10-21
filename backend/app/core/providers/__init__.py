@@ -6,6 +6,7 @@ from app.core.providers.interfaces import (
     BasePlacesProvider,
     BaseRoutingProvider,
     BaseServiceProvider,
+    BaseVoiceSTTProvider,
     BaseWeatherProvider,
     CityNotSimulatedError,
 )
@@ -21,6 +22,7 @@ from app.core.providers.real import (
 )
 from app.core.providers.registry import ProviderRegistry, get_provider_registry, reset_provider_registry
 from app.core.providers.simulated import (
+    LocalWhisperSTTProvider,
     SimulatedAIProvider,
     SimulatedCalendarProvider,
     SimulatedFlightsProvider,
@@ -28,6 +30,8 @@ from app.core.providers.simulated import (
     SimulatedPlacesProvider,
     SimulatedRoutingProvider,
     SimulatedWeatherProvider,
+    WebSpeechSTTProvider,
+    get_voice_stt_provider,
 )
 
 __all__ = [
@@ -39,6 +43,7 @@ __all__ = [
     "BaseAIProvider",
     "BasePlacesProvider",
     "BaseRoutingProvider",
+    "BaseVoiceSTTProvider",
     "RealGmailProvider",
     "RealCalendarProvider",
     "RealFlightsProvider",
@@ -53,7 +58,11 @@ __all__ = [
     "SimulatedAIProvider",
     "SimulatedPlacesProvider",
     "SimulatedRoutingProvider",
+    "WebSpeechSTTProvider",
+    "LocalWhisperSTTProvider",
+    "get_voice_stt_provider",
     "ProviderRegistry",
     "get_provider_registry",
     "reset_provider_registry",
 ]
+

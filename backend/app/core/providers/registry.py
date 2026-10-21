@@ -10,6 +10,7 @@ from app.core.providers.interfaces import (
     BasePlacesProvider,
     BaseRoutingProvider,
     BaseServiceProvider,
+    BaseVoiceSTTProvider,
     BaseWeatherProvider,
 )
 from app.core.providers.real import (
@@ -22,6 +23,7 @@ from app.core.providers.real import (
     RealWeatherProvider,
 )
 from app.core.providers.simulated import (
+    LocalWhisperSTTProvider,
     SimulatedAIProvider,
     SimulatedCalendarProvider,
     SimulatedFlightsProvider,
@@ -29,6 +31,8 @@ from app.core.providers.simulated import (
     SimulatedPlacesProvider,
     SimulatedRoutingProvider,
     SimulatedWeatherProvider,
+    WebSpeechSTTProvider,
+    get_voice_stt_provider,
 )
 
 logger = logging.getLogger("travelmate.providers")
@@ -74,6 +78,24 @@ class ProviderRegistry:
             if self.settings.ROUTING_PROVIDER_MODE == "real"
             else SimulatedRoutingProvider(self.settings)
         )
+        self.voice_stt: BaseVoiceSTTProvider = get_voice_stt_provider(
+            self.settings.VOICE_STT_PROVIDER_MODE,
+            self.settings,
+        )
+
+    def resolve_voice_stt_provider(self, provider_override: str | None = None) -> BaseVoiceSTTProvider:
+        if provider_override:
+            return get_voice_stt_provider(provider_override, self.settings)
+        return self.voice_stt
+
+    def voice_stt_info(self) -> dict[str, Any]:
+        return {
+            "active_provider": self.voice_stt.provider_metadata(),
+            "available_providers": [
+                WebSpeechSTTProvider(self.settings).provider_metadata(),
+                LocalWhisperSTTProvider(self.settings).provider_metadata(),
+            ],
+        }
 
     def all_providers(self) -> dict[str, BaseServiceProvider]:
         return {

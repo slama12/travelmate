@@ -21,8 +21,12 @@ import {
   MapPin,
   Maximize2,
   MessageCircle,
+  Mic,
+  MicOff,
   Navigation,
+  Pause,
   Plane,
+  Play,
   Plus,
   Send,
   SlidersHorizontal,
@@ -32,6 +36,8 @@ import {
   Train,
   Trash2,
   Utensils,
+  Volume2,
+  VolumeX,
   Wand2,
   X,
 } from "lucide-react";
@@ -50,6 +56,8 @@ import type { FlightBooking, UserProfile } from "./App";
 declare global {
   interface Window {
     L?: any;
+    SpeechRecognition?: any;
+    webkitSpeechRecognition?: any;
   }
 }
 
@@ -325,7 +333,12 @@ export interface AIGenerateDraftPayload {
 }
 
 export interface ChatProposedAction {
-  action_type: "ADD_VISIT" | "MOVE_VISIT" | "REMOVE_VISIT";
+  action_type:
+    | "ADD_VISIT"
+    | "MOVE_VISIT"
+    | "REMOVE_VISIT"
+    | "BOOK_RESERVATION"
+    | "PROCESS_PAYMENT";
   item_id: string | null;
   place_id: string;
   place_name: string;
@@ -338,6 +351,10 @@ export interface ChatProposedAction {
   validation_error_code: string | null;
   validation_message_fr: string | null;
   suggested_slots: SuggestedSlot[];
+  requires_double_confirmation?: boolean;
+  confirmation_steps_required?: number;
+  confirmation_step?: number;
+  spoken_summary_fr?: string | null;
 }
 
 export interface ChatMessageItem {
@@ -346,8 +363,311 @@ export interface ChatMessageItem {
   role: "user" | "assistant";
   content: string;
   proposed_action: ChatProposedAction | null;
-  action_status: "NONE" | "PENDING_CONFIRMATION" | "CONFIRMED" | "REJECTED";
+  action_status:
+    | "NONE"
+    | "PENDING_CONFIRMATION"
+    | "AWAITING_SECOND_CONFIRMATION"
+    | "CONFIRMED"
+    | "REJECTED";
+  navigation_target?: string | null;
+  voice_command?: string | null;
   created_at: string;
+}
+
+export type VoiceSTTProviderId = "web_speech" | "whisper_local";
+
+export interface VoiceAccessibilitySettings {
+  ttsEnabled: boolean;
+  ttsRate: number;
+  handsFree: boolean;
+  sttProvider: VoiceSTTProviderId;
+}
+
+export const VOICE_SETTINGS_STORAGE_KEY = "tm_voice_settings_v1";
+
+export const DEFAULT_VOICE_SETTINGS: VoiceAccessibilitySettings = {
+  ttsEnabled: true,
+  ttsRate: 1.0,
+  handsFree: false,
+  sttProvider: "web_speech",
+};
+
+export const WEB_SPEECH_PRIVACY_NOTICE_FR =
+  "Confidentialité : en mode reconnaissance vocale du navigateur (Web Speech API, fr-FR), l'audio peut transiter par le service de reconnaissance du navigateur. Vous pouvez sélectionner Whisper local pour un traitement 100 % local.";
+
+export const WHISPER_LOCAL_PRIVACY_NOTICE_FR =
+  "Confidentialité : avec Whisper local (fr-FR), l'audio est traité localement sans transiter par le service de reconnaissance externe du navigateur.";
+
+export function loadVoiceAccessibilitySettings(): VoiceAccessibilitySettings {
+  if (typeof window === "undefined") return DEFAULT_VOICE_SETTINGS;
+  try {
+    const raw = window.localStorage.getItem(VOICE_SETTINGS_STORAGE_KEY);
+    if (!raw) return DEFAULT_VOICE_SETTINGS;
+    const parsed = JSON.parse(raw);
+    return {
+      ttsEnabled:
+        typeof parsed.ttsEnabled === "boolean"
+          ? parsed.ttsEnabled
+          : DEFAULT_VOICE_SETTINGS.ttsEnabled,
+      ttsRate: [0.8, 1.0, 1.2, 1.5].includes(Number(parsed.ttsRate))
+        ? Number(parsed.ttsRate)
+        : DEFAULT_VOICE_SETTINGS.ttsRate,
+      handsFree: Boolean(parsed.handsFree),
+      sttProvider:
+        parsed.sttProvider === "whisper_local" ? "whisper_local" : "web_speech",
+    };
+  } catch {
+    return DEFAULT_VOICE_SETTINGS;
+  }
+}
+
+export function saveVoiceAccessibilitySettings(
+  next: VoiceAccessibilitySettings
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(VOICE_SETTINGS_STORAGE_KEY, JSON.stringify(next));
+    window.dispatchEvent(new CustomEvent("tm-voice-settings-updated"));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function speakFrenchResponse(
+  text: string,
+  options?: { rate?: number; enabled?: boolean }
+): boolean {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+    return false;
+  }
+  const settings = loadVoiceAccessibilitySettings();
+  const enabled = options?.enabled ?? settings.ttsEnabled;
+  if (!enabled || !text.trim()) return false;
+  try {
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text.trim());
+    utterance.lang = "fr-FR";
+    utterance.rate = options?.rate ?? settings.ttsRate ?? 1.0;
+    window.speechSynthesis.speak(utterance);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function togglePauseSpeechSynthesis(): "paused" | "resumed" | "idle" {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+    return "idle";
+  }
+  try {
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+      return "resumed";
+    }
+    if (window.speechSynthesis.speaking) {
+      window.speechSynthesis.pause();
+      return "paused";
+    }
+    return "idle";
+  } catch {
+    return "idle";
+  }
+}
+
+export function stopSpeechSynthesis(): void {
+  if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+  try {
+    window.speechSynthesis.cancel();
+  } catch {
+    // ignore
+  }
+}
+
+export interface FrontendVoiceRecognitionCallbacks {
+  onListeningChange: (listening: boolean) => void;
+  onTranscript: (transcript: string, isFinal: boolean) => void;
+  onSilenceStop: () => void;
+  onError: (
+    errorCode:
+      | "MIC_DENIED"
+      | "BROWSER_UNSUPPORTED"
+      | "UNRECOGNIZED_SPEECH"
+      | "NOISE"
+      | "SILENCE",
+    messageFr: string
+  ) => void;
+}
+
+export interface FrontendVoiceSTTProvider {
+  readonly providerId: VoiceSTTProviderId;
+  readonly providerLabelFr: string;
+  readonly language: "fr-FR";
+  readonly privacyNoticeFr: string;
+  isSupported(): boolean;
+  startListening(callbacks: FrontendVoiceRecognitionCallbacks): () => void;
+}
+
+export class WebSpeechFrontendProvider implements FrontendVoiceSTTProvider {
+  readonly providerId: VoiceSTTProviderId = "web_speech";
+  readonly providerLabelFr = "Web Speech API (Navigateur fr-FR)";
+  readonly language = "fr-FR" as const;
+  readonly privacyNoticeFr = WEB_SPEECH_PRIVACY_NOTICE_FR;
+
+  isSupported(): boolean {
+    if (typeof window === "undefined") return false;
+    return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+  }
+
+  startListening(callbacks: FrontendVoiceRecognitionCallbacks): () => void {
+    if (!this.isSupported()) {
+      callbacks.onListeningChange(false);
+      callbacks.onError(
+        "BROWSER_UNSUPPORTED",
+        "Votre navigateur n'est pas compatible avec la reconnaissance vocale Web Speech API (fr-FR). Utilisez un navigateur compatible ou activez le fournisseur Whisper local dans Paramètres."
+      );
+      return () => {};
+    }
+
+    const SpeechRecognitionCtor =
+      window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = "fr-FR";
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    let stopped = false;
+    const silenceTimer = window.setTimeout(() => {
+      if (!stopped) {
+        stopped = true;
+        try {
+          recognition.stop();
+        } catch {
+          // ignore
+        }
+        callbacks.onListeningChange(false);
+        callbacks.onSilenceStop();
+      }
+    }, 6500);
+
+    recognition.onstart = () => {
+      callbacks.onListeningChange(true);
+    };
+
+    recognition.onresult = (event: any) => {
+      let transcript = "";
+      let isFinal = false;
+      for (let i = event.resultIndex || 0; i < event.results.length; i++) {
+        transcript += event.results[i][0].transcript;
+        if (event.results[i].isFinal) isFinal = true;
+      }
+      if (transcript.trim()) {
+        callbacks.onTranscript(transcript.trim(), isFinal);
+      }
+    };
+
+    recognition.onspeechend = () => {
+      window.clearTimeout(silenceTimer);
+      try {
+        recognition.stop();
+      } catch {
+        // ignore
+      }
+      callbacks.onListeningChange(false);
+      callbacks.onSilenceStop();
+    };
+
+    recognition.onerror = (event: any) => {
+      window.clearTimeout(silenceTimer);
+      stopped = true;
+      callbacks.onListeningChange(false);
+      const err = String(event?.error || "").toLowerCase();
+      if (err === "not-allowed" || err === "permission-denied" || err === "service-not-allowed") {
+        callbacks.onError(
+          "MIC_DENIED",
+          "Accès au microphone refusé. Veuillez autoriser le microphone dans votre navigateur ou saisir votre demande au clavier."
+        );
+      } else if (err === "no-speech") {
+        callbacks.onSilenceStop();
+        callbacks.onError(
+          "SILENCE",
+          "Silence détecté : l'écoute vocale s'est arrêtée automatiquement."
+        );
+      } else if (err === "audio-capture" || err === "network") {
+        callbacks.onError(
+          "NOISE",
+          "Bruit ambiant important détecté. Pouvez-vous répéter dans un environnement plus calme ?"
+        );
+      } else {
+        callbacks.onError("UNRECOGNIZED_SPEECH", "Pouvez-vous répéter ?");
+      }
+    };
+
+    recognition.onend = () => {
+      window.clearTimeout(silenceTimer);
+      callbacks.onListeningChange(false);
+    };
+
+    try {
+      recognition.start();
+    } catch {
+      window.clearTimeout(silenceTimer);
+      callbacks.onListeningChange(false);
+      callbacks.onError(
+        "MIC_DENIED",
+        "Accès au microphone refusé ou indisponible."
+      );
+    }
+
+    return () => {
+      stopped = true;
+      window.clearTimeout(silenceTimer);
+      try {
+        recognition.stop();
+      } catch {
+        // ignore
+      }
+      callbacks.onListeningChange(false);
+    };
+  }
+}
+
+export class WhisperLocalFrontendProvider implements FrontendVoiceSTTProvider {
+  readonly providerId: VoiceSTTProviderId = "whisper_local";
+  readonly providerLabelFr = "Whisper local (Fournisseur local fr-FR)";
+  readonly language = "fr-FR" as const;
+  readonly privacyNoticeFr = WHISPER_LOCAL_PRIVACY_NOTICE_FR;
+
+  isSupported(): boolean {
+    return true;
+  }
+
+  startListening(callbacks: FrontendVoiceRecognitionCallbacks): () => void {
+    // Si l'API SpeechRecognition du navigateur est présente pour capturer le flux localement, on l'utilise ;
+    // sinon l'arrêt par silence reste pris en charge de façon déterministe.
+    const webProvider = new WebSpeechFrontendProvider();
+    if (webProvider.isSupported()) {
+      return webProvider.startListening(callbacks);
+    }
+    callbacks.onListeningChange(true);
+    const timer = window.setTimeout(() => {
+      callbacks.onListeningChange(false);
+      callbacks.onSilenceStop();
+    }, 3000);
+    return () => {
+      window.clearTimeout(timer);
+      callbacks.onListeningChange(false);
+    };
+  }
+}
+
+export function createFrontendVoiceSTTProvider(
+  providerId: VoiceSTTProviderId
+): FrontendVoiceSTTProvider {
+  if (providerId === "whisper_local") {
+    return new WhisperLocalFrontendProvider();
+  }
+  return new WebSpeechFrontendProvider();
 }
 
 export interface OptimizationProposedSlot {
@@ -433,6 +753,7 @@ export interface TravelerPreferences {
   language: "fr" | "en";
   travelStyle: "ECO" | "STANDARD" | "LUXURY";
 }
+
 
 const FALLBACK_HOTEL_IMAGE =
   "https://images.unsplash.com/photo-1566073771259-6a8506099945?auto=format&fit=crop&w=900&q=80";
@@ -1721,13 +2042,364 @@ export function ActivitiesScreen({
 }
 
 /* ============================================================================
- * 3. ÉCRAN MON PROGRAMME (/itinerary) — ÉTAPE 3 & ÉTAPE 4
+/* ============================================================================
+ * BARRE D'ACCESSIBILITÉ VOCALE ÉTAPE 5V (COMPATIBLE LECTEUR D'ÉCRAN, AA, SANS SOURIS NI CLAVIER)
+ * ========================================================================== */
+export function VoiceAccessibilityToolbar({
+  apiBase,
+  token,
+  tripId,
+  defaultSummaryFr,
+  onSelectDayNumber,
+}: {
+  apiBase: string;
+  token: string;
+  tripId?: string | null;
+  defaultSummaryFr?: string;
+  onSelectDayNumber?: (dayNumber: number) => void;
+}) {
+  const navigate = useNavigate();
+  const [voiceSettings, setVoiceSettings] = useState<VoiceAccessibilitySettings>(
+    () => loadVoiceAccessibilitySettings()
+  );
+  const [listening, setListening] = useState<boolean>(false);
+  const [spokenReplyFr, setSpokenReplyFr] = useState<string>(
+    defaultSummaryFr || ""
+  );
+  const [errorFr, setErrorFr] = useState<string>("");
+  const [ttsPaused, setTtsPaused] = useState<boolean>(false);
+  const stopRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    const sync = () => setVoiceSettings(loadVoiceAccessibilitySettings());
+    window.addEventListener("tm-voice-settings-updated", sync);
+    return () => window.removeEventListener("tm-voice-settings-updated", sync);
+  }, []);
+
+  useEffect(() => {
+    if (defaultSummaryFr && !spokenReplyFr) {
+      setSpokenReplyFr(defaultSummaryFr);
+    }
+  }, [defaultSummaryFr]);
+
+  async function runVoiceCommand(transcriptText: string) {
+    setErrorFr("");
+    if (!tripId || !token) {
+      const fallback =
+        defaultSummaryFr ||
+        `Commande vocale reçue : ${transcriptText}.`;
+      setSpokenReplyFr(fallback);
+      speakFrenchResponse(fallback, {
+        rate: voiceSettings.ttsRate,
+        enabled: voiceSettings.ttsEnabled,
+      });
+      return;
+    }
+
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/itinerary/trip/${tripId}/voice/command`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            transcript: transcriptText,
+            signal: "SPEECH",
+            confidence: 0.95,
+            provider: voiceSettings.sttProvider,
+            hands_free: true,
+          }),
+        }
+      );
+      if (!resp.ok) {
+        setErrorFr("Accès refusé ou commande vocale indisponible pour votre rôle.");
+        return;
+      }
+      const data = await resp.json();
+      if (data.status === "ERROR" || data.status === "REPEAT_REQUIRED") {
+        const msg = data.error_message_fr || data.spoken_reply_fr || "Pouvez-vous répéter ?";
+        setErrorFr(msg);
+        speakFrenchResponse(msg, {
+          rate: voiceSettings.ttsRate,
+          enabled: voiceSettings.ttsEnabled,
+        });
+        return;
+      }
+      const reply = data.spoken_reply_fr || defaultSummaryFr || "";
+      setSpokenReplyFr(reply);
+      speakFrenchResponse(reply, {
+        rate: voiceSettings.ttsRate,
+        enabled: voiceSettings.ttsEnabled,
+      });
+      if (data.day_number && onSelectDayNumber) {
+        onSelectDayNumber(Number(data.day_number));
+      }
+      if (data.navigation_target) {
+        navigate(data.navigation_target);
+      }
+    } catch {
+      setErrorFr("Impossible de joindre l'analyseur vocal.");
+    }
+  }
+
+  function handleToggleMic() {
+    setErrorFr("");
+    if (listening && stopRef.current) {
+      stopRef.current();
+      stopRef.current = null;
+      setListening(false);
+      return;
+    }
+    const provider = createFrontendVoiceSTTProvider(voiceSettings.sttProvider);
+    stopRef.current = provider.startListening({
+      onListeningChange: (active) => setListening(active),
+      onTranscript: (text, isFinal) => {
+        if (isFinal && text.trim()) {
+          runVoiceCommand(text.trim());
+        }
+      },
+      onSilenceStop: () => setListening(false),
+      onError: (_code, msgFr) => {
+        setListening(false);
+        setErrorFr(msgFr);
+      },
+    });
+  }
+
+  function handleRateChange(nextRate: number) {
+    const updated: VoiceAccessibilitySettings = {
+      ...voiceSettings,
+      ttsRate: nextRate,
+    };
+    setVoiceSettings(updated);
+    saveVoiceAccessibilitySettings(updated);
+  }
+
+  return (
+    <section
+      role="region"
+      aria-label="Commandes vocales et lecture à voix haute"
+      data-testid="voice-accessibility-toolbar"
+      className="rounded-card border border-brand-300 bg-white p-3.5 shadow-soft space-y-2.5"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            data-testid="screen-voice-mic-btn"
+            aria-label={
+              listening
+                ? "Arrêter l'écoute vocale (J'écoute…)"
+                : "Dicter une commande vocale en français (fr-FR)"
+            }
+            aria-pressed={listening}
+            onClick={handleToggleMic}
+            className={`inline-flex min-h-[44px] items-center gap-2 rounded-card px-3.5 py-2 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 ${
+              listening
+                ? "bg-amber-700 text-white"
+                : "bg-brand-700 text-white hover:bg-brand-800"
+            }`}
+          >
+            {listening ? (
+              <>
+                <MicOff className="h-4 w-4 shrink-0" />
+                <span>Arrêter l'écoute</span>
+              </>
+            ) : (
+              <>
+                <Mic className="h-4 w-4 shrink-0" />
+                <span>Commande vocale (fr-FR)</span>
+              </>
+            )}
+          </button>
+
+          {listening && (
+            <span
+              role="status"
+              aria-live="polite"
+              data-testid="screen-voice-listening-status"
+              className="inline-flex items-center gap-1.5 rounded-pill bg-amber-100 border border-amber-400 px-3 py-1 text-caption font-bold text-amber-950"
+            >
+              J'écoute…
+            </span>
+          )}
+        </div>
+
+        {/* Lecture à voix haute (speechSynthesis) : vitesse réglable + bouton pause */}
+        <div
+          className="flex flex-wrap items-center gap-1.5"
+          role="group"
+          aria-label="Contrôles de lecture vocale"
+        >
+          <button
+            type="button"
+            data-testid="voice-tts-speak-btn"
+            aria-label="Lire à voix haute le résumé de l'écran"
+            onClick={() => {
+              const textToRead =
+                spokenReplyFr ||
+                defaultSummaryFr ||
+                "Résumé vocal prêt.";
+              setSpokenReplyFr(textToRead);
+              speakFrenchResponse(textToRead, {
+                rate: voiceSettings.ttsRate,
+                enabled: true,
+              });
+            }}
+            className="inline-flex min-h-[44px] items-center gap-1.5 rounded-card border border-brand-300 bg-brand-50 px-3 py-1.5 text-caption font-semibold text-brand-900 hover:bg-brand-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+          >
+            <Volume2 className="h-4 w-4 shrink-0" />
+            <span>Lire à voix haute</span>
+          </button>
+
+          <button
+            type="button"
+            data-testid="voice-tts-pause-btn"
+            aria-label={
+              ttsPaused
+                ? "Reprendre la lecture vocale"
+                : "Mettre en pause la lecture vocale"
+            }
+            onClick={() => {
+              const state = togglePauseSpeechSynthesis();
+              setTtsPaused(state === "paused");
+            }}
+            className="inline-flex min-h-[44px] items-center gap-1 rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+          >
+            {ttsPaused ? (
+              <>
+                <Play className="h-3.5 w-3.5 shrink-0" />
+                <span>Reprendre</span>
+              </>
+            ) : (
+              <>
+                <Pause className="h-3.5 w-3.5 shrink-0" />
+                <span>Pause</span>
+              </>
+            )}
+          </button>
+
+          <div
+            className="inline-flex items-center gap-1 rounded-card border border-border bg-canvas-subtle px-2 py-1"
+            data-testid="voice-tts-rate-group"
+            role="group"
+            aria-label="Vitesse de lecture vocale"
+          >
+            {[0.8, 1.0, 1.2, 1.5].map((rate) => (
+              <button
+                key={rate}
+                type="button"
+                aria-label={`Vitesse de lecture ${rate}x`}
+                aria-pressed={voiceSettings.ttsRate === rate}
+                data-testid={`voice-rate-btn-${rate}`}
+                onClick={() => handleRateChange(rate)}
+                className={`min-h-[36px] rounded px-2 py-0.5 text-[11px] font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                  voiceSettings.ttsRate === rate
+                    ? "bg-brand-700 text-white"
+                    : "text-ink-secondary hover:text-ink"
+                }`}
+              >
+                {rate}x
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Parcours complet faisable sans souris ni clavier grâce aux commandes vocales */}
+      <div
+        className="flex flex-wrap items-center gap-1.5"
+        role="group"
+        aria-label="Commandes vocales rapides de navigation et de lecture"
+      >
+        <button
+          type="button"
+          data-testid="voice-cmd-read-budget"
+          onClick={() => runVoiceCommand("lis-moi mon budget")}
+          className="min-h-[40px] rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+        >
+          « Lis-moi mon budget »
+        </button>
+        <button
+          type="button"
+          data-testid="voice-cmd-open-documents"
+          onClick={() => runVoiceCommand("ouvre mes documents")}
+          className="min-h-[40px] rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+        >
+          « Ouvre mes documents »
+        </button>
+        <button
+          type="button"
+          data-testid="voice-cmd-open-infos"
+          onClick={() => runVoiceCommand("infos pratiques")}
+          className="min-h-[40px] rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+        >
+          « Infos pratiques »
+        </button>
+        <button
+          type="button"
+          data-testid="voice-cmd-goto-itinerary"
+          onClick={() => runVoiceCommand("va à mon programme")}
+          className="min-h-[40px] rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+        >
+          « Va à mon programme »
+        </button>
+        <button
+          type="button"
+          data-testid="voice-cmd-goto-accommodations"
+          onClick={() => runVoiceCommand("ouvre l'hébergement")}
+          className="min-h-[40px] rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+        >
+          « Ouvre l'hébergement »
+        </button>
+        <button
+          type="button"
+          data-testid="voice-cmd-read-day-2"
+          onClick={() => runVoiceCommand("lis-moi le jour 2")}
+          className="min-h-[40px] rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+        >
+          « Lis-moi le jour 2 »
+        </button>
+      </div>
+
+      {errorFr && (
+        <div
+          role="alert"
+          data-testid="voice-screen-error-banner"
+          className="rounded-card border border-amber-400 bg-amber-50 px-3 py-2 text-caption font-semibold text-amber-950"
+        >
+          {errorFr}
+        </div>
+      )}
+
+      {spokenReplyFr && (
+        <div
+          aria-live="polite"
+          aria-atomic="true"
+          data-testid="voice-spoken-reply-box"
+          className="rounded-card bg-brand-50 border border-brand-200 px-3 py-2 text-caption font-medium text-ink"
+        >
+          <span className="font-bold text-brand-900">Lecture vocale : </span>
+          <span>{spokenReplyFr}</span>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ============================================================================
+ * 3. ÉCRAN MON PROGRAMME (/itinerary) — ÉTAPE 3, ÉTAPE 4 & ÉTAPE 5V
  *    - UN JOUR à la fois
  *    - Puces horizontales des jours du séjour AVEC météo par jour
  *    - Alerte pluie/orage sur visite extérieure + suggestion intérieur / autre créneau (1 clic Accepter / Refuser)
  *    - Bouton "Génère mon programme" (Itinéraire IA en brouillon, 3 champs max)
  *    - Vue chronologique verticale du jour choisi avec indication Temps estimé / Temps réel
- *    - Bulle flottante Assistant de chat avec boutons de confirmation sur les actions proposées
+ *    - Bulle flottante Assistant de chat avec bouton micro (Web Speech API, fr-FR),
+ *      lecture à voix haute (speechSynthesis), confirmation vocale ("oui"/"non"/silence)
+ *      et double confirmation pour réservation, paiement et suppression
  * ========================================================================== */
 export function ItineraryScreen({
   apiBase,
@@ -1788,14 +2460,31 @@ export function ItineraryScreen({
   // Étape 4.1 — Adaptation météo en 1 clic
   const [weatherActionLoadingId, setWeatherActionLoadingId] = useState<string>("");
 
-  // Étape 4.3 — Bulle flottante Assistant de chat
+  // Étape 4.3 & 5V — Bulle flottante Assistant de chat & Accessibilité vocale
   const [chatOpen, setChatOpen] = useState<boolean>(false);
   const [chatMessages, setChatMessages] = useState<ChatMessageItem[]>([]);
   const [chatInput, setChatInput] = useState<string>("");
   const [chatSending, setChatSending] = useState<boolean>(false);
   const [chatConfirmingId, setChatConfirmingId] = useState<string>("");
 
+  const [voiceSettings, setVoiceSettings] = useState<VoiceAccessibilitySettings>(
+    () => loadVoiceAccessibilitySettings()
+  );
+  const [voiceListening, setVoiceListening] = useState<boolean>(false);
+  const [voiceErrorFr, setVoiceErrorFr] = useState<string>("");
+  const [ttsPaused, setTtsPaused] = useState<boolean>(false);
+  const stopChatVoiceRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    const syncVoiceSettings = () =>
+      setVoiceSettings(loadVoiceAccessibilitySettings());
+    window.addEventListener("tm-voice-settings-updated", syncVoiceSettings);
+    return () =>
+      window.removeEventListener("tm-voice-settings-updated", syncVoiceSettings);
+  }, []);
+
   const cityLabel = destination?.city_name || schedule?.city_name || "votre destination";
+
 
   async function refreshWeather(tripId: string) {
     try {
@@ -2202,11 +2891,12 @@ export function ItineraryScreen({
     }
   }
 
-  // Étape 4.3 — Envoyer un message au chat et confirmer / refuser une action proposée
+  // Étape 4.3 & 5V — Envoyer un message au chat (avec lecture vocale et navigation le cas échéant)
   async function handleSendChatMessage(customText?: string) {
     const content = (customText ?? chatInput).trim();
     if (!trip?.id || !content || chatSending) return;
     if (!customText) setChatInput("");
+    setVoiceErrorFr("");
     setChatSending(true);
     try {
       const resp = await fetch(`${apiBase}/api/v1/itinerary/trip/${trip.id}/chat`, {
@@ -2219,12 +2909,192 @@ export function ItineraryScreen({
       });
       if (resp.ok) {
         const data = await resp.json();
-        setChatMessages(data.messages || []);
+        const messages: ChatMessageItem[] = data.messages || [];
+        setChatMessages(messages);
+        const latestAssistant =
+          [...messages].reverse().find((m) => m.role !== "user") || null;
+        if (latestAssistant?.content) {
+          speakFrenchResponse(latestAssistant.content, {
+            rate: voiceSettings.ttsRate,
+            enabled: voiceSettings.ttsEnabled,
+          });
+        }
+        if (latestAssistant?.navigation_target) {
+          navigate(latestAssistant.navigation_target);
+        }
       }
     } finally {
       setChatSending(false);
     }
   }
+
+  // Étape 5V — Exécuter une commande vocale via le même analyseur que le chat
+  async function handleVoiceCommandSubmit(
+    transcriptText: string,
+    signalType:
+      | "SPEECH"
+      | "SILENCE"
+      | "NOISE"
+      | "MIC_DENIED"
+      | "BROWSER_UNSUPPORTED"
+      | "UNRECOGNIZED_SPEECH" = "SPEECH"
+  ) {
+    if (!trip?.id || chatSending) return;
+    setVoiceErrorFr("");
+    setChatSending(true);
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/itinerary/trip/${trip.id}/voice/command`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            transcript: transcriptText,
+            signal: signalType,
+            confidence: 0.95,
+            provider: voiceSettings.sttProvider,
+            hands_free: voiceSettings.handsFree,
+          }),
+        }
+      );
+      if (resp.status === 403) {
+        setVoiceErrorFr(
+          "Accès refusé : votre rôle en lecture seule ne permet pas de modifier l'itinéraire."
+        );
+        return;
+      }
+      if (!resp.ok) {
+        setVoiceErrorFr("Commande vocale temporairement indisponible.");
+        return;
+      }
+      const data = await resp.json();
+      if (data.status === "ERROR" || data.status === "REPEAT_REQUIRED") {
+        const errMsg =
+          data.error_message_fr ||
+          data.spoken_reply_fr ||
+          "Pouvez-vous répéter ?";
+        setVoiceErrorFr(errMsg);
+        speakFrenchResponse(errMsg, {
+          rate: voiceSettings.ttsRate,
+          enabled: voiceSettings.ttsEnabled,
+        });
+        return;
+      }
+      if (data.spoken_reply_fr) {
+        speakFrenchResponse(data.spoken_reply_fr, {
+          rate: voiceSettings.ttsRate,
+          enabled: voiceSettings.ttsEnabled,
+        });
+      }
+      if (data.day_number && tripDays[data.day_number - 1]) {
+        setSelectedDayDate(tripDays[data.day_number - 1]);
+      }
+      await refreshChatHistory(trip.id);
+      if (data.navigation_target && data.navigation_target !== "/itinerary") {
+        navigate(data.navigation_target);
+      }
+    } finally {
+      setChatSending(false);
+    }
+  }
+
+  // Étape 5V — Confirmation vocale explicite ("oui" / "non" / silence, double confirmation pour suppression/réservation/paiement)
+  async function handleVoiceConfirmAction(
+    messageId: string,
+    transcriptWord: string,
+    signalType:
+      | "SPEECH"
+      | "SILENCE"
+      | "NOISE"
+      | "MIC_DENIED"
+      | "BROWSER_UNSUPPORTED"
+      | "UNRECOGNIZED_SPEECH" = "SPEECH"
+  ) {
+    if (!trip?.id) return;
+    setChatConfirmingId(messageId);
+    setVoiceErrorFr("");
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/itinerary/trip/${trip.id}/chat/${messageId}/voice-confirm`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            message_id: messageId,
+            transcript: transcriptWord,
+            signal: signalType,
+            confidence: 0.95,
+            provider: voiceSettings.sttProvider,
+          }),
+        }
+      );
+      if (!resp.ok) {
+        setVoiceErrorFr("Impossible de valider cette confirmation vocale.");
+        return;
+      }
+      const data = await resp.json();
+      if (data.spoken_reply_fr) {
+        speakFrenchResponse(data.spoken_reply_fr, {
+          rate: voiceSettings.ttsRate,
+          enabled: voiceSettings.ttsEnabled,
+        });
+      }
+      if (
+        data.status === "ERROR_NO_MODIFICATION" ||
+        data.status === "REPEAT_REQUIRED"
+      ) {
+        setVoiceErrorFr(data.spoken_reply_fr || "Pouvez-vous répéter ?");
+      }
+      await refreshChatHistory(trip.id);
+      if (data.applied_change) {
+        await refreshSchedule();
+        notify({
+          title: "Confirmé à la voix",
+          description: data.spoken_reply_fr,
+          tone: "success",
+        });
+      }
+    } finally {
+      setChatConfirmingId("");
+    }
+  }
+
+  function handleToggleChatMic() {
+    setVoiceErrorFr("");
+    if (voiceListening && stopChatVoiceRef.current) {
+      stopChatVoiceRef.current();
+      stopChatVoiceRef.current = null;
+      setVoiceListening(false);
+      return;
+    }
+
+    const provider = createFrontendVoiceSTTProvider(voiceSettings.sttProvider);
+    stopChatVoiceRef.current = provider.startListening({
+      onListeningChange: (active) => setVoiceListening(active),
+      onTranscript: (transcript, isFinal) => {
+        // Transcription affichée et modifiable avant envoi, sauf en mode mains libres
+        setChatInput(transcript);
+        if (isFinal && voiceSettings.handsFree && transcript.trim()) {
+          setChatInput("");
+          handleVoiceCommandSubmit(transcript.trim(), "SPEECH");
+        }
+      },
+      onSilenceStop: () => {
+        setVoiceListening(false);
+      },
+      onError: (_code, msgFr) => {
+        setVoiceListening(false);
+        setVoiceErrorFr(msgFr);
+      },
+    });
+  }
+
 
   async function handleConfirmChatAction(
     messageId: string,
@@ -2423,7 +3293,8 @@ export function ItineraryScreen({
   const pendingChatProposalMsg =
     lastAssistantMsg &&
     lastAssistantMsg.proposed_action &&
-    lastAssistantMsg.action_status === "PENDING_CONFIRMATION"
+    (lastAssistantMsg.action_status === "PENDING_CONFIRMATION" ||
+      lastAssistantMsg.action_status === "AWAITING_SECOND_CONFIRMATION")
       ? lastAssistantMsg
       : null;
 
@@ -2471,6 +3342,32 @@ export function ItineraryScreen({
             Un jour à la fois, avec prévisions météo, itinéraire sur mesure et temps de déplacement.
           </p>
         </div>
+
+        {/* Étape 5V — Barre d'accessibilité vocale & lecture à voix haute */}
+        <div className="w-full">
+          <VoiceAccessibilityToolbar
+            apiBase={apiBase}
+            token={token}
+            tripId={trip?.id}
+            defaultSummaryFr={
+              currentDayItems.length > 0
+                ? `Programme du ${formatFullDateHuman(
+                    selectedDayDate
+                  )} à ${cityLabel} : ${currentDayItems
+                    .map(
+                      (it) =>
+                        `${it.local_start_time} ${it.place_name}`
+                    )
+                    .join(", ")}.`
+                : `Programme à ${cityLabel} : aucune visite planifiée pour ce jour.`
+            }
+            onSelectDayNumber={(dayNum) => {
+              const targetDate = tripDays[dayNum - 1];
+              if (targetDate) setSelectedDayDate(targetDate);
+            }}
+          />
+        </div>
+
 
         <div
           className="flex flex-wrap items-center gap-2"
@@ -3394,11 +4291,72 @@ export function ItineraryScreen({
                   Assistant {cityLabel}
                 </div>
                 <div className="text-[11px] text-white/80 truncate">
-                  Programme, météo, budget • Confirmation requise
+                  Voix fr-FR • Confirmation requise
                 </div>
               </div>
             </div>
             <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                data-testid="chat-tts-toggle-btn"
+                aria-label={
+                  voiceSettings.ttsEnabled
+                    ? "Désactiver la lecture à voix haute"
+                    : "Activer la lecture à voix haute"
+                }
+                aria-pressed={voiceSettings.ttsEnabled}
+                onClick={() => {
+                  const next = {
+                    ...voiceSettings,
+                    ttsEnabled: !voiceSettings.ttsEnabled,
+                  };
+                  setVoiceSettings(next);
+                  saveVoiceAccessibilitySettings(next);
+                  if (!next.ttsEnabled) stopSpeechSynthesis();
+                }}
+                className="rounded-md border border-white/25 bg-white/10 p-1.5 text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+              >
+                {voiceSettings.ttsEnabled ? (
+                  <Volume2 className="h-3.5 w-3.5" />
+                ) : (
+                  <VolumeX className="h-3.5 w-3.5" />
+                )}
+              </button>
+              <button
+                type="button"
+                data-testid="chat-tts-pause-btn"
+                aria-label={
+                  ttsPaused
+                    ? "Reprendre la lecture vocale"
+                    : "Mettre en pause la lecture vocale"
+                }
+                onClick={() => {
+                  const state = togglePauseSpeechSynthesis();
+                  setTtsPaused(state === "paused");
+                }}
+                className="rounded-md border border-white/25 bg-white/10 px-2 py-1 text-[11px] font-medium text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+              >
+                {ttsPaused ? "Reprendre" : "Pause"}
+              </button>
+              <button
+                type="button"
+                data-testid="chat-tts-rate-btn"
+                aria-label={`Vitesse de lecture vocale ${voiceSettings.ttsRate}x`}
+                onClick={() => {
+                  const rates = [0.8, 1.0, 1.2, 1.5];
+                  const nextIdx =
+                    (rates.indexOf(voiceSettings.ttsRate) + 1) % rates.length;
+                  const next = {
+                    ...voiceSettings,
+                    ttsRate: rates[nextIdx],
+                  };
+                  setVoiceSettings(next);
+                  saveVoiceAccessibilitySettings(next);
+                }}
+                className="rounded-md border border-white/25 bg-white/10 px-2 py-1 text-[11px] font-bold text-white hover:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+              >
+                {voiceSettings.ttsRate}x
+              </button>
               <button
                 type="button"
                 data-testid="new-chat-conversation-btn"
@@ -3428,7 +4386,7 @@ export function ItineraryScreen({
             {chatMessages.length === 0 ? (
               <div className="space-y-2 text-caption text-ink-secondary">
                 <p>
-                  Bonjour ! Je connais votre vol, votre budget, la météo et votre programme à {cityLabel}.
+                  Bonjour ! Je connais votre vol, votre budget, la météo et votre programme à {cityLabel}. Vous pouvez écrire ou utiliser le bouton micro (fr-FR).
                 </p>
                 <div className="flex flex-wrap gap-1.5 pt-1">
                   <button
@@ -3475,6 +4433,26 @@ export function ItineraryScreen({
                     {msg.content}
                   </div>
 
+                  {msg.role !== "user" && (
+                    <div>
+                      <button
+                        type="button"
+                        aria-label="Écouter cette réponse à voix haute"
+                        data-testid={`chat-speak-msg-${msg.id}`}
+                        onClick={() =>
+                          speakFrenchResponse(msg.content, {
+                            rate: voiceSettings.ttsRate,
+                            enabled: true,
+                          })
+                        }
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-brand-800 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+                      >
+                        <Volume2 className="h-3 w-3" />
+                        <span>Lire à voix haute</span>
+                      </button>
+                    </div>
+                  )}
+
                   {msg.action_status === "CONFIRMED" && (
                     <div className="text-[11px] font-semibold text-feedback-success">
                       ✓ Modification confirmée et appliquée
@@ -3490,15 +4468,40 @@ export function ItineraryScreen({
             )}
           </div>
 
-          {/* Zone épinglée au-dessus du champ de saisie : Confirmer / Refuser toujours visibles */}
+          {/* Zone épinglée au-dessus du champ de saisie : Confirmer / Refuser + Confirmation vocale ("oui"/"non"/silence) */}
           {pendingChatProposalMsg && pendingChatProposalMsg.proposed_action && (
             <div
               data-testid="chat-proposed-action-card"
               className="shrink-0 border-t border-brand-200 bg-brand-50 px-4 py-3 text-left space-y-2"
             >
-              <div className="text-[11px] font-bold uppercase tracking-wide text-brand-800">
-                Proposition en attente de votre accord
+              <div className="flex flex-wrap items-center justify-between gap-1">
+                <div className="text-[11px] font-bold uppercase tracking-wide text-brand-800">
+                  Proposition en attente de votre accord
+                </div>
+                {pendingChatProposalMsg.proposed_action
+                  .requires_double_confirmation && (
+                  <span
+                    data-testid="double-confirmation-badge"
+                    className="rounded-pill bg-amber-100 border border-amber-400 px-2 py-0.5 text-[10px] font-bold text-amber-950"
+                  >
+                    Double confirmation requise (
+                    {pendingChatProposalMsg.action_status ===
+                    "AWAITING_SECOND_CONFIRMATION"
+                      ? "2/2"
+                      : "1/2"}
+                    )
+                  </span>
+                )}
               </div>
+
+              {pendingChatProposalMsg.proposed_action.spoken_summary_fr && (
+                <div
+                  data-testid="voice-action-spoken-summary"
+                  className="text-[11px] font-medium text-brand-900"
+                >
+                  {pendingChatProposalMsg.proposed_action.spoken_summary_fr}
+                </div>
+              )}
 
               {pendingChatProposalMsg.proposed_action.validated_by_engine ? (
                 <>
@@ -3509,7 +4512,7 @@ export function ItineraryScreen({
                     )}{" "}
                     à {pendingChatProposalMsg.proposed_action.local_start_time}
                   </div>
-                  <div className="flex items-center gap-2 pt-0.5">
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
                     <Button
                       type="button"
                       size="sm"
@@ -3589,6 +4592,88 @@ export function ItineraryScreen({
                   </div>
                 </>
               )}
+
+              {/* Confirmation vocale explicite : "oui" pour confirmer, "non" ou silence pour annuler */}
+              <div
+                data-testid="voice-confirmation-controls"
+                className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-brand-200/70"
+              >
+                <button
+                  type="button"
+                  data-testid="voice-confirm-yes-btn"
+                  disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                  onClick={() =>
+                    handleVoiceConfirmAction(
+                      pendingChatProposalMsg.id,
+                      "oui",
+                      "SPEECH"
+                    )
+                  }
+                  className="min-h-[36px] rounded-card bg-brand-700 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-brand-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+                >
+                  Dire « oui »
+                </button>
+                <button
+                  type="button"
+                  data-testid="voice-confirm-no-btn"
+                  disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                  onClick={() =>
+                    handleVoiceConfirmAction(
+                      pendingChatProposalMsg.id,
+                      "non",
+                      "SPEECH"
+                    )
+                  }
+                  className="min-h-[36px] rounded-card border border-border bg-white px-2.5 py-1 text-[11px] font-semibold text-ink hover:border-brand-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+                >
+                  Dire « non »
+                </button>
+                <button
+                  type="button"
+                  data-testid="voice-confirm-silence-btn"
+                  disabled={chatConfirmingId === pendingChatProposalMsg.id}
+                  onClick={() =>
+                    handleVoiceConfirmAction(
+                      pendingChatProposalMsg.id,
+                      "",
+                      "SILENCE"
+                    )
+                  }
+                  className="min-h-[36px] rounded-card border border-border bg-canvas-subtle px-2.5 py-1 text-[11px] font-medium text-ink-secondary hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
+                >
+                  Silence (annuler)
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* État visible "J'écoute…" et alertes d'erreur vocale (micro refusé, navigateur non compatible, parole non comprise, bruit) */}
+          {voiceListening && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="voice-listening-status"
+              className="shrink-0 flex items-center justify-between gap-2 border-t border-amber-300 bg-amber-50 px-4 py-2 text-caption font-bold text-amber-950"
+            >
+              <span>J'écoute… (parlez en français, arrêt par silence ou bouton)</span>
+              <button
+                type="button"
+                data-testid="voice-stop-listening-btn"
+                onClick={handleToggleChatMic}
+                className="rounded-md bg-amber-800 px-2.5 py-1 text-[11px] font-bold text-white hover:bg-amber-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-900"
+              >
+                Arrêter
+              </button>
+            </div>
+          )}
+
+          {voiceErrorFr && (
+            <div
+              role="alert"
+              data-testid="voice-error-banner"
+              className="shrink-0 border-t border-amber-300 bg-amber-50 px-4 py-2 text-caption font-semibold text-amber-950"
+            >
+              {voiceErrorFr}
             </div>
           )}
 
@@ -3599,6 +4684,28 @@ export function ItineraryScreen({
             }}
             className="shrink-0 flex items-center gap-2 border-t border-border bg-white p-3"
           >
+            <button
+              type="button"
+              data-testid="chat-mic-btn"
+              aria-label={
+                voiceListening
+                  ? "Arrêter l'écoute vocale (J'écoute…)"
+                  : "Dicter un message vocal (Web Speech API, fr-FR)"
+              }
+              aria-pressed={voiceListening}
+              onClick={handleToggleChatMic}
+              className={`inline-flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-card border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 ${
+                voiceListening
+                  ? "border-amber-700 bg-amber-700 text-white"
+                  : "border-brand-300 bg-brand-50 text-brand-800 hover:bg-brand-100"
+              }`}
+            >
+              {voiceListening ? (
+                <MicOff className="h-4 w-4" />
+              ) : (
+                <Mic className="h-4 w-4" />
+              )}
+            </button>
             <Input
               type="text"
               placeholder="Ex: Ajoute une visite mercredi à 10h..."
@@ -3618,6 +4725,7 @@ export function ItineraryScreen({
           </aside>
         </>
       )}
+
     </div>
   );
 }
@@ -4182,10 +5290,18 @@ function TripSubNavHeader({
   activeTab,
   cityLabel,
   userRole,
+  apiBase = "",
+  token = "",
+  tripId = null,
+  defaultSummaryFr,
 }: {
   activeTab: "hub" | "budget" | "documents" | "infos";
   cityLabel: string;
   userRole?: string;
+  apiBase?: string;
+  token?: string;
+  tripId?: string | null;
+  defaultSummaryFr?: string;
 }) {
   const navigate = useNavigate();
   const items = [
@@ -4196,36 +5312,46 @@ function TripSubNavHeader({
   ] as const;
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
-      <div className="flex flex-wrap items-center gap-2" role="navigation" aria-label="Sous-pages Mon voyage">
-        {items.map((item) => {
-          const isActive = activeTab === item.key;
-          return (
-            <button
-              key={item.key}
-              type="button"
-              data-testid={item.testId}
-              onClick={() => navigate(item.path)}
-              className={`rounded-pill px-3.5 py-1.5 text-caption font-semibold transition-colors whitespace-nowrap ${
-                isActive
-                  ? "bg-brand-700 text-white shadow-sm"
-                  : "bg-canvas-subtle text-ink-secondary hover:text-ink border border-border"
-              }`}
-            >
-              {item.label}
-            </button>
-          );
-        })}
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
+        <div className="flex flex-wrap items-center gap-2" role="navigation" aria-label="Sous-pages Mon voyage">
+          {items.map((item) => {
+            const isActive = activeTab === item.key;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                data-testid={item.testId}
+                onClick={() => navigate(item.path)}
+                className={`rounded-pill px-3.5 py-1.5 text-caption font-semibold transition-colors whitespace-nowrap focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                  isActive
+                    ? "bg-brand-700 text-white shadow-sm"
+                    : "bg-canvas-subtle text-ink-secondary hover:text-ink border border-border"
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Badge variant="brand" data-testid="trip-role-badge">
+            Rôle : {formatRoleLabelFr(userRole)}
+          </Badge>
+          <span className="text-caption text-ink-muted hidden sm:inline">
+            Séjour à {cityLabel}
+          </span>
+        </div>
       </div>
 
-      <div className="flex items-center gap-2">
-        <Badge variant="brand" data-testid="trip-role-badge">
-          Rôle : {formatRoleLabelFr(userRole)}
-        </Badge>
-        <span className="text-caption text-ink-muted hidden sm:inline">
-          Séjour à {cityLabel}
-        </span>
-      </div>
+      {/* Étape 5V — Voix ajoutée aux écrans de la 5A ("lis-moi mon budget", "ouvre mes documents", "infos pratiques") */}
+      <VoiceAccessibilityToolbar
+        apiBase={apiBase}
+        token={token}
+        tripId={tripId}
+        defaultSummaryFr={defaultSummaryFr}
+      />
     </div>
   );
 }
@@ -4339,6 +5465,10 @@ export function MyTripSummaryScreen({
         activeTab="hub"
         cityLabel={cityLabel}
         userRole={activeRole}
+        apiBase={apiBase}
+        token={token}
+        tripId={trip?.id}
+        defaultSummaryFr={`Mon voyage à ${cityLabel}. Budget prévu : ${budgetSummary.total_planned} ${budgetSummary.currency}, dépensé : ${budgetSummary.total_spent} ${budgetSummary.currency}, restant : ${budgetSummary.remaining_budget} ${budgetSummary.currency}. ${docsSummary.documents.length} document(s) chiffré(s).`}
       />
 
       {/* En-tête récapitulatif */}
@@ -4862,6 +5992,10 @@ export function TripBudgetScreen({
         activeTab="budget"
         cityLabel={cityLabel}
         userRole={activeRole}
+        apiBase={apiBase}
+        token={token}
+        tripId={trip?.id}
+        defaultSummaryFr={`Point sur votre budget à ${cityLabel} : prévu ${summary.total_planned} ${summary.currency}, dépensé ${summary.total_spent} ${summary.currency}, solde restant ${summary.remaining_budget} ${summary.currency}.${summary.over_budget_alert && summary.over_budget_message_fr ? ` ${summary.over_budget_message_fr}` : ""}`}
       />
 
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
@@ -5468,6 +6602,10 @@ export function TripDocumentsScreen({
         activeTab="documents"
         cityLabel={cityLabel}
         userRole={activeRole}
+        apiBase={apiBase}
+        token={token}
+        tripId={trip?.id}
+        defaultSummaryFr={`Mes documents de voyage à ${cityLabel} : ${docsPayload.documents.length} document(s) chiffré(s) accessible(s).${docsPayload.passport_expiration_alert && docsPayload.passport_alert_message_fr ? ` ${docsPayload.passport_alert_message_fr}` : ""}`}
       />
 
       <div>
@@ -5809,6 +6947,9 @@ export function TripPracticalInfoScreen({
         activeTab="infos"
         cityLabel={cityLabel}
         userRole={activeRole}
+        apiBase={apiBase}
+        tripId={trip?.id}
+        defaultSummaryFr={`Infos pratiques pour ${info.city_name} : Prises : ${info.plugs}. Urgences : ${info.emergency}. Monnaie : ${info.currency}. Indicatif : ${info.dial_code}. Pourboires : ${info.tipping}.`}
       />
 
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
@@ -6018,13 +7159,28 @@ export function SettingsScreen({
   const [travelStyle, setTravelStyle] = useState<
     TravelerPreferences["travelStyle"]
   >(preferences.travelStyle);
+  const [voiceSettings, setVoiceSettings] =
+    useState<VoiceAccessibilitySettings>(() => loadVoiceAccessibilitySettings());
+
+  function updateVoiceSetting(patch: Partial<VoiceAccessibilitySettings>) {
+    const next: VoiceAccessibilitySettings = {
+      ...voiceSettings,
+      ...patch,
+    };
+    setVoiceSettings(next);
+    saveVoiceAccessibilitySettings(next);
+    if (!next.ttsEnabled) {
+      stopSpeechSynthesis();
+    }
+  }
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     onSavePreferences({ currency, language, travelStyle });
+    saveVoiceAccessibilitySettings(voiceSettings);
     notify({
       title: "Préférences enregistrées",
-      description: "Vos choix de devise, de langue et de style de voyage ont été mis à jour.",
+      description: "Vos choix de devise, de langue, de confort et d'accessibilité vocale ont été mis à jour.",
       tone: "success",
     });
   }
@@ -6040,7 +7196,7 @@ export function SettingsScreen({
         </Badge>
         <h1 className="text-h1 text-ink">Paramètres</h1>
         <p className="text-body text-ink-secondary mt-1">
-          Personnalisez votre devise, votre langue et votre confort de voyage.
+          Personnalisez votre devise, votre langue, votre confort de voyage et l'accessibilité vocale.
         </p>
       </div>
 
@@ -6119,6 +7275,180 @@ export function SettingsScreen({
             </Button>
           </div>
         </form>
+      </Card>
+
+      {/* Étape 5V — Accessibilité vocale, synthèse vocale (speechSynthesis), mode mains libres et confidentialité */}
+      <Card
+        className="p-6 sm:p-8 space-y-5 border-brand-200"
+        data-testid="voice-settings-card"
+      >
+        <div>
+          <Badge variant="brand" className="mb-1.5">
+            Accessibilité vocale (fr-FR)
+          </Badge>
+          <h2 className="text-h2 text-ink">
+            Commandes vocales, lecture à voix haute & mode mains libres
+          </h2>
+          <p className="text-caption text-ink-secondary mt-1">
+            Parcours complet faisable sans souris ni clavier grâce aux commandes vocales et à la confirmation explicite par « oui » ou « non ».
+          </p>
+        </div>
+
+        {/* 1. Lecture à voix haute (speechSynthesis) désactivable dans Paramètres */}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-card border border-border bg-canvas-subtle p-4">
+          <div className="space-y-0.5">
+            <div className="text-body font-semibold text-ink">
+              Lecture à voix haute des réponses (speechSynthesis)
+            </div>
+            <div className="text-caption text-ink-secondary">
+              Lit automatiquement les réponses et relit chaque action avant confirmation.
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={voiceSettings.ttsEnabled}
+            data-testid="settings-tts-toggle"
+            onClick={() =>
+              updateVoiceSetting({ ttsEnabled: !voiceSettings.ttsEnabled })
+            }
+            className={`min-h-[44px] rounded-card px-4 py-2 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 ${
+              voiceSettings.ttsEnabled
+                ? "bg-brand-700 text-white"
+                : "bg-white border border-border text-ink"
+            }`}
+          >
+            {voiceSettings.ttsEnabled ? "Activée" : "Désactivée"}
+          </button>
+        </div>
+
+        {/* 2. Vitesse de lecture réglable */}
+        <div className="space-y-2">
+          <div className="text-caption font-semibold text-ink">
+            Vitesse de lecture vocale ({voiceSettings.ttsRate}x)
+          </div>
+          <div
+            className="flex flex-wrap items-center gap-2"
+            data-testid="settings-tts-rate-group"
+          >
+            {[0.8, 1.0, 1.2, 1.5].map((rateVal) => (
+              <button
+                key={rateVal}
+                type="button"
+                data-testid={`settings-tts-rate-${rateVal}`}
+                aria-pressed={voiceSettings.ttsRate === rateVal}
+                onClick={() => updateVoiceSetting({ ttsRate: rateVal })}
+                className={`min-h-[44px] min-w-[64px] rounded-card px-3.5 py-2 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                  voiceSettings.ttsRate === rateVal
+                    ? "bg-brand-700 text-white"
+                    : "bg-canvas-subtle border border-border text-ink hover:border-brand-700"
+                }`}
+              >
+                {rateVal}x
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 3. Mode mains libres activable avec message de confidentialité */}
+        <div className="space-y-3 rounded-card border border-brand-200 bg-brand-50/70 p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <div className="text-body font-semibold text-ink">
+                Mode mains libres
+              </div>
+              <div className="text-caption text-ink-secondary">
+                Envoie la commande vocale dès la fin de phrase sans étape d'édition manuelle (les actions sensibles exigent toujours « oui » explicite).
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={voiceSettings.handsFree}
+              data-testid="settings-hands-free-toggle"
+              onClick={() =>
+                updateVoiceSetting({ handsFree: !voiceSettings.handsFree })
+              }
+              className={`min-h-[44px] rounded-card px-4 py-2 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 ${
+                voiceSettings.handsFree
+                  ? "bg-brand-700 text-white"
+                  : "bg-white border border-border text-ink"
+              }`}
+            >
+              {voiceSettings.handsFree
+                ? "Mains libres activé"
+                : "Mains libres désactivé"}
+            </button>
+          </div>
+
+          <div
+            role="note"
+            data-testid="voice-privacy-notice"
+            className="rounded-card border border-amber-300 bg-amber-50 p-3 text-caption font-medium text-amber-950"
+          >
+            Confidentialité : en mode Web Speech API (fr-FR), l'audio peut transiter par le service de reconnaissance du navigateur. Vous pouvez sélectionner le fournisseur Whisper local ci-dessous pour un traitement local sans transit externe.
+          </div>
+        </div>
+
+        {/* 4. Fournisseur de reconnaissance vocale remplaçable (Web Speech API vs Whisper local derrière la même interface) */}
+        <div className="space-y-2" data-testid="settings-stt-provider-select">
+          <div className="text-caption font-semibold text-ink">
+            Fournisseur de reconnaissance vocale (même interface STT fr-FR)
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <button
+              type="button"
+              data-testid="settings-stt-provider-web"
+              aria-pressed={voiceSettings.sttProvider === "web_speech"}
+              onClick={() => updateVoiceSetting({ sttProvider: "web_speech" })}
+              className={`min-h-[48px] rounded-card border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                voiceSettings.sttProvider === "web_speech"
+                  ? "border-brand-700 bg-brand-700 text-white"
+                  : "border-border bg-white text-ink hover:border-brand-700"
+              }`}
+            >
+              <div className="text-caption font-bold">
+                Web Speech API (Navigateur, fr-FR)
+              </div>
+              <div
+                className={`text-[11px] ${
+                  voiceSettings.sttProvider === "web_speech"
+                    ? "text-white/90"
+                    : "text-ink-secondary"
+                }`}
+              >
+                Reconnaissance native du navigateur
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-testid="settings-stt-provider-whisper"
+              aria-pressed={voiceSettings.sttProvider === "whisper_local"}
+              onClick={() =>
+                updateVoiceSetting({ sttProvider: "whisper_local" })
+              }
+              className={`min-h-[48px] rounded-card border p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                voiceSettings.sttProvider === "whisper_local"
+                  ? "border-brand-700 bg-brand-700 text-white"
+                  : "border-border bg-white text-ink hover:border-brand-700"
+              }`}
+            >
+              <div className="text-caption font-bold">
+                Whisper local (Confidentiel, fr-FR)
+              </div>
+              <div
+                className={`text-[11px] ${
+                  voiceSettings.sttProvider === "whisper_local"
+                    ? "text-white/90"
+                    : "text-ink-secondary"
+                }`}
+              >
+                Traitement local sans transit par le navigateur
+              </div>
+            </button>
+          </div>
+        </div>
       </Card>
     </div>
   );

@@ -174,10 +174,16 @@ class AIApplyDraftRequest(BaseModel):
 
 
 # ==============================================================================
-# 3. ASSISTANT DE CHAT CONTEXTUEL & SÉCURISÉ
+# 3. ASSISTANT DE CHAT CONTEXTUEL & SÉCURISÉ + ACCESSIBILITÉ VOCALE (ÉTAPE 5V)
 # ==============================================================================
 class ChatProposedActionSchema(BaseModel):
-    action_type: Literal["ADD_VISIT", "MOVE_VISIT", "REMOVE_VISIT"]
+    action_type: Literal[
+        "ADD_VISIT",
+        "MOVE_VISIT",
+        "REMOVE_VISIT",
+        "BOOK_RESERVATION",
+        "PROCESS_PAYMENT",
+    ]
     item_id: str | None = None
     place_id: str
     place_name: str
@@ -191,6 +197,10 @@ class ChatProposedActionSchema(BaseModel):
     validation_error_code: str | None = None
     validation_message_fr: str | None = None
     suggested_slots: list[SuggestedSlotSchema] = Field(default_factory=list)
+    requires_double_confirmation: bool = False
+    confirmation_steps_required: int = 1
+    confirmation_step: int = 1
+    spoken_summary_fr: str | None = None
 
 
 class ChatMessageResponse(BaseModel):
@@ -199,7 +209,15 @@ class ChatMessageResponse(BaseModel):
     role: Literal["user", "assistant"]
     content: str
     proposed_action: ChatProposedActionSchema | None = None
-    action_status: Literal["NONE", "PENDING_CONFIRMATION", "CONFIRMED", "REJECTED"] = "NONE"
+    action_status: Literal[
+        "NONE",
+        "PENDING_CONFIRMATION",
+        "AWAITING_SECOND_CONFIRMATION",
+        "CONFIRMED",
+        "REJECTED",
+    ] = "NONE"
+    navigation_target: str | None = None
+    voice_command: str | None = None
     created_at: datetime
 
 
@@ -220,3 +238,111 @@ class ChatActionDecisionResponse(BaseModel):
     updated_item: ItineraryItemResponse | None = None
     deleted_item_id: str | None = None
     detail_fr: str
+
+
+VoiceSignalType = Literal[
+    "SPEECH",
+    "SILENCE",
+    "NOISE",
+    "MIC_DENIED",
+    "BROWSER_UNSUPPORTED",
+    "UNRECOGNIZED_SPEECH",
+]
+
+
+class VoiceCommandRequest(BaseModel):
+    transcript: str | None = Field(default=None, max_length=1200)
+    signal: VoiceSignalType = "SPEECH"
+    provider: Literal["web_speech", "whisper_local"] | None = None
+    hands_free: bool = False
+    confidence: float = Field(default=0.95, ge=0.0, le=1.0)
+    audio_base64: str | None = None
+
+
+class VoiceCommandResponse(BaseModel):
+    ok: bool
+    status: str = "OK"
+    trip_id: str
+    provider_id: str
+    provider_used: str = ""
+    provider_label_fr: str
+    language: str = "fr-FR"
+    transits_browser_service: bool
+    privacy_notice_fr: str
+    hands_free: bool = False
+    editable_before_send: bool = True
+    auto_submitted: bool = False
+    signal: str
+    error_code: str | None = None
+    error_message_fr: str | None = None
+    recognized_transcript: str = ""
+    action_type: str = "NONE"
+    voice_command: str | None = None
+    navigation_target: str | None = None
+    day_number: int | None = None
+    spoken_reply_fr: str
+    requires_voice_confirmation: bool = False
+    requires_confirmation: bool = False
+    requires_double_confirmation: bool = False
+    confirmation_steps_required: int = 0
+    confirmation_step: int = 0
+    pending_message_id: str | None = None
+    message_id: str | None = None
+    proposed_action: ChatProposedActionSchema | None = None
+    applied_change: bool = False
+    message: ChatMessageResponse | None = None
+
+
+class VoiceConfirmRequest(BaseModel):
+    message_id: str | None = None
+    transcript: str | None = Field(default=None, max_length=400)
+    signal: VoiceSignalType = "SPEECH"
+    provider: Literal["web_speech", "whisper_local"] | None = None
+    confidence: float = Field(default=0.95, ge=0.0, le=1.0)
+
+
+class VoiceConfirmResponse(BaseModel):
+    ok: bool
+    status: str = "CONFIRMED"
+    trip_id: str
+    message_id: str | None = None
+    decision: Literal[
+        "CONFIRMED",
+        "AWAITING_SECOND_CONFIRMATION",
+        "CANCELLED_BY_NO",
+        "CANCELLED_BY_SILENCE",
+        "REPEAT_REQUIRED",
+        "ERROR_NO_MODIFICATION",
+    ]
+    action_status: Literal[
+        "NONE",
+        "PENDING_CONFIRMATION",
+        "AWAITING_SECOND_CONFIRMATION",
+        "CONFIRMED",
+        "REJECTED",
+    ]
+    applied_change: bool = False
+    pending_action_preserved: bool = False
+    requires_double_confirmation: bool = False
+    confirmation_steps_required: int = 1
+    confirmation_step: int = 1
+    error_code: str | None = None
+    spoken_reply_fr: str
+    detail_fr: str
+    updated_item: ItineraryItemResponse | None = None
+    deleted_item_id: str | None = None
+    message: ChatMessageResponse | None = None
+
+
+class VoiceProvidersConfigResponse(BaseModel):
+    active_provider: dict[str, Any]
+    available_providers: list[dict[str, Any]]
+    supported_tts_rates: list[float] = Field(default_factory=lambda: [0.8, 1.0, 1.2, 1.5])
+    default_language: str = "fr-FR"
+    language: str = "fr-FR"
+    hands_free_privacy_notice_fr: str = (
+        "En mode mains libres avec Web Speech API, l'audio peut transiter par le service de reconnaissance "
+        "vocale du navigateur. Vous pouvez sélectionner Whisper local pour un traitement hors navigateur."
+    )
+
+

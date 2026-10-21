@@ -28,6 +28,7 @@ from app.core.providers import (
     build_chat_assistant_prompt,
     get_provider_registry,
 )
+from app.core.rbac import READ_ROLES, WRITE_ROLES, require_trip_access
 from app.core.redis import cache_client
 from app.models.entities import (
     Accommodation,
@@ -41,6 +42,9 @@ from app.models.entities import (
     User,
 )
 from app.modules.auth.router import get_current_user
+from app.modules.budget.router import build_trip_budget_summary
+from app.modules.destinations.router import DESTINATION_PRACTICAL_CATALOG
+from app.modules.documents.router import build_trip_documents_list
 from app.modules.intelligence.schemas import (
     AcceptWeatherAlertRequest,
     AIApplyDraftRequest,
@@ -55,6 +59,11 @@ from app.modules.intelligence.schemas import (
     ChatSendMessageRequest,
     DailyWeatherForecastSchema,
     TripWeatherResponse,
+    VoiceCommandRequest,
+    VoiceCommandResponse,
+    VoiceConfirmRequest,
+    VoiceConfirmResponse,
+    VoiceProvidersConfigResponse,
     WeatherAdaptationOptionSchema,
     WeatherVisitAlertSchema,
 )
@@ -1339,11 +1348,13 @@ async def _build_safe_trip_context_for_chat(
     db: AsyncSession,
     trip: Trip,
     destination: Destination,
+    current_user_id: str | None = None,
+    user_role: str = "OWNER",
 ) -> tuple[dict[str, Any], dict[str, Place], list[ItineraryItem]]:
     """
     Construit le contexte du voyage pour l'assistant de chat en respectant strictement :
     1. Aucune donnée d'un autre utilisateur ni d'un autre voyage,
-    2. Aucun document du coffre-fort (VaultDocument) ni jeton OAuth Google (google_oauth_tokens),
+    2. Aucun document déchiffré du coffre-fort (VaultDocument) ni jeton OAuth Google (google_oauth_tokens),
     3. Les descriptions de lieux sont encapsulées et nettoyées comme de simples données passives.
     """
     dest_tz = destination.timezone or "UTC"
@@ -1434,6 +1445,73 @@ async def _build_safe_trip_context_for_chat(
 
     flight_cost = float(flight_obj.price) if flight_obj else 0.0
     planned_total = float(trip.total_budget_planned or 2000.0)
+    budget_dict: dict[str, Any] = {
+        "planned_total": planned_total,
+        "flight_cost": flight_cost,
+        "visits_estimated_cost": round(visits_cost, 2),
+        "remaining_estimated": round(max(0.0, planned_total - flight_cost - visits_cost), 2),
+    }
+    try:
+        b_summary = await build_trip_budget_summary(db, trip, destination)
+        cat_parts = [
+            f"{c.label_fr} {float(c.spent_amount):.0f} {b_summary.currency}"
+            for c in b_summary.categories
+            if float(c.spent_amount) > 0
+        ]
+        budget_dict.update(
+            {
+                "planned_total": float(b_summary.total_planned),
+                "total_spent": float(b_summary.total_spent),
+                "committed_total": float(b_summary.total_spent),
+                "remaining_total": float(b_summary.remaining),
+                "remaining_estimated": float(b_summary.remaining),
+                "over_budget_alert": bool(b_summary.over_budget_alert),
+                "alert_message_fr": b_summary.alert_message_fr,
+                "categories_summary_fr": ", ".join(cat_parts),
+            }
+        )
+    except Exception:
+        pass
+
+    docs_summary_dict: dict[str, Any] = {
+        "visible_count": 0,
+        "titles": [],
+        "passport_expiration_alert": False,
+        "passport_alert_message_fr": None,
+    }
+    try:
+        docs_list = await build_trip_documents_list(
+            db,
+            trip,
+            destination,
+            current_user_id or trip.owner_id,
+            user_role,
+        )
+        docs_summary_dict = {
+            "visible_count": len(docs_list.documents),
+            "titles": [d.title for d in docs_list.documents],
+            "passport_expiration_alert": bool(docs_list.passport_expiration_alert),
+            "passport_alert_message_fr": docs_list.passport_alert_message_fr,
+        }
+    except Exception:
+        pass
+
+    city_key = (destination.city_name or "").strip().lower()
+    p_cat = (
+        DESTINATION_PRACTICAL_CATALOG.get(city_key)
+        or DESTINATION_PRACTICAL_CATALOG.get(destination.city_name)
+        or {}
+    )
+    practical_info_dict = {
+        "plugs": p_cat.get("plugs") or p_cat.get("plugs_fr") or "Prises locales",
+        "tipping": p_cat.get("tipping") or p_cat.get("tipping_fr") or "Variable selon le service",
+        "emergency": p_cat.get("emergency") or p_cat.get("emergency_fr") or "Urgences locales",
+        "dial_code": p_cat.get("dial_code") or "",
+        "currency": p_cat.get("currency") or p_cat.get("currency_fr") or trip.currency or "EUR",
+        "source": p_cat.get("source") or p_cat.get("source_fr") or "Conseils aux Voyageurs",
+        "updated_at_fr": p_cat.get("updated_at_fr") or "15 octobre 2026",
+    }
+
     safe_context = {
         "trip": {
             "id": trip.id,
@@ -1447,12 +1525,9 @@ async def _build_safe_trip_context_for_chat(
         },
         "flight": flight_data,
         "accommodation": acc_data,
-        "budget": {
-            "planned_total": planned_total,
-            "flight_cost": flight_cost,
-            "visits_estimated_cost": round(visits_cost, 2),
-            "remaining_estimated": round(max(0.0, planned_total - flight_cost - visits_cost), 2),
-        },
+        "budget": budget_dict,
+        "documents_summary": docs_summary_dict,
+        "practical_info": practical_info_dict,
         "weather": [w.model_dump() for w in weather_days],
         "itinerary": itinerary_safe,
         "available_places": available_places_safe,
@@ -1629,6 +1704,13 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         "duration",
         "transit_mode",
         "info_subtype",
+        "navigation_target",
+        "voice_command",
+        "day_number",
+        "requires_double_confirmation",
+        "confirmation_steps_required",
+        "confirmation_step",
+        "spoken_summary_fr",
     }
     unknown_top = set(raw_res.keys()) - allowed_keys
     if unknown_top:
@@ -1683,6 +1765,15 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         "REMOVE": "REMOVE_VISIT",
         "REMOVE_VISIT": "REMOVE_VISIT",
         "DELETE": "REMOVE_VISIT",
+        "BOOK": "BOOK_RESERVATION",
+        "BOOK_RESERVATION": "BOOK_RESERVATION",
+        "PAY": "PROCESS_PAYMENT",
+        "PROCESS_PAYMENT": "PROCESS_PAYMENT",
+        "NAVIGATE": "NAVIGATE",
+        "READ_DAY": "READ_DAY",
+        "READ_BUDGET": "READ_BUDGET",
+        "OPEN_DOCUMENTS": "OPEN_DOCUMENTS",
+        "OPEN_PRACTICAL_INFO": "OPEN_PRACTICAL_INFO",
         "INFO": "INFO",
         "INFO_PLACES": "INFO",
         "LIST": "INFO",
@@ -1696,11 +1787,15 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         raise ValueError(f"Valeur action_type hors schéma : {raw_act!r}")
     norm_act = action_map[act_upper]
 
-    if norm_act == "INFO":
+    if norm_act in {"INFO", "NAVIGATE", "READ_DAY", "READ_BUDGET", "OPEN_DOCUMENTS", "OPEN_PRACTICAL_INFO"}:
         return {
-            "action_type": "INFO",
+            "action_type": norm_act,
             "info_subtype": raw_res.get("info_subtype"),
+            "voice_command": raw_res.get("voice_command"),
+            "navigation_target": raw_res.get("navigation_target"),
+            "day_number": raw_res.get("day_number"),
             "place_name": raw_res.get("place_name"),
+            "visit_date": raw_res.get("visit_date"),
             "reply": str(reply_val or ""),
             "proposed_action": None,
         }
@@ -1791,6 +1886,7 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
             "proposed_action": None,
         }
 
+    needs_double = norm_act in {"REMOVE_VISIT", "BOOK_RESERVATION", "PROCESS_PAYMENT"}
     return {
         "action_type": norm_act,
         "reply": str(reply_val or ""),
@@ -1803,6 +1899,9 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
             "local_start_time": norm_time,
             "duration_minutes": norm_dur,
             "transit_mode": norm_tmode,
+            "requires_double_confirmation": needs_double,
+            "confirmation_steps_required": 2 if needs_double else 1,
+            "confirmation_step": 1,
         },
     }
 
@@ -2183,7 +2282,23 @@ async def send_trip_chat_message(
         )
         dur_hyb = round((time.perf_counter() - t0_hyb) * 1000, 2)
         cand_hyb = _validate_and_normalize_chat_llm_payload(raw_rules_hyb)
-        if cand_hyb.get("action_type") in {"ADD_VISIT", "MOVE_VISIT", "REMOVE_VISIT", "INFO"} or provider_mode != "real":
+        if (
+            cand_hyb.get("action_type")
+            in {
+                "ADD_VISIT",
+                "MOVE_VISIT",
+                "REMOVE_VISIT",
+                "BOOK_RESERVATION",
+                "PROCESS_PAYMENT",
+                "NAVIGATE",
+                "READ_DAY",
+                "READ_BUDGET",
+                "OPEN_DOCUMENTS",
+                "OPEN_PRACTICAL_INFO",
+                "INFO",
+            }
+            or provider_mode != "real"
+        ):
             validated_ai = cand_hyb
             logger.info(
                 "[CHAT_AI] strategy=hybrid(rules) | provider=SimulatedAIProvider | mode=rules | model=rules-deterministic | duration_ms=%.2f | attempt=1 | trip_id=%s",
@@ -2260,7 +2375,7 @@ async def send_trip_chat_message(
     is_info_reply = False
     is_duplicate_refusal = False
 
-    # Point 1 : Question d'information (autres lieux, horaires, météo, budget) -> Action INFO sans modification
+    # Point 1 : Question d'information (autres lieux, horaires, météo, budget) ou commande vocale de navigation/lecture -> sans modification
     if is_info_places_question or (
         validated_ai is not None
         and validated_ai.get("action_type") == "INFO"
@@ -2272,8 +2387,15 @@ async def send_trip_chat_message(
         )
         raw_action = None
         is_info_reply = True
-    elif validated_ai is not None and validated_ai.get("action_type") == "INFO":
-        if validated_ai.get("info_subtype") == "PLACES":
+    elif validated_ai is not None and validated_ai.get("action_type") in {
+        "INFO",
+        "NAVIGATE",
+        "READ_DAY",
+        "READ_BUDGET",
+        "OPEN_DOCUMENTS",
+        "OPEN_PRACTICAL_INFO",
+    }:
+        if validated_ai.get("action_type") == "INFO" and validated_ai.get("info_subtype") == "PLACES":
             reply_text = _format_unscheduled_places_info(
                 destination.city_name, places_by_id, existing_items
             )
@@ -2318,6 +2440,40 @@ async def send_trip_chat_message(
     )
 
     if isinstance(raw_action, dict) and raw_action.get("action_type") in {
+        "BOOK_RESERVATION",
+        "PROCESS_PAYMENT",
+    }:
+        act_type = str(raw_action["action_type"])
+        v_date_str = (
+            named_trip_date.isoformat()
+            if named_trip_date is not None
+            else str(raw_action.get("visit_date") or trip_dates[0].isoformat())
+        )
+        v_time_str = str(msg_extracted_time or raw_action.get("local_start_time") or "10:00")
+        dur_min = int(raw_action.get("duration_minutes") or 60)
+        t_mode = normalize_transit_mode(str(raw_action.get("transit_mode") or "METRO"))
+        proposed_action_dict = {
+            "action_type": act_type,
+            "item_id": None,
+            "place_id": str(raw_action.get("place_id") or f"voice-{act_type.lower()}"),
+            "place_name": str(raw_action.get("place_name") or ("Réservation" if act_type == "BOOK_RESERVATION" else "Paiement")),
+            "visit_date": v_date_str,
+            "local_start_time": v_time_str,
+            "local_end_time": None,
+            "duration_minutes": dur_min,
+            "transit_mode": t_mode,
+            "allow_duplicate": False,
+            "validated_by_engine": True,
+            "validation_error_code": None,
+            "validation_message_fr": None,
+            "suggested_slots": [],
+            "requires_double_confirmation": True,
+            "confirmation_steps_required": 2,
+            "confirmation_step": 1,
+            "spoken_summary_fr": reply_text,
+        }
+        action_status = "PENDING_CONFIRMATION"
+    elif isinstance(raw_action, dict) and raw_action.get("action_type") in {
         "ADD_VISIT",
         "MOVE_VISIT",
         "REMOVE_VISIT",
@@ -2412,6 +2568,10 @@ async def send_trip_chat_message(
                 "validation_error_code": None,
                 "validation_message_fr": None,
                 "suggested_slots": [],
+                "requires_double_confirmation": True,
+                "confirmation_steps_required": 2,
+                "confirmation_step": 1,
+                "spoken_summary_fr": reply_text,
             }
             action_status = "PENDING_CONFIRMATION"
         elif place_obj is not None and v_date_str is not None:
@@ -2619,6 +2779,10 @@ async def send_trip_chat_message(
                     "validation_error_code": val_res.reason_code if not val_res.valid else None,
                     "validation_message_fr": reply_text if not val_res.valid else None,
                     "suggested_slots": sug_dicts,
+                    "requires_double_confirmation": False,
+                    "confirmation_steps_required": 1,
+                    "confirmation_step": 1,
+                    "spoken_summary_fr": reply_text,
                 }
                 action_status = "PENDING_CONFIRMATION"
 
@@ -2653,7 +2817,13 @@ async def send_trip_chat_message(
     db.add(assistant_msg)
     await db.commit()
 
-    return await get_trip_chat_history(trip_id=trip.id, current_user=current_user, db=db)
+    conv_res = await get_trip_chat_history(trip_id=trip.id, current_user=current_user, db=db)
+    if conv_res.messages and validated_ai is not None:
+        if validated_ai.get("navigation_target"):
+            conv_res.messages[-1].navigation_target = str(validated_ai["navigation_target"])
+        if validated_ai.get("voice_command"):
+            conv_res.messages[-1].voice_command = str(validated_ai["voice_command"])
+    return conv_res
 
 
 @router.post(
@@ -2702,6 +2872,19 @@ async def confirm_chat_proposed_action(
     dur_min = int(action.get("duration_minutes") or 90)
     t_mode = normalize_transit_mode(str(action.get("transit_mode") or "METRO"))
     allow_dup = bool(action.get("allow_duplicate", False))
+
+    if act_type in {"BOOK_RESERVATION", "PROCESS_PAYMENT"}:
+        msg.action_status = "CONFIRMED"
+        await db.commit()
+        await db.refresh(msg)
+        label_fr = "La réservation" if act_type == "BOOK_RESERVATION" else "Le paiement"
+        return ChatActionDecisionResponse(
+            message=_serialize_chat_message(msg),
+            applied_change=True,
+            updated_item=None,
+            deleted_item_id=None,
+            detail_fr=f"Modification confirmée et appliquée : {label_fr} « {action.get('place_name')} » a bien été validé(e).",
+        )
 
     if act_type == "REMOVE_VISIT":
         if not item_id:
@@ -2894,3 +3077,667 @@ async def reject_chat_proposed_action(
         deleted_item_id=None,
         detail_fr="Proposition refusée : votre programme reste inchangé.",
     )
+
+
+# ==============================================================================
+# 4. ÉTAPE 5V — ACCESSIBILITÉ VOCALE (WEB SPEECH API / WHISPER LOCAL, CONFIRMATION VOCALE)
+# ==============================================================================
+@router.get("/voice/providers", response_model=VoiceProvidersConfigResponse)
+async def get_voice_providers_config(
+    current_user: User = Depends(get_current_user),
+) -> VoiceProvidersConfigResponse:
+    """
+    Retourne le fournisseur de reconnaissance vocale actif (Web Speech API fr-FR par défaut)
+    ainsi que l'alternative Whisper local derrière la même interface BaseVoiceSTTProvider,
+    avec le message de confidentialité associé.
+    """
+    _ = current_user
+    registry = get_provider_registry()
+    info = registry.voice_stt_info()
+    return VoiceProvidersConfigResponse(
+        active_provider=dict(info["active_provider"]),
+        available_providers=[dict(p) for p in info["available_providers"]],
+        supported_tts_rates=[0.8, 1.0, 1.2, 1.5],
+        default_language="fr-FR",
+        language="fr-FR",
+        hands_free_privacy_notice_fr=(
+            "En mode mains libres avec Web Speech API, l'audio peut transiter par le service de reconnaissance "
+            "du navigateur. Vous pouvez sélectionner Whisper local pour un traitement hors navigateur."
+        ),
+    )
+
+
+@router.post("/trip/{trip_id}/voice/command", response_model=VoiceCommandResponse)
+async def process_trip_voice_command(
+    trip_id: str,
+    payload: VoiceCommandRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VoiceCommandResponse:
+    """
+    Traite une commande vocale (ou un signal d'erreur micro/navigateur/silence/bruit)
+    via le même analyseur que le chat et le même contrôle d'accès (cookie HttpOnly, CSRF, RBAC).
+    - Commandes de lecture / navigation ("va à mon programme", "ouvre l'hébergement",
+      "lis-moi le jour 2", "lis-moi mon budget", "ouvre mes documents", "infos pratiques") :
+      accessibles aux rôles OWNER, EDITOR et VIEWER.
+    - Commandes de modification / action (ajout, déplacement, suppression, réservation, paiement) :
+      réservées aux rôles OWNER et EDITOR (403 pour VIEWER), et JAMAIS validées automatiquement :
+      l'assistant relit l'action comprise et exige une confirmation vocale explicite ("oui"),
+      avec double confirmation ("oui" deux fois) pour réservation, paiement et suppression.
+    """
+    trip, destination, user_role = await require_trip_access(
+        db,
+        trip_id,
+        current_user.id,
+        allowed_roles=READ_ROLES,
+    )
+
+    registry = get_provider_registry()
+    stt_provider = registry.resolve_voice_stt_provider(payload.provider)
+    stt_res = await stt_provider.transcribe(
+        transcript_text=payload.transcript,
+        audio_base64=payload.audio_base64,
+        signal=payload.signal,
+        confidence=payload.confidence,
+    )
+
+    if not stt_res["ok"]:
+        raw_err_code = str(stt_res.get("error_code") or payload.signal)
+        err_code = "NOISE_DETECTED" if raw_err_code == "NOISE" else raw_err_code
+        msg_fr = str(stt_res.get("message_fr") or "Pouvez-vous répéter ?")
+        if err_code == "UNRECOGNIZED_SPEECH" and (payload.transcript or "").strip():
+            db.add(
+                ChatUnrecognized(
+                    trip_id=trip.id,
+                    user_id=current_user.id,
+                    raw_message=(payload.transcript or "").strip(),
+                    reason="VOICE_LOW_CONFIDENCE_OR_UNRECOGNIZED",
+                    assistant_reply=msg_fr,
+                )
+            )
+            await db.commit()
+        status_label = (
+            "REPEAT_REQUIRED"
+            if err_code in {"NOISE", "NOISE_DETECTED", "UNRECOGNIZED_SPEECH"}
+            else "ERROR"
+        )
+        return VoiceCommandResponse(
+            ok=False,
+            status=status_label,
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal=str(stt_res.get("signal") or payload.signal),
+            error_code=err_code,
+            error_message_fr=msg_fr,
+            recognized_transcript=str(stt_res.get("transcript") or ""),
+            action_type="NONE",
+            voice_command=None,
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=msg_fr,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=None,
+            proposed_action=None,
+            applied_change=False,
+            message=None,
+        )
+
+    transcript_clean = str(stt_res.get("transcript") or "").strip()
+
+    # Analyse de l'intention avec le même analyseur que le chat
+    safe_context, _places_by_id, _existing_items = await _build_safe_trip_context_for_chat(
+        db,
+        trip,
+        destination,
+        current_user_id=current_user.id,
+        user_role=user_role,
+    )
+    prev_msgs_res = await db.scalars(
+        select(ChatMessage)
+        .where(ChatMessage.trip_id == trip.id)
+        .order_by(ChatMessage.created_at.desc())
+        .limit(10)
+    )
+    prev_msgs = list(reversed(prev_msgs_res.all()))
+    history_for_ai = [
+        {
+            "role": m.sender_role,
+            "content": m.content,
+            "proposed_action": m.proposed_action,
+            "action_status": m.action_status,
+        }
+        for m in prev_msgs
+    ]
+
+    rules_provider = SimulatedAIProvider(get_settings())
+    raw_rules = await rules_provider.generate_chat_reply(
+        user_message=transcript_clean,
+        safe_trip_context=safe_context,
+        chat_history=history_for_ai,
+    )
+    validated_voice = _validate_and_normalize_chat_llm_payload(raw_rules)
+    act_type = str(validated_voice.get("action_type") or "NONE")
+
+    # 1. Commandes de navigation ou de lecture vocale (READ_ROLES suffisant)
+    if act_type in {"NAVIGATE", "READ_DAY", "READ_BUDGET", "OPEN_DOCUMENTS", "OPEN_PRACTICAL_INFO", "INFO"}:
+        reply_fr = str(validated_voice.get("reply") or "").strip()
+        nav_target = validated_voice.get("navigation_target")
+        v_cmd = validated_voice.get("voice_command") or act_type
+        day_num = validated_voice.get("day_number")
+
+        user_msg = ChatMessage(
+            trip_id=trip.id,
+            sender_role="user",
+            content=transcript_clean,
+            proposed_action=None,
+            action_status="NONE",
+        )
+        assistant_msg = ChatMessage(
+            trip_id=trip.id,
+            sender_role="assistant",
+            content=reply_fr,
+            proposed_action=None,
+            action_status="NONE",
+        )
+        db.add(user_msg)
+        db.add(assistant_msg)
+        await db.commit()
+        await db.refresh(assistant_msg)
+
+        msg_schema = _serialize_chat_message(assistant_msg)
+        msg_schema.navigation_target = nav_target
+        msg_schema.voice_command = v_cmd
+
+        is_hf = bool(payload.hands_free)
+        return VoiceCommandResponse(
+            ok=True,
+            status="OK" if is_hf else "TRANSCRIBED_EDITABLE",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=is_hf,
+            editable_before_send=not is_hf,
+            auto_submitted=is_hf,
+            signal="SPEECH",
+            error_code=None,
+            error_message_fr=None,
+            recognized_transcript=transcript_clean,
+            action_type=act_type,
+            voice_command=v_cmd,
+            navigation_target=nav_target,
+            day_number=int(day_num) if day_num is not None else None,
+            spoken_reply_fr=reply_fr,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=assistant_msg.id,
+            proposed_action=None,
+            applied_change=False,
+            message=msg_schema,
+        )
+
+    # 2. Parole non comprise (ASK / NONE sans action reconnue) -> "Pouvez-vous répéter ?" sans aucune modification
+    raw_prop = validated_voice.get("proposed_action")
+    if act_type in {"ASK", "NONE"} and not isinstance(raw_prop, dict):
+        base_reply = str(validated_voice.get("reply") or "").strip()
+        if "pouvez-vous répéter" not in base_reply.lower():
+            spoken_repeat = f"Pouvez-vous répéter ? {base_reply}".strip()
+        else:
+            spoken_repeat = base_reply
+        db.add(
+            ChatUnrecognized(
+                trip_id=trip.id,
+                user_id=current_user.id,
+                raw_message=transcript_clean,
+                reason="VOICE_UNRECOGNIZED_COMMAND",
+                assistant_reply=spoken_repeat,
+            )
+        )
+        await db.commit()
+        return VoiceCommandResponse(
+            ok=False,
+            status="REPEAT_REQUIRED",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="UNRECOGNIZED_SPEECH",
+            error_code="UNRECOGNIZED_SPEECH",
+            error_message_fr=spoken_repeat,
+            recognized_transcript=transcript_clean,
+            action_type=act_type,
+            voice_command=None,
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=spoken_repeat,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=None,
+            proposed_action=None,
+            applied_change=False,
+            message=None,
+        )
+
+    # 3. Commande d'action (ADD_VISIT, MOVE_VISIT, REMOVE_VISIT, BOOK_RESERVATION, PROCESS_PAYMENT) :
+    #    - Contrôle d'accès en écriture strict (OWNER / EDITOR uniquement -> 403 pour VIEWER)
+    #    - Délègue à send_trip_chat_message qui crée la proposition en attente (PENDING_CONFIRMATION)
+    #      sans JAMAIS l'exécuter automatiquement.
+    await require_trip_access(
+        db,
+        trip_id,
+        current_user.id,
+        allowed_roles=WRITE_ROLES,
+    )
+    conv_resp = await send_trip_chat_message(
+        trip_id=trip.id,
+        payload=ChatSendMessageRequest(message=transcript_clean),
+        current_user=current_user,
+        db=db,
+    )
+    last_msg = conv_resp.messages[-1] if conv_resp.messages else None
+    prop = last_msg.proposed_action if last_msg else None
+
+    if prop is None or not last_msg or last_msg.action_status != "PENDING_CONFIRMATION":
+        reply_txt = last_msg.content if last_msg else "Pouvez-vous répéter votre demande ?"
+        return VoiceCommandResponse(
+            ok=True,
+            status="ASK",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="SPEECH",
+            error_code=None,
+            error_message_fr=None,
+            recognized_transcript=transcript_clean,
+            action_type="ASK",
+            voice_command=None,
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=reply_txt,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=last_msg.id if last_msg else None,
+            proposed_action=None,
+            applied_change=False,
+            message=last_msg,
+        )
+
+    needs_double = bool(
+        prop.requires_double_confirmation
+        or prop.action_type in {"REMOVE_VISIT", "BOOK_RESERVATION", "PROCESS_PAYMENT"}
+    )
+    steps_req = 2 if needs_double else 1
+    base_content = last_msg.content.strip()
+    if needs_double:
+        if "double confirmation" not in base_content.lower():
+            spoken_prompt = (
+                f"Action comprise : {base_content} "
+                "Cette action sensible nécessite une double confirmation vocale : "
+                "dites explicitement « oui » une première fois pour continuer, ou « non » (ou gardez le silence) pour annuler."
+            )
+        else:
+            spoken_prompt = base_content
+    else:
+        if "dites « oui »" not in base_content.lower() and "dites oui" not in base_content.lower():
+            spoken_prompt = (
+                f"Action comprise : {base_content} "
+                "Dites explicitement « oui » pour confirmer, ou « non » (ou gardez le silence) pour annuler."
+            )
+        else:
+            spoken_prompt = base_content
+
+    if not prop.spoken_summary_fr:
+        prop.spoken_summary_fr = spoken_prompt
+
+    return VoiceCommandResponse(
+        ok=True,
+        status="PENDING_CONFIRMATION",
+        trip_id=trip.id,
+        provider_id=stt_provider.provider_id,
+        provider_used=stt_provider.provider_id,
+        provider_label_fr=stt_provider.provider_label_fr,
+        language=stt_provider.language,
+        transits_browser_service=stt_provider.transits_browser_service,
+        privacy_notice_fr=stt_provider.privacy_notice_fr,
+        hands_free=bool(payload.hands_free),
+        editable_before_send=not bool(payload.hands_free),
+        auto_submitted=bool(payload.hands_free),
+        signal="SPEECH",
+        error_code=None,
+        error_message_fr=None,
+        recognized_transcript=transcript_clean,
+        action_type=prop.action_type,
+        voice_command=prop.action_type,
+        navigation_target=None,
+        day_number=None,
+        spoken_reply_fr=spoken_prompt,
+        requires_voice_confirmation=True,
+        requires_confirmation=True,
+        requires_double_confirmation=needs_double,
+        confirmation_steps_required=steps_req,
+        confirmation_step=1,
+        pending_message_id=last_msg.id,
+        message_id=last_msg.id,
+        proposed_action=prop,
+        applied_change=False,
+        message=last_msg,
+    )
+
+
+async def _handle_voice_confirmation_decision(
+    *,
+    trip_id: str,
+    message_id: str | None,
+    payload: VoiceConfirmRequest,
+    current_user: User,
+    db: AsyncSession,
+) -> VoiceConfirmResponse:
+    trip, _destination = await _load_trip_and_destination_strict(
+        db,
+        trip_id,
+        current_user.id,
+        write=True,
+    )
+
+    if message_id:
+        msg = await db.scalar(
+            select(ChatMessage).where(
+                ChatMessage.id == message_id,
+                ChatMessage.trip_id == trip.id,
+            )
+        )
+    else:
+        res = await db.scalars(
+            select(ChatMessage)
+            .where(
+                ChatMessage.trip_id == trip.id,
+                ChatMessage.action_status.in_(["PENDING_CONFIRMATION", "AWAITING_SECOND_CONFIRMATION"]),
+            )
+            .order_by(ChatMessage.created_at.desc())
+        )
+        msg = res.first()
+
+    if not msg or not msg.proposed_action:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Aucune proposition d'action en attente de confirmation vocale.",
+        )
+    if msg.action_status == "CONFIRMED":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cette proposition a déjà été confirmée.",
+        )
+
+    action = dict(msg.proposed_action)
+    act_type = str(action.get("action_type") or "")
+    needs_double = bool(
+        action.get("requires_double_confirmation")
+        or act_type in {"REMOVE_VISIT", "BOOK_RESERVATION", "PROCESS_PAYMENT"}
+    )
+    steps_req = 2 if needs_double else 1
+    cur_step = int(action.get("confirmation_step") or 1)
+
+    sig = (payload.signal or "SPEECH").strip().upper()
+    raw_txt = (payload.transcript or "").strip()
+    txt_norm = "".join(
+        c for c in unicodedata.normalize("NFD", raw_txt.lower()) if unicodedata.category(c) != "Mn"
+    )
+
+    # 1. Erreurs micro / navigateur / bruit / erreur de reconnaissance -> AUCUNE modification, proposition préservée
+    if sig in {"MIC_DENIED", "BROWSER_UNSUPPORTED", "NOISE", "UNRECOGNIZED_SPEECH"} or (
+        sig != "SILENCE" and payload.confidence < 0.35
+    ):
+        err_code = sig if sig != "SPEECH" else "UNRECOGNIZED_SPEECH"
+        spoken = (
+            "Pouvez-vous répéter ? Dites explicitement « oui » pour confirmer ou « non » pour annuler. "
+            "Aucune modification n'a été effectuée."
+        )
+        if err_code == "MIC_DENIED":
+            spoken = (
+                "Accès au microphone refusé. Aucune modification n'a été appliquée à votre programme."
+            )
+        elif err_code == "BROWSER_UNSUPPORTED":
+            spoken = (
+                "Navigateur non compatible avec la reconnaissance vocale. Aucune modification n'a été appliquée."
+            )
+        elif err_code == "NOISE":
+            spoken = (
+                "Bruit ambiant détecté. Pouvez-vous répéter « oui » ou « non » ? Aucune modification n'a été appliquée."
+            )
+        return VoiceConfirmResponse(
+            ok=False,
+            status="ERROR_NO_MODIFICATION",
+            trip_id=trip.id,
+            message_id=msg.id,
+            decision="ERROR_NO_MODIFICATION",
+            action_status=msg.action_status,  # type: ignore[arg-type]
+            applied_change=False,
+            pending_action_preserved=True,
+            requires_double_confirmation=needs_double,
+            confirmation_steps_required=steps_req,
+            confirmation_step=cur_step,
+            error_code=err_code,
+            spoken_reply_fr=spoken,
+            detail_fr=spoken,
+            message=_serialize_chat_message(msg),
+        )
+
+    # 2. Silence -> annule immédiatement la proposition sans modifier le programme
+    if sig == "SILENCE" or not txt_norm or re.search(r"^\s*(silence|muet)\s*$", txt_norm):
+        msg.action_status = "REJECTED"
+        await db.commit()
+        await db.refresh(msg)
+        spoken = "Silence détecté : l'action est annulée et aucune modification n'a été appliquée."
+        return VoiceConfirmResponse(
+            ok=True,
+            status="CANCELLED_BY_SILENCE",
+            trip_id=trip.id,
+            message_id=msg.id,
+            decision="CANCELLED_BY_SILENCE",
+            action_status="REJECTED",
+            applied_change=False,
+            pending_action_preserved=False,
+            requires_double_confirmation=needs_double,
+            confirmation_steps_required=steps_req,
+            confirmation_step=cur_step,
+            error_code=None,
+            spoken_reply_fr=spoken,
+            detail_fr=spoken,
+            message=_serialize_chat_message(msg),
+        )
+
+    # 3. "Non" explicite -> annule immédiatement la proposition sans modifier le programme
+    has_no = bool(re.search(r"\b(non|annule|annuler|annulation|refuse|refuser|stop|jamais)\b", txt_norm))
+    has_yes = bool(re.search(r"\b(oui)\b", txt_norm)) and not has_no
+
+    if has_no:
+        msg.action_status = "REJECTED"
+        await db.commit()
+        await db.refresh(msg)
+        spoken = "Confirmation refusée (« non ») : l'action est annulée et votre programme reste inchangé."
+        return VoiceConfirmResponse(
+            ok=True,
+            status="REJECTED",
+            trip_id=trip.id,
+            message_id=msg.id,
+            decision="CANCELLED_BY_NO",
+            action_status="REJECTED",
+            applied_change=False,
+            pending_action_preserved=False,
+            requires_double_confirmation=needs_double,
+            confirmation_steps_required=steps_req,
+            confirmation_step=cur_step,
+            error_code=None,
+            spoken_reply_fr=spoken,
+            detail_fr=spoken,
+            message=_serialize_chat_message(msg),
+        )
+
+    # 4. Parole qui n'est ni "oui" explicite ni "non" -> demande de répéter sans rien modifier
+    if not has_yes:
+        spoken = (
+            "Pouvez-vous répéter ? Pour votre sécurité, je n'applique jamais de validation automatique : "
+            "dites explicitement « oui » pour confirmer ou « non » pour annuler."
+        )
+        return VoiceConfirmResponse(
+            ok=False,
+            status="REPEAT_REQUIRED",
+            trip_id=trip.id,
+            message_id=msg.id,
+            decision="REPEAT_REQUIRED",
+            action_status=msg.action_status,  # type: ignore[arg-type]
+            applied_change=False,
+            pending_action_preserved=True,
+            requires_double_confirmation=needs_double,
+            confirmation_steps_required=steps_req,
+            confirmation_step=cur_step,
+            error_code="UNRECOGNIZED_SPEECH",
+            spoken_reply_fr=spoken,
+            detail_fr=spoken,
+            message=_serialize_chat_message(msg),
+        )
+
+    # 5. "Oui" explicite reçu :
+    #    - Si double confirmation requise (réservation, paiement, suppression) et étape 1 -> passe à l'étape 2 sans appliquer
+    if needs_double and cur_step < 2:
+        action["requires_double_confirmation"] = True
+        action["confirmation_steps_required"] = 2
+        action["confirmation_step"] = 2
+        msg.proposed_action = action
+        msg.action_status = "AWAITING_SECOND_CONFIRMATION"
+        await db.commit()
+        await db.refresh(msg)
+        place_lbl = str(action.get("place_name") or "cette action")
+        spoken = (
+            f"Première confirmation « oui » enregistrée pour « {place_lbl} ». "
+            "Attention : s'agissant d'une suppression, d'une réservation ou d'un paiement, "
+            "une seconde confirmation vocale est requise. Dites une deuxième fois « oui » pour valider définitivement, "
+            "ou « non » pour annuler."
+        )
+        return VoiceConfirmResponse(
+            ok=True,
+            status="AWAITING_SECOND_CONFIRMATION",
+            trip_id=trip.id,
+            message_id=msg.id,
+            decision="AWAITING_SECOND_CONFIRMATION",
+            action_status="AWAITING_SECOND_CONFIRMATION",
+            applied_change=False,
+            pending_action_preserved=True,
+            requires_double_confirmation=True,
+            confirmation_steps_required=2,
+            confirmation_step=2,
+            error_code=None,
+            spoken_reply_fr=spoken,
+            detail_fr=spoken,
+            message=_serialize_chat_message(msg),
+        )
+
+    # 6. Validation finale ("oui" sur action simple, ou 2e "oui" sur action à double confirmation)
+    decision_res = await confirm_chat_proposed_action(
+        trip_id=trip.id,
+        message_id=msg.id,
+        override_visit_date=None,
+        override_local_start_time=None,
+        current_user=current_user,
+        db=db,
+    )
+    return VoiceConfirmResponse(
+        ok=True,
+        status="CONFIRMED",
+        trip_id=trip.id,
+        message_id=msg.id,
+        decision="CONFIRMED",
+        action_status="CONFIRMED",
+        applied_change=decision_res.applied_change,
+        pending_action_preserved=False,
+        requires_double_confirmation=needs_double,
+        confirmation_steps_required=steps_req,
+        confirmation_step=steps_req,
+        error_code=None,
+        spoken_reply_fr=decision_res.detail_fr,
+        detail_fr=decision_res.detail_fr,
+        updated_item=decision_res.updated_item,
+        deleted_item_id=decision_res.deleted_item_id,
+        message=decision_res.message,
+    )
+
+
+@router.post("/trip/{trip_id}/voice/confirm", response_model=VoiceConfirmResponse)
+async def confirm_trip_voice_action(
+    trip_id: str,
+    payload: VoiceConfirmRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VoiceConfirmResponse:
+    """
+    Confirme ou annule vocalement la dernière proposition en attente sur le voyage.
+    """
+    return await _handle_voice_confirmation_decision(
+        trip_id=trip_id,
+        message_id=payload.message_id,
+        payload=payload,
+        current_user=current_user,
+        db=db,
+    )
+
+
+@router.post("/trip/{trip_id}/chat/{message_id}/voice-confirm", response_model=VoiceConfirmResponse)
+async def confirm_specific_chat_message_by_voice(
+    trip_id: str,
+    message_id: str,
+    payload: VoiceConfirmRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VoiceConfirmResponse:
+    """
+    Confirme ou annule vocalement une proposition spécifique identifiée par message_id.
+    """
+    return await _handle_voice_confirmation_decision(
+        trip_id=trip_id,
+        message_id=message_id,
+        payload=payload,
+        current_user=current_user,
+        db=db,
+    )
+

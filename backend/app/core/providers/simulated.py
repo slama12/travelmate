@@ -16,6 +16,7 @@ from app.core.providers.interfaces import (
     BaseGmailProvider,
     BasePlacesProvider,
     BaseRoutingProvider,
+    BaseVoiceSTTProvider,
     BaseWeatherProvider,
     CityNotSimulatedError,
 )
@@ -1010,6 +1011,368 @@ class SimulatedAIProvider(BaseAIProvider):
         ) and not has_move_verb and not has_remove_verb
 
         # ---------------------------------------------------------------------
+        # 00. COMMANDES VOCALES DE NAVIGATION, LECTURE (ÉTAPE 5V & 5A)
+        #     ET ACTIONS SENSIBLES À DOUBLE CONFIRMATION (RÉSERVATION, PAIEMENT)
+        # ---------------------------------------------------------------------
+        # 00a. Lecture vocale d'un jour précis : "lis-moi le jour 2", "lis le jour 1"
+        day_read_match = re.search(
+            r"\b(?:lis(?:[- ]moi)?|lisez(?:[- ]moi)?|lecture(?:\s+du)?|raconte(?:[- ]moi)?)\s+"
+            r"(?:le\s+|mon\s+)?jour\s*(\d+|un|deux|trois|quatre|cinq|six|sept)\b",
+            msg_lower,
+        )
+        if day_read_match:
+            word_to_num = {
+                "un": 1,
+                "deux": 2,
+                "trois": 3,
+                "quatre": 4,
+                "cinq": 5,
+                "six": 6,
+                "sept": 7,
+            }
+            raw_tok = day_read_match.group(1)
+            day_num = word_to_num.get(raw_tok, int(raw_tok) if raw_tok.isdigit() else 1)
+            day_idx = max(0, min(day_num - 1, len(trip_dates_iso) - 1))
+            target_day_iso = trip_dates_iso[day_idx]
+            day_items = [
+                it for it in itinerary_items if str(it.get("visit_date", ""))[:10] == target_day_iso
+            ]
+            day_items.sort(key=lambda x: str(x.get("local_start_time", "00:00")))
+            if day_items:
+                segments = [
+                    f"à {it.get('local_start_time', '10:00')}, {it.get('place_name', 'Visite')} ({it.get('duration_minutes', 90)} minutes)"
+                    for it in day_items
+                ]
+                day_reply = (
+                    f"Lecture vocale du jour {day_num} ({_fmt_date_fr(target_day_iso)}) à {city_name} : "
+                    f"{len(day_items)} visite(s) au programme — " + " ; puis ".join(segments) + "."
+                )
+            else:
+                day_reply = (
+                    f"Lecture vocale du jour {day_num} ({_fmt_date_fr(target_day_iso)}) à {city_name} : "
+                    "aucune visite n'est encore planifiée sur cette journée."
+                )
+            return {
+                "action_type": "READ_DAY",
+                "voice_command": "READ_DAY",
+                "navigation_target": "/itinerary",
+                "day_number": day_num,
+                "place_name": None,
+                "visit_date": target_day_iso,
+                "local_start_time": None,
+                "reply": day_reply,
+                "proposed_action": None,
+            }
+
+        # 00b. Écran 5A Budget : "lis-moi mon budget", "ouvre mon budget", "va à mon budget"
+        is_voice_budget_cmd = bool(
+            re.search(
+                r"\b(?:lis(?:[- ]moi)?|lisez(?:[- ]moi)?|lecture(?:\s+de)?|ouvre|ouvrir|"
+                r"va\s+(?:[àa]|au|vers|sur)|aller\s+(?:[àa]|au|vers|sur)|affiche|afficher)\s+"
+                r"(?:mon\s+|le\s+)?budget\b",
+                msg_lower,
+            )
+        )
+        if is_voice_budget_cmd:
+            budget_total = budget_info.get("planned_total", trip_info.get("total_budget_planned", 2000))
+            spent_total = budget_info.get(
+                "total_spent",
+                budget_info.get("committed_total", budget_info.get("flight_cost", 0)),
+            )
+            rem_total = budget_info.get(
+                "remaining_total",
+                budget_info.get("remaining_estimated", max(0, float(budget_total) - float(spent_total))),
+            )
+            currency = trip_info.get("currency", "EUR")
+            alert_msg = budget_info.get("alert_message_fr") or ""
+            cat_summary = budget_info.get("categories_summary_fr") or ""
+            reply_budget = (
+                f"Lecture vocale de votre budget pour {city_name} : budget total prévu de {float(budget_total):.2f} {currency}, "
+                f"total dépensé {float(spent_total):.2f} {currency}, solde restant {float(rem_total):.2f} {currency}."
+            )
+            if cat_summary:
+                reply_budget += f" Répartition : {cat_summary}."
+            if alert_msg:
+                reply_budget += f" {alert_msg}"
+            return {
+                "action_type": "READ_BUDGET",
+                "voice_command": "READ_BUDGET",
+                "navigation_target": "/trip/budget",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": reply_budget,
+                "proposed_action": None,
+            }
+
+        # 00c. Écran 5A Documents : "ouvre mes documents", "va à mes documents", "lis-moi mes documents"
+        is_voice_documents_cmd = bool(
+            re.search(
+                r"\b(?:(?:ouvre|ouvrir|va\s+(?:[àa]|aux|vers|sur)|aller\s+(?:[àa]|aux|vers|sur)|"
+                r"lis(?:[- ]moi)?|affiche|afficher)\s+(?:mes\s+|les\s+)?documents?|\bmes\s+documents?\b)",
+                msg_lower,
+            )
+        )
+        if is_voice_documents_cmd:
+            docs_meta = safe_trip_context.get("documents_summary") or {}
+            doc_count = int(docs_meta.get("visible_count", 0))
+            titles_list = docs_meta.get("titles") or []
+            passport_msg = docs_meta.get("passport_alert_message_fr")
+            if doc_count > 0:
+                titles_str = ", ".join(str(t) for t in titles_list[:4])
+                reply_docs = (
+                    f"Ouverture de vos documents pour {city_name} : vous avez {doc_count} document(s) chiffré(s) "
+                    f"accessible(s) ({titles_str})."
+                )
+            else:
+                reply_docs = (
+                    f"Ouverture de vos documents pour {city_name} : aucun document enregistré pour le moment."
+                )
+            if passport_msg:
+                reply_docs += f" {passport_msg}"
+            return {
+                "action_type": "OPEN_DOCUMENTS",
+                "voice_command": "OPEN_DOCUMENTS",
+                "navigation_target": "/trip/documents",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": reply_docs,
+                "proposed_action": None,
+            }
+
+        # 00d. Écran 5A Infos pratiques : "infos pratiques", "ouvre les infos pratiques", "lis-moi les infos pratiques"
+        is_voice_practical_cmd = bool(
+            re.search(r"\b(infos?\s+pratiques?|informations?\s+pratiques?)\b", msg_lower)
+        )
+        if is_voice_practical_cmd:
+            p_info = safe_trip_context.get("practical_info") or {}
+            plugs = p_info.get("plugs") or "Type C / E"
+            emerg = p_info.get("emergency") or "112"
+            curr_label = p_info.get("currency") or trip_info.get("currency", "EUR")
+            dial = p_info.get("dial_code") or "+33"
+            tipping = p_info.get("tipping") or "Selon satisfaction"
+            reply_practical = (
+                f"Infos pratiques pour {city_name} : prises électriques {plugs}. "
+                f"Urgences : {emerg}. Monnaie : {curr_label} (indicatif {dial}). "
+                f"Pourboires : {tipping}."
+            )
+            return {
+                "action_type": "OPEN_PRACTICAL_INFO",
+                "voice_command": "OPEN_PRACTICAL_INFO",
+                "navigation_target": "/trip/infos",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": reply_practical,
+                "proposed_action": None,
+            }
+
+        # 00e. Commandes de navigation vocales : "va à mon programme", "ouvre l'hébergement", etc.
+        is_nav_programme = bool(
+            re.search(
+                r"\b(?:va\s+(?:[àa]|au|vers|sur)|aller\s+(?:[àa]|au|vers|sur)|ouvre|ouvrir|affiche|afficher|"
+                r"retourne\s+(?:[àa]|au))\s+(?:mon\s+|le\s+)?programme\b",
+                msg_lower,
+            )
+        )
+        if is_nav_programme:
+            return {
+                "action_type": "NAVIGATE",
+                "voice_command": "NAVIGATE_ITINERARY",
+                "navigation_target": "/itinerary",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": (
+                    f"Navigation vocale vers votre programme à {city_name}. "
+                    f"Vous avez {len(itinerary_items)} visite(s) planifiée(s)."
+                ),
+                "proposed_action": None,
+            }
+
+        is_nav_accommodation = bool(
+            re.search(
+                r"\b(?:ouvre|ouvrir|va\s+(?:[àa]|aux|vers|sur)|aller\s+(?:[àa]|aux|vers|sur)|"
+                r"affiche|afficher|montre|montrer)\s+(?:l['’]\s*|les\s+|mon\s+)?(h[ée]bergements?|h[ôo]tels?|logements?)\b",
+                msg_lower,
+            )
+        )
+        if is_nav_accommodation:
+            acc_info = safe_trip_context.get("accommodation") or {}
+            acc_name = acc_info.get("name")
+            acc_suffix = f" Hébergement recommandé : {acc_name}." if acc_name else ""
+            return {
+                "action_type": "NAVIGATE",
+                "voice_command": "NAVIGATE_ACCOMMODATIONS",
+                "navigation_target": "/accommodations",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": f"Ouverture de l'écran des hébergements à {city_name}.{acc_suffix}",
+                "proposed_action": None,
+            }
+
+        is_nav_trip_hub = bool(
+            re.search(
+                r"\b(?:va\s+(?:[àa]|vers|sur)|aller\s+(?:[àa]|vers|sur)|ouvre|ouvrir|affiche|afficher)\s+"
+                r"(?:mon\s+|le\s+)?voyage\b",
+                msg_lower,
+            )
+        )
+        if is_nav_trip_hub:
+            return {
+                "action_type": "NAVIGATE",
+                "voice_command": "NAVIGATE_TRIP",
+                "navigation_target": "/trip",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": f"Ouverture de l'accueil Mon voyage pour {city_name}.",
+                "proposed_action": None,
+            }
+
+        is_nav_flights = bool(
+            re.search(
+                r"\b(?:ouvre|ouvrir|va\s+(?:[àa]|aux|vers|sur)|aller\s+(?:[àa]|aux|vers|sur)|"
+                r"affiche|afficher)\s+(?:les\s+|mes\s+|mon\s+)?vols?\b",
+                msg_lower,
+            )
+        )
+        if is_nav_flights:
+            return {
+                "action_type": "NAVIGATE",
+                "voice_command": "NAVIGATE_FLIGHTS",
+                "navigation_target": "/flights",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": f"Ouverture de l'écran des vols pour {city_name}.",
+                "proposed_action": None,
+            }
+
+        is_nav_activities = bool(
+            re.search(
+                r"\b(?:ouvre|ouvrir|va\s+(?:[àa]|aux|vers|sur)|aller\s+(?:[àa]|aux|vers|sur)|"
+                r"affiche|afficher)\s+(?:les\s+|mes\s+)?activit[ée]s?\b",
+                msg_lower,
+            )
+        )
+        if is_nav_activities:
+            return {
+                "action_type": "NAVIGATE",
+                "voice_command": "NAVIGATE_ACTIVITIES",
+                "navigation_target": "/activities",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": f"Ouverture du catalogue des activités à {city_name}.",
+                "proposed_action": None,
+            }
+
+        is_nav_settings = bool(
+            re.search(
+                r"\b(?:ouvre|ouvrir|va\s+(?:[àa]|aux|vers|sur)|aller\s+(?:[àa]|aux|vers|sur)|"
+                r"affiche|afficher)\s+(?:les\s+|mes\s+)?param[èe]tres?\b",
+                msg_lower,
+            )
+        )
+        if is_nav_settings:
+            return {
+                "action_type": "NAVIGATE",
+                "voice_command": "NAVIGATE_SETTINGS",
+                "navigation_target": "/settings",
+                "place_name": None,
+                "visit_date": None,
+                "local_start_time": None,
+                "reply": "Ouverture des paramètres et des options d'accessibilité vocale.",
+                "proposed_action": None,
+            }
+
+        # 00f. Actions sensibles soumises à DOUBLE CONFIRMATION vocale : Réservation & Paiement
+        is_booking_command = bool(
+            re.search(
+                r"\b(r[ée]server|r[ée]serve|r[ée]servez|confirmer?\s+la\s+r[ée]servation)\b",
+                msg_lower,
+            )
+        )
+        if is_booking_command:
+            acc_info = safe_trip_context.get("accommodation") or {}
+            flight_info = safe_trip_context.get("flight") or {}
+            if "vol" in msg_lower or "avion" in msg_lower:
+                booking_label = (
+                    f"Vol {flight_info.get('airline', 'Air France')} ({city_name})"
+                )
+            else:
+                booking_label = acc_info.get("name") or f"Hébergement sélectionné à {city_name}"
+            first_place_id = (
+                str(available_places[0]["id"]) if available_places else "reservation-target"
+            )
+            return {
+                "action_type": "BOOK_RESERVATION",
+                "place_name": booking_label,
+                "visit_date": trip_dates_iso[0],
+                "local_start_time": "14:00",
+                "reply": (
+                    f"Action comprise : réserver « {booking_label} » pour votre séjour à {city_name}. "
+                    "Cette réservation nécessite une double confirmation vocale. "
+                    "Première confirmation : dites « oui » pour confirmer, ou « non » (ou gardez le silence) pour annuler."
+                ),
+                "proposed_action": {
+                    "action_type": "BOOK_RESERVATION",
+                    "item_id": None,
+                    "place_id": first_place_id,
+                    "place_name": booking_label,
+                    "visit_date": trip_dates_iso[0],
+                    "local_start_time": "14:00",
+                    "duration_minutes": 60,
+                    "transit_mode": "METRO",
+                    "requires_double_confirmation": True,
+                    "confirmation_steps_required": 2,
+                    "confirmation_step": 1,
+                },
+            }
+
+        is_payment_command = bool(
+            re.search(
+                r"\b(payer|paie|paye|payez|effectuer?\s+le\s+paiement|valider?\s+le\s+paiement|"
+                r"r[ée]gler\s+(?:la\s+r[ée]servation|le\s+s[ée]jour|l['’]h[ôo]tel|le\s+vol))\b",
+                msg_lower,
+            )
+        )
+        if is_payment_command:
+            budget_total = budget_info.get("planned_total", trip_info.get("total_budget_planned", 2000))
+            currency = trip_info.get("currency", "EUR")
+            payment_label = f"Paiement réservation séjour {city_name} ({budget_total} {currency})"
+            first_place_id = (
+                str(available_places[0]["id"]) if available_places else "payment-target"
+            )
+            return {
+                "action_type": "PROCESS_PAYMENT",
+                "place_name": payment_label,
+                "visit_date": trip_dates_iso[0],
+                "local_start_time": "12:00",
+                "reply": (
+                    f"Action comprise : effectuer le « {payment_label} ». "
+                    "Ce paiement nécessite une double confirmation vocale. "
+                    "Première confirmation : dites « oui » pour confirmer, ou « non » (ou gardez le silence) pour annuler."
+                ),
+                "proposed_action": {
+                    "action_type": "PROCESS_PAYMENT",
+                    "item_id": None,
+                    "place_id": first_place_id,
+                    "place_name": payment_label,
+                    "visit_date": trip_dates_iso[0],
+                    "local_start_time": "12:00",
+                    "duration_minutes": 30,
+                    "transit_mode": "METRO",
+                    "requires_double_confirmation": True,
+                    "confirmation_steps_required": 2,
+                    "confirmation_step": 1,
+                },
+            }
+
+        # ---------------------------------------------------------------------
         # 0. QUESTIONS D'INFORMATION (Action INFO : autres lieux, horaires, météo, budget)
         # ---------------------------------------------------------------------
         # 0a. Autres lieux à visiter non présents au programme
@@ -1182,6 +1545,9 @@ class SimulatedAIProvider(BaseAIProvider):
                         "local_start_time": target_item["local_start_time"],
                         "duration_minutes": int(target_item.get("duration_minutes", 90)),
                         "transit_mode": target_item.get("transit_mode", "METRO"),
+                        "requires_double_confirmation": True,
+                        "confirmation_steps_required": 2,
+                        "confirmation_step": 1,
                     },
                 }
             if explicit_catalog_place is not None:
@@ -1487,3 +1853,203 @@ class SimulatedRoutingProvider(BaseRoutingProvider):
             "provider": "SimulatedHaversine",
             "label_fr": "Temps estimé",
         }
+
+
+def _normalize_voice_stt_signal(
+    *,
+    provider_id: str,
+    provider_label_fr: str,
+    transits_browser_service: bool,
+    privacy_notice_fr: str,
+    transcript_text: str | None = None,
+    audio_base64: str | None = None,
+    signal: str = "SPEECH",
+    confidence: float = 0.95,
+) -> dict[str, Any]:
+    sig = (signal or "SPEECH").strip().upper()
+    cleaned_text = (transcript_text or "").strip()
+
+    if sig == "MIC_DENIED":
+        return {
+            "ok": False,
+            "signal": "MIC_DENIED",
+            "error_code": "MIC_DENIED",
+            "transcript": "",
+            "confidence": 0.0,
+            "language": "fr-FR",
+            "provider_id": provider_id,
+            "provider_label_fr": provider_label_fr,
+            "transits_browser_service": transits_browser_service,
+            "privacy_notice_fr": privacy_notice_fr,
+            "message_fr": (
+                "Accès au microphone refusé. Veuillez autoriser le microphone dans les paramètres "
+                "du navigateur ou saisir votre demande au clavier. Aucune modification n'a été appliquée."
+            ),
+        }
+
+    if sig == "BROWSER_UNSUPPORTED":
+        return {
+            "ok": False,
+            "signal": "BROWSER_UNSUPPORTED",
+            "error_code": "BROWSER_UNSUPPORTED",
+            "transcript": "",
+            "confidence": 0.0,
+            "language": "fr-FR",
+            "provider_id": provider_id,
+            "provider_label_fr": provider_label_fr,
+            "transits_browser_service": transits_browser_service,
+            "privacy_notice_fr": privacy_notice_fr,
+            "message_fr": (
+                "Navigateur non compatible avec la Web Speech API (fr-FR). "
+                "Vous pouvez basculer sur le fournisseur Whisper local dans les Paramètres ou utiliser le clavier."
+            ),
+        }
+
+    if sig == "NOISE":
+        return {
+            "ok": False,
+            "signal": "NOISE",
+            "error_code": "NOISE",
+            "transcript": "",
+            "confidence": 0.0,
+            "language": "fr-FR",
+            "provider_id": provider_id,
+            "provider_label_fr": provider_label_fr,
+            "transits_browser_service": transits_browser_service,
+            "privacy_notice_fr": privacy_notice_fr,
+            "message_fr": (
+                "Bruit ambiant trop élevé détecté. Pouvez-vous répéter ? "
+                "Aucune modification n'a été effectuée."
+            ),
+        }
+
+    if sig == "SILENCE":
+        return {
+            "ok": False,
+            "signal": "SILENCE",
+            "error_code": "SILENCE",
+            "transcript": "",
+            "confidence": 0.0,
+            "language": "fr-FR",
+            "provider_id": provider_id,
+            "provider_label_fr": provider_label_fr,
+            "transits_browser_service": transits_browser_service,
+            "privacy_notice_fr": privacy_notice_fr,
+            "message_fr": "Silence détecté : écoute arrêtée sans aucune modification.",
+        }
+
+    if sig == "UNRECOGNIZED_SPEECH" or confidence < 0.35 or (not cleaned_text and not audio_base64):
+        return {
+            "ok": False,
+            "signal": "UNRECOGNIZED_SPEECH",
+            "error_code": "UNRECOGNIZED_SPEECH",
+            "transcript": cleaned_text,
+            "confidence": float(confidence),
+            "language": "fr-FR",
+            "provider_id": provider_id,
+            "provider_label_fr": provider_label_fr,
+            "transits_browser_service": transits_browser_service,
+            "privacy_notice_fr": privacy_notice_fr,
+            "message_fr": "Pouvez-vous répéter ? Je n'ai pas compris votre parole.",
+        }
+
+    return {
+        "ok": True,
+        "signal": "SPEECH",
+        "error_code": None,
+        "transcript": cleaned_text,
+        "confidence": float(confidence),
+        "language": "fr-FR",
+        "provider_id": provider_id,
+        "provider_label_fr": provider_label_fr,
+        "transits_browser_service": transits_browser_service,
+        "privacy_notice_fr": privacy_notice_fr,
+        "message_fr": f"Transcription vocale ({provider_label_fr}) : « {cleaned_text} ».",
+    }
+
+
+class WebSpeechSTTProvider(BaseVoiceSTTProvider):
+    """Adaptateur Web Speech API (fr-FR, côté navigateur)."""
+
+    provider_id = "web_speech"
+    provider_label_fr = "Web Speech API (navigateur, fr-FR)"
+    language = "fr-FR"
+    transits_browser_service = True
+    privacy_notice_fr = (
+        "Confidentialité vocale : en utilisant la Web Speech API, l'audio peut transiter "
+        "par le service de reconnaissance du navigateur."
+    )
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings
+
+    async def transcribe(
+        self,
+        *,
+        transcript_text: str | None = None,
+        audio_base64: str | None = None,
+        signal: str = "SPEECH",
+        confidence: float = 0.95,
+    ) -> dict[str, Any]:
+        return _normalize_voice_stt_signal(
+            provider_id=self.provider_id,
+            provider_label_fr=self.provider_label_fr,
+            transits_browser_service=self.transits_browser_service,
+            privacy_notice_fr=self.privacy_notice_fr,
+            transcript_text=transcript_text,
+            audio_base64=audio_base64,
+            signal=signal,
+            confidence=confidence,
+        )
+
+
+class LocalWhisperSTTProvider(BaseVoiceSTTProvider):
+    """
+    Adaptateur Whisper local (fr-FR) derrière la même interface BaseVoiceSTTProvider.
+    Permet de remplacer la Web Speech API du navigateur sans modifier l'analyseur ni les écrans.
+    """
+
+    provider_id = "whisper_local"
+    provider_label_fr = "Whisper local (fr-FR, traitement local)"
+    language = "fr-FR"
+    transits_browser_service = False
+    privacy_notice_fr = (
+        "Confidentialité vocale : avec Whisper local, l'audio est transcrit localement "
+        "sans transiter par le service de reconnaissance du navigateur."
+    )
+
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings
+        self.model_name = settings.WHISPER_LOCAL_MODEL if settings else "whisper-small-fr"
+
+    async def transcribe(
+        self,
+        *,
+        transcript_text: str | None = None,
+        audio_base64: str | None = None,
+        signal: str = "SPEECH",
+        confidence: float = 0.96,
+    ) -> dict[str, Any]:
+        res = _normalize_voice_stt_signal(
+            provider_id=self.provider_id,
+            provider_label_fr=self.provider_label_fr,
+            transits_browser_service=self.transits_browser_service,
+            privacy_notice_fr=self.privacy_notice_fr,
+            transcript_text=transcript_text,
+            audio_base64=audio_base64,
+            signal=signal,
+            confidence=confidence,
+        )
+        res["whisper_model"] = self.model_name
+        return res
+
+
+def get_voice_stt_provider(
+    provider_mode: str | None = None,
+    settings: Settings | None = None,
+) -> BaseVoiceSTTProvider:
+    mode = (provider_mode or (settings.VOICE_STT_PROVIDER_MODE if settings else "web_speech")).strip().lower()
+    if mode in {"whisper", "whisper_local", "local_whisper"}:
+        return LocalWhisperSTTProvider(settings=settings)
+    return WebSpeechSTTProvider(settings=settings)
+

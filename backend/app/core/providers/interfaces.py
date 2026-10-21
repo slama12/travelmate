@@ -209,3 +209,38 @@ class BaseRoutingProvider(BaseServiceProvider, ABC):
         mode: str = "METRO",
     ) -> dict[str, Any]:
         """Calcule le temps de trajet et la distance entre deux coordonnées (réel ou estimé)."""
+
+
+class BaseVoiceSTTProvider(ABC):
+    """
+    Interface commune de reconnaissance vocale (Étape 5V).
+    Permet de remplacer la Web Speech API du navigateur par Whisper local derrière la même interface.
+    """
+
+    provider_id: str
+    provider_label_fr: str
+    language: str = "fr-FR"
+    transits_browser_service: bool = False
+    privacy_notice_fr: str = ""
+
+    @abstractmethod
+    async def transcribe(
+        self,
+        *,
+        transcript_text: str | None = None,
+        audio_base64: str | None = None,
+        signal: str = "SPEECH",
+        confidence: float = 0.95,
+    ) -> dict[str, Any]:
+        """Transcrit l'entrée vocale ou normalise le signal de reconnaissance (SPEECH, SILENCE, NOISE, MIC_DENIED, BROWSER_UNSUPPORTED)."""
+
+    def provider_metadata(self) -> dict[str, Any]:
+        return {
+            "provider_id": self.provider_id,
+            "provider_label_fr": self.provider_label_fr,
+            "implementation": self.__class__.__name__,
+            "language": self.language,
+            "transits_browser_service": self.transits_browser_service,
+            "privacy_notice_fr": self.privacy_notice_fr,
+        }
+

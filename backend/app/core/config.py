@@ -7,6 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderMode = Literal["simulated", "real"]
 ChatStrategyMode = Literal["rules", "hybrid", "model"]
+VoiceSTTProviderMode = Literal["web_speech", "whisper_local"]
 
 _ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"
 _LOCAL_ENV = Path(__file__).resolve().parents[2] / ".env"
@@ -78,6 +79,10 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = Field(default="http://host.docker.internal:11434")
     OLLAMA_MODEL: str = Field(default="mistral")
     OLLAMA_TIMEOUT_SECONDS: float = Field(default=90.0, ge=1.0)
+
+    # --- Accessibilité vocale (Étape 5V : Web Speech API fr-FR remplaçable par Whisper local) ---
+    VOICE_STT_PROVIDER_MODE: VoiceSTTProviderMode = Field(default="web_speech")
+    WHISPER_LOCAL_MODEL: str = Field(default="whisper-small-fr")
 
     PLACES_PROVIDER_MODE: ProviderMode = Field(default="simulated")
     GOOGLE_PLACES_API_KEY: str = Field(default="")
