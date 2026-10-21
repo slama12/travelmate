@@ -12,7 +12,9 @@ from app.core.redis import cache_client
 from app.core.seed import seed_initial_data
 from app.modules.accommodations import router as accommodations_router
 from app.modules.auth import router as auth_router
+from app.modules.budget.router import router as budget_router
 from app.modules.destinations import router as destinations_router
+from app.modules.documents.router import router as documents_router
 from app.modules.flights import router as flights_router
 from app.modules.health import router as health_router
 from app.modules.intelligence.router import router as intelligence_router
@@ -51,7 +53,7 @@ def create_app() -> FastAPI:
         version=settings.APP_VERSION,
         description=(
             "Application web modulaire de voyage complète "
-            "(Étapes 1 à 4 : Socle, Réservation, Géospatial, Planification, Météo, Itinéraire IA, Chat & Trajets)."
+            "(Étapes 1 à 5A : Socle, Réservation, Géospatial, Planification, Météo, Itinéraire IA, Chat, Budget, Documents, Infos pratiques & RBAC)."
         ),
         lifespan=lifespan,
     )
@@ -84,6 +86,11 @@ def create_app() -> FastAPI:
 
     # Modules Étape 4 : Météo, Itinéraire IA en brouillon, Assistant de chat & Temps de trajet réels/estimés
     app.include_router(intelligence_router, prefix=settings.API_V1_STR)
+
+    # Modules Étape 5A : Budget, Documents chiffrés, Rappel passeport
+    app.include_router(budget_router, prefix=f"{settings.API_V1_STR}/budget", tags=["Budget"])
+    app.include_router(documents_router, prefix=f"{settings.API_V1_STR}/documents", tags=["Documents"])
+    app.include_router(documents_router, prefix=f"{settings.API_V1_STR}/vault", tags=["Documents"])
 
     return app
 

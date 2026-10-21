@@ -53,13 +53,17 @@ import {
   AccommodationsScreen,
   ActivitiesScreen,
   AdminTechnicalStatusScreen,
+  clearOfflineDocumentsCache,
   type Destination,
   ItineraryScreen,
   MyTripSummaryScreen,
   SettingsScreen,
   type TravelerPreferences,
   type Trip,
+  TripBudgetScreen,
+  TripDocumentsScreen,
   type TripGalleryPayload,
+  TripPracticalInfoScreen,
 } from "./EnvoiCScreens";
 
 const RAW_API_BASE = String(
@@ -72,6 +76,79 @@ export const API_BASE = RAW_API_BASE.replace(/\/api\/v1\/?$/i, "").replace(
 
 const TOKEN_STORAGE_KEY = "travelmate_jwt_token";
 const USER_STORAGE_KEY = "travelmate_user_profile";
+export const SESSION_COOKIE_MARKER = "cookie-session";
+
+let inMemoryCsrfToken = "";
+
+export function readCsrfCookie(): string {
+  if (typeof document === "undefined" || !document.cookie) {
+    return inMemoryCsrfToken;
+  }
+  const match = document.cookie.match(/(?:^|;\s*)tm_csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : inMemoryCsrfToken;
+}
+
+export function setInMemoryCsrfToken(token?: string | null): void {
+  if (token && typeof token === "string") {
+    inMemoryCsrfToken = token;
+  }
+}
+
+function installSecureCookieFetchInterceptor(): void {
+  if (typeof window === "undefined" || typeof window.fetch !== "function") {
+    return;
+  }
+  const w = window as any;
+  if (w.__tmSecureFetchInstalled) return;
+  w.__tmSecureFetchInstalled = true;
+
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.toString()
+        : input.url;
+
+    const isBackendCall =
+      urlStr.startsWith(API_BASE) ||
+      urlStr.startsWith("/api/") ||
+      urlStr.includes("/api/v1/") ||
+      urlStr.endsWith("/health");
+
+    if (!isBackendCall) {
+      return nativeFetch(input, init);
+    }
+
+    const nextInit: RequestInit = { ...(init || {}) };
+    nextInit.credentials = "include";
+
+    const headers = new Headers(init?.headers || {});
+    const authHeader = headers.get("Authorization") || "";
+    if (
+      authHeader === `Bearer ${SESSION_COOKIE_MARKER}` ||
+      authHeader === "Bearer ssr-demo-token" ||
+      authHeader === "Bearer "
+    ) {
+      headers.delete("Authorization");
+    }
+
+    const method = (nextInit.method || "GET").toUpperCase();
+    if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+      const csrf = readCsrfCookie();
+      if (csrf && !headers.has("X-CSRF-Token")) {
+        headers.set("X-CSRF-Token", csrf);
+      }
+    }
+
+    nextInit.headers = headers;
+    const response = await nativeFetch(input, nextInit);
+    return response;
+  };
+}
+
+installSecureCookieFetchInterceptor();
 
 export interface UserProfile {
   id: string;
@@ -1264,7 +1341,8 @@ function AuthScreen({
       }
 
       const data = await resp.json();
-      await onAuthSuccess(data.access_token, data.user);
+      setInMemoryCsrfToken(data.csrf_token);
+      await onAuthSuccess(SESSION_COOKIE_MARKER, data.user);
       notify({
         title: mode === "login" ? "Bon retour parmi nous" : "Bienvenue sur TravelMate",
         description: `Connecté en tant que ${data.user.full_name}`,
@@ -1294,7 +1372,8 @@ function AuthScreen({
       });
       if (resp.ok) {
         const data = await resp.json();
-        await onAuthSuccess(data.access_token, data.user);
+        setInMemoryCsrfToken(data.csrf_token);
+        await onAuthSuccess(SESSION_COOKIE_MARKER, data.user);
         navigate("/");
       }
     } finally {
@@ -1466,7 +1545,9 @@ export function TravelMateShell({
   const navigate = useNavigate();
   const [token, setToken] = useState<string>(() => {
     if (typeof localStorage === "undefined") return "ssr-demo-token";
-    return localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+    // Aucun jeton de session n'est conservé dans localStorage (cookie HttpOnly tm_access_token)
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    return SESSION_COOKIE_MARKER;
   });
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
     if (typeof localStorage === "undefined") {
@@ -1518,14 +1599,20 @@ export function TravelMateShell({
     travelStyle: "STANDARD",
   });
 
-  function persistSession(accessToken: string, user: UserProfile) {
-    localStorage.setItem(TOKEN_STORAGE_KEY, accessToken);
+  function persistSession(_sessionMarker: string, user: UserProfile) {
+    // Le jeton de session est stocké exclusivement dans le cookie HttpOnly tm_access_token
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
     localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(user));
-    setToken(accessToken);
+    setToken(SESSION_COOKIE_MARKER);
     setCurrentUser(user);
   }
 
   function handleLogout() {
+    fetch(`${API_BASE}/api/v1/auth/logout`, {
+      method: "POST",
+      credentials: "include",
+    }).catch(() => null);
+    clearOfflineDocumentsCache();
     localStorage.removeItem(TOKEN_STORAGE_KEY);
     localStorage.removeItem(USER_STORAGE_KEY);
     setToken("");
@@ -1589,6 +1676,7 @@ export function TravelMateShell({
     async function bootstrap() {
       setIsLoadingDestinations(true);
       try {
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
         const dResp = await fetch(`${API_BASE}/api/v1/destinations`);
         let destList: Destination[] = [];
         if (dResp.ok) {
@@ -1596,19 +1684,23 @@ export function TravelMateShell({
           setDestinations(destList);
         }
 
-        const storedToken = localStorage.getItem(TOKEN_STORAGE_KEY);
-        if (storedToken) {
-          const meResp = await fetch(`${API_BASE}/api/v1/auth/me`, {
-            headers: { Authorization: `Bearer ${storedToken}` },
-          });
-          if (meResp.ok) {
-            const meData: UserProfile = await meResp.json();
-            persistSession(storedToken, meData);
-            await loadUserTripsAndEnsureActive(storedToken, destList);
-            return;
+        // 1. Vérification d'une session active par cookie HttpOnly (tm_access_token)
+        const meResp = await fetch(`${API_BASE}/api/v1/auth/me`);
+        if (meResp.ok) {
+          const meData: UserProfile = await meResp.json();
+          const csrfResp = await fetch(`${API_BASE}/api/v1/auth/csrf`).catch(
+            () => null
+          );
+          if (csrfResp && csrfResp.ok) {
+            const csrfJson = await csrfResp.json();
+            setInMemoryCsrfToken(csrfJson.csrf_token);
           }
+          persistSession(SESSION_COOKIE_MARKER, meData);
+          await loadUserTripsAndEnsureActive(SESSION_COOKIE_MARKER, destList);
+          return;
         }
 
+        // 2. Connexion automatique de démonstration via cookie HttpOnly + jeton CSRF
         const loginResp = await fetch(`${API_BASE}/api/v1/auth/login`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1619,8 +1711,9 @@ export function TravelMateShell({
         });
         if (loginResp.ok) {
           const authData = await loginResp.json();
-          persistSession(authData.access_token, authData.user);
-          await loadUserTripsAndEnsureActive(authData.access_token, destList);
+          setInMemoryCsrfToken(authData.csrf_token);
+          persistSession(SESSION_COOKIE_MARKER, authData.user);
+          await loadUserTripsAndEnsureActive(SESSION_COOKIE_MARKER, destList);
         }
       } finally {
         setIsLoadingDestinations(false);
@@ -1726,32 +1819,37 @@ export function TravelMateShell({
     <div className="min-h-screen flex flex-col bg-canvas text-ink overflow-x-hidden">
       {/* Navigation finale : barre de progression Destination > Vol > Hébergement > Activités > Programme */}
       <header className="sticky top-0 z-30 border-b border-border bg-canvas-card/95 backdrop-blur">
-        <div className="mx-auto max-w-[1440px] px-4 h-16 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2 xl:gap-3 min-w-0">
+        <div
+          className="mx-auto max-w-[1440px] px-3 h-16 flex items-center justify-between gap-2 flex-nowrap"
+          data-testid="desktop-top-header-row"
+        >
+          <div className="flex items-center gap-2 flex-nowrap shrink-0">
             <Link
               to="/"
               data-testid="header-brand-link"
-              className="flex items-center gap-2 text-ink font-semibold text-h2 tracking-tight whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 rounded-md"
+              style={{ whiteSpace: "nowrap" }}
+              className="flex items-center gap-1.5 text-ink font-semibold text-h2 tracking-tight whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 rounded-md"
             >
-              <span className="flex h-8 w-8 xl:h-9 xl:w-9 items-center justify-center rounded-card bg-brand-700 text-white shrink-0">
+              <span className="flex h-8 w-8 items-center justify-center rounded-card bg-brand-700 text-white shrink-0">
                 <Plane className="h-4 w-4" />
               </span>
-              <span>TravelMate</span>
+              <span style={{ whiteSpace: "nowrap" }}>TravelMate</span>
             </Link>
 
             {/* Barre de progression sur ordinateur (>= 1280px) */}
             <nav
               aria-label="Étapes de votre voyage"
               data-testid="step-progress-bar"
-              className="hidden xl:flex items-center gap-0.5 shrink-0"
+              className="hidden xl:flex items-center gap-0.5 flex-nowrap shrink-0"
             >
               {progressSteps.map((step, index) => (
                 <React.Fragment key={step.to}>
                   <NavLink
                     to={step.to}
                     end={step.end}
+                    style={{ whiteSpace: "nowrap" }}
                     className={({ isActive }) =>
-                      `inline-flex items-center gap-1 px-2 py-1 rounded-card text-[12px] font-semibold whitespace-nowrap shrink-0 transition-colors ${
+                      `inline-flex items-center gap-1 px-2 py-1 rounded-card text-[12px] leading-none font-semibold whitespace-nowrap shrink-0 transition-colors ${
                         isActive
                           ? "bg-brand-700 text-white shadow-sm"
                           : "text-ink-secondary hover:text-ink hover:bg-canvas-subtle"
@@ -1761,7 +1859,7 @@ export function TravelMateShell({
                     <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-black/10 text-[10px] font-bold shrink-0">
                       {index + 1}
                     </span>
-                    <span>{step.label}</span>
+                    <span style={{ whiteSpace: "nowrap" }}>{step.label}</span>
                   </NavLink>
                   {index < progressSteps.length - 1 && (
                     <ChevronRight
@@ -1774,23 +1872,26 @@ export function TravelMateShell({
             </nav>
           </div>
 
-          <div className="flex items-center gap-1.5 shrink-0">
+          <div className="flex items-center gap-1.5 flex-nowrap shrink-0">
             {activeDestination && (
               <Badge
                 variant="brand"
-                className="hidden sm:inline-flex whitespace-nowrap shrink-0 px-2 py-0.5 text-[12px]"
+                className="hidden sm:inline-flex whitespace-nowrap shrink-0 px-2 py-0.5 text-[12px] leading-none"
                 data-testid="active-destination-pill"
               >
                 <MapPin className="h-3 w-3 shrink-0" />
-                <span>{activeDestination.city_name}</span>
+                <span style={{ whiteSpace: "nowrap" }}>
+                  {activeDestination.city_name}
+                </span>
               </Badge>
             )}
 
             <NavLink
               to="/trip"
               data-testid="nav-my-trip-link"
+              style={{ whiteSpace: "nowrap" }}
               className={({ isActive }) =>
-                `inline-flex items-center gap-1 px-2.5 py-1 rounded-card text-[12px] font-semibold whitespace-nowrap shrink-0 transition-colors ${
+                `inline-flex items-center gap-1 px-2 py-1 rounded-card text-[12px] leading-none font-semibold whitespace-nowrap shrink-0 transition-colors ${
                   isActive
                     ? "bg-brand-50 text-brand-800 border border-brand-200"
                     : "text-ink-secondary hover:text-ink hover:bg-canvas-subtle"
@@ -1798,19 +1899,23 @@ export function TravelMateShell({
               }
             >
               <Compass className="h-3.5 w-3.5 text-brand-700 shrink-0" />
-              <span className="hidden sm:inline">Mon voyage</span>
+              <span className="hidden sm:inline" style={{ whiteSpace: "nowrap" }}>
+                Mon voyage
+              </span>
             </NavLink>
 
             <Button
               type="button"
               variant="ghost"
               size="sm"
-              className="whitespace-nowrap shrink-0 px-2.5 py-1 text-[12px]"
+              className="whitespace-nowrap shrink-0 px-2 py-1 text-[12px] leading-none"
               data-testid="open-documents-btn"
-              onClick={() => setDocumentsModalOpen(true)}
+              onClick={() => navigate("/trip/documents")}
             >
               <FileText className="h-3.5 w-3.5 text-brand-700 shrink-0" />
-              <span className="hidden md:inline">Mes documents</span>
+              <span className="hidden md:inline" style={{ whiteSpace: "nowrap" }}>
+                Mes documents
+              </span>
             </Button>
 
             <NavLink
@@ -1829,15 +1934,19 @@ export function TravelMateShell({
             </NavLink>
 
             {token && currentUser ? (
-              <div className="flex items-center gap-1 shrink-0">
+              <div className="flex items-center gap-1 flex-nowrap shrink-0">
                 <Link
                   to="/login"
                   data-testid="header-user-link"
-                  className="inline-flex items-center gap-1 rounded-card border border-border bg-canvas-subtle px-2 py-1 text-[12px] font-medium text-ink whitespace-nowrap shrink-0 hover:bg-border/40"
+                  style={{ whiteSpace: "nowrap" }}
+                  className="inline-flex items-center gap-1 rounded-card border border-border bg-canvas-subtle px-2 py-1 text-[12px] leading-none font-medium text-ink whitespace-nowrap shrink-0 hover:bg-border/40"
                 >
                   <User className="h-3.5 w-3.5 text-brand-700 shrink-0" />
-                  <span className="max-w-[84px] truncate hidden sm:inline">
-                    {currentUser.full_name.split(" ")[0]}
+                  <span
+                    className="hidden sm:inline whitespace-nowrap"
+                    style={{ whiteSpace: "nowrap" }}
+                  >
+                    {currentUser.full_name}
                   </span>
                 </Link>
                 <button
@@ -2011,7 +2120,39 @@ export function TravelMateShell({
                 destination={activeDestination}
                 latestBooking={latestBooking}
                 selectedAccommodation={selectedAccommodation}
-                onOpenDocumentsModal={() => setDocumentsModalOpen(true)}
+                onOpenDocumentsModal={() => navigate("/trip/documents")}
+              />
+            }
+          />
+          <Route
+            path="/trip/budget"
+            element={
+              <TripBudgetScreen
+                apiBase={API_BASE}
+                token={token}
+                trip={activeTrip}
+                destination={activeDestination}
+              />
+            }
+          />
+          <Route
+            path="/trip/documents"
+            element={
+              <TripDocumentsScreen
+                apiBase={API_BASE}
+                token={token}
+                trip={activeTrip}
+                destination={activeDestination}
+              />
+            }
+          />
+          <Route
+            path="/trip/infos"
+            element={
+              <TripPracticalInfoScreen
+                apiBase={API_BASE}
+                trip={activeTrip}
+                destination={activeDestination}
               />
             }
           />
@@ -2025,7 +2166,7 @@ export function TravelMateShell({
                 destination={activeDestination}
                 latestBooking={latestBooking}
                 selectedAccommodation={selectedAccommodation}
-                onOpenDocumentsModal={() => setDocumentsModalOpen(true)}
+                onOpenDocumentsModal={() => navigate("/trip/documents")}
               />
             }
           />
@@ -2334,6 +2475,9 @@ export function renderTravelerPagesForInspection() {
     { key: "/activities", path: "/activities", state: baseSsrState },
     { key: "/itinerary", path: "/itinerary", state: baseSsrState },
     { key: "/trip", path: "/trip", state: baseSsrState },
+    { key: "/trip/budget", path: "/trip/budget", state: baseSsrState },
+    { key: "/trip/documents", path: "/trip/documents", state: baseSsrState },
+    { key: "/trip/infos", path: "/trip/infos", state: baseSsrState },
     { key: "/settings", path: "/settings", state: baseSsrState },
   ];
 

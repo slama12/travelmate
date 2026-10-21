@@ -408,9 +408,11 @@ async def book_flight_atomically(
         encrypted = cipher.encrypt_document(eticket_payload)
         vault_doc = VaultDocument(
             trip_id=trip.id,
+            owner_id=current_user.id,
             doc_type=DocumentType.FLIGHT_TICKET.value,
             title=f"Billet d'avion {effective_origin_iata} <-> {effective_dest_iata} ({pnr})",
             mime_type="application/json",
+            is_shared=False,
             encrypted_payload=encrypted["encrypted_payload"],  # type: ignore[arg-type]
             encryption_iv=encrypted["encryption_iv"],  # type: ignore[arg-type]
             encrypted_dek=encrypted["encrypted_dek"],  # type: ignore[arg-type]

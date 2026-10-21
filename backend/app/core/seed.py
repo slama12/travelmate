@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from app.core.database import AsyncSession, AsyncSessionLocal
 from app.core.security import hash_password
-from app.models.entities import Accommodation, Destination, LocalTransport, Place, User
+from app.models.entities import Accommodation, Destination, LocalTransport, Place, Trip, User
 from app.models.enums import AccommodationType, PlaceCategory, TravelStyle
 
 logger = logging.getLogger("travelmate.seed")
@@ -1292,6 +1292,9 @@ async def seed_initial_data(session: AsyncSession) -> dict[str, int]:
             preferred_style=TravelStyle.STANDARD.value,
         )
         session.add(demo_user)
+        await session.flush()
+    else:
+        demo_user = existing_user
 
     for dest_data in SEED_DESTINATIONS:
         dest = await session.scalar(
@@ -1314,6 +1317,9 @@ async def seed_initial_data(session: AsyncSession) -> dict[str, int]:
             session.add(dest)
             await session.flush()
             created_destinations += 1
+        else:
+            dest.practical_info = dest_data["practical_info"]
+            dest.useful_phrases = dest_data["useful_phrases"]
 
         for place_data in dest_data.get("places", []):
             existing_place = await session.scalar(
@@ -1352,6 +1358,130 @@ async def seed_initial_data(session: AsyncSession) -> dict[str, int]:
             )
             if not existing_tr:
                 session.add(LocalTransport(destination_id=dest.id, **tr_data))
+
+    await session.flush()
+
+    # Création idempotente du séjour de démonstration à Marrakech avec budget (5 catégories) et documents chiffrés
+    marrakech_dest = await session.scalar(
+        select(Destination).where(Destination.city_name == "Marrakech")
+    )
+    if demo_user and marrakech_dest:
+        existing_demo_trip = await session.scalar(
+            select(Trip).where(
+                Trip.owner_id == demo_user.id,
+                Trip.destination_id == marrakech_dest.id,
+            )
+        )
+        if not existing_demo_trip:
+            from datetime import date, datetime, timezone
+            from decimal import Decimal
+            from app.core.security import get_envelope_cipher
+            from app.models.entities import BudgetItem, FlightBooking, TripMember, VaultDocument
+            from app.models.enums import BudgetCategory, FlightStatus, InviteStatus, MemberRole, TripStatus
+
+            demo_trip = Trip(
+                owner_id=demo_user.id,
+                destination_id=marrakech_dest.id,
+                title="Séjour à Marrakech",
+                travel_style=TravelStyle.STANDARD.value,
+                total_budget_planned=Decimal("1800.00"),
+                currency="EUR",
+                arrival_at=datetime(2026, 11, 10, 10, 30, tzinfo=timezone.utc),
+                departure_at=datetime(2026, 11, 17, 18, 0, tzinfo=timezone.utc),
+                status=TripStatus.BOOKED.value,
+            )
+            session.add(demo_trip)
+            await session.flush()
+
+            session.add(
+                TripMember(
+                    trip_id=demo_trip.id,
+                    user_id=demo_user.id,
+                    role=MemberRole.OWNER.value,
+                    invite_status=InviteStatus.ACCEPTED.value,
+                )
+            )
+
+            session.add(
+                FlightBooking(
+                    trip_id=demo_trip.id,
+                    idempotency_key=f"seed-demo-flight-{demo_trip.id[:12]}",
+                    airline="Air France",
+                    flight_number_outbound="AF1562",
+                    flight_number_inbound="AF1563",
+                    origin_iata="CDG",
+                    destination_iata="RAK",
+                    departure_outbound_at=datetime(2026, 11, 10, 7, 15, tzinfo=timezone.utc),
+                    arrival_outbound_at=datetime(2026, 11, 10, 10, 30, tzinfo=timezone.utc),
+                    departure_inbound_at=datetime(2026, 11, 17, 14, 45, tzinfo=timezone.utc),
+                    arrival_inbound_at=datetime(2026, 11, 17, 18, 0, tzinfo=timezone.utc),
+                    price=Decimal("295.00"),
+                    currency="EUR",
+                    cabin_class="ECONOMY",
+                    pnr_reference="TM8K4M",
+                    flight_status=FlightStatus.SCHEDULED.value,
+                    gmail_confirmation_sent=True,
+                )
+            )
+
+            seed_expenses = [
+                (BudgetCategory.FLIGHT.value, "Vol aller-retour Air France Paris — Marrakech", Decimal("295.00")),
+                (BudgetCategory.ACCOMMODATION.value, "Riad Patio Andalou Médina (7 nuits)", Decimal("660.00")),
+                (BudgetCategory.ACTIVITY.value, "Entrées Jardin Majorelle & Palais de la Bahia", Decimal("75.00")),
+                (BudgetCategory.MEAL.value, "Dîners traditionnels en médina", Decimal("140.00")),
+                (BudgetCategory.TRANSPORT.value, "Navette aéroport Ménara & taxis officiels", Decimal("45.00")),
+            ]
+            for cat_code, title_fr, amt_dec in seed_expenses:
+                session.add(
+                    BudgetItem(
+                        trip_id=demo_trip.id,
+                        category=cat_code,
+                        title=title_fr,
+                        amount=amt_dec,
+                        currency="EUR",
+                        is_estimated=False,
+                        metadata_json={"original_amount": str(amt_dec), "original_currency": "EUR", "exchange_rate": "1.0000"},
+                    )
+                )
+
+            cipher = get_envelope_cipher()
+            passport_enc = cipher.encrypt_document(
+                "Passeport biométrique n° 21FR88419 — Titulaire : Alex Voyageur — Délivré à Paris".encode("utf-8")
+            )
+            session.add(
+                VaultDocument(
+                    trip_id=demo_trip.id,
+                    owner_id=demo_user.id,
+                    doc_type="PASSPORT",
+                    title="Passeport biométrique — Alex Voyageur",
+                    mime_type="text/plain",
+                    is_shared=False,
+                    expires_on=date(2027, 2, 18),
+                    encrypted_payload=passport_enc["encrypted_payload"],  # type: ignore[arg-type]
+                    encryption_iv=passport_enc["encryption_iv"],  # type: ignore[arg-type]
+                    encrypted_dek=passport_enc["encrypted_dek"],  # type: ignore[arg-type]
+                    checksum_sha256=str(passport_enc["checksum_sha256"]),
+                )
+            )
+
+            ticket_enc = cipher.encrypt_document(
+                "Billet électronique Air France AF1562 / AF1563 — Référence TM8K4M — Siège 14A".encode("utf-8")
+            )
+            session.add(
+                VaultDocument(
+                    trip_id=demo_trip.id,
+                    owner_id=demo_user.id,
+                    doc_type="FLIGHT_TICKET",
+                    title="Billet d'avion aller-retour Air France (Réf. TM8K4M)",
+                    mime_type="text/plain",
+                    is_shared=True,
+                    expires_on=date(2026, 11, 17),
+                    encrypted_payload=ticket_enc["encrypted_payload"],  # type: ignore[arg-type]
+                    encryption_iv=ticket_enc["encryption_iv"],  # type: ignore[arg-type]
+                    encrypted_dek=ticket_enc["encrypted_dek"],  # type: ignore[arg-type]
+                    checksum_sha256=str(ticket_enc["checksum_sha256"]),
+                )
+            )
 
     await session.commit()
     return {

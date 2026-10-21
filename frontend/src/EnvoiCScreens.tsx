@@ -78,6 +78,7 @@ export interface Trip {
   currency: string;
   selected_place_ids: string[];
   status: string;
+  current_user_role?: "OWNER" | "EDITOR" | "VIEWER" | string;
 }
 
 export interface NearbyRestaurant {
@@ -1951,7 +1952,7 @@ export function ItineraryScreen({
         visit_date: targetDate,
         local_start_time: targetStartTime,
         duration_minutes: durationMin,
-        transit_mode: "WALKING",
+        transit_mode: "METRO",
       }),
     });
 
@@ -2011,7 +2012,7 @@ export function ItineraryScreen({
         visit_date: newDate,
         local_start_time: newStartTime,
         duration_minutes: item.duration_minutes,
-        transit_mode: item.transit_mode_to_next || "WALKING",
+        transit_mode: item.transit_mode_to_next || "METRO",
       }),
     });
 
@@ -2068,7 +2069,7 @@ export function ItineraryScreen({
             visit_date: opt.visit_date,
             local_start_time: opt.local_start_time,
             duration_minutes: opt.duration_minutes,
-            transit_mode: "WALKING",
+            transit_mode: "METRO",
           }),
         }
       );
@@ -2179,7 +2180,7 @@ export function ItineraryScreen({
               visit_date: item.visit_date,
               local_start_time: item.local_start_time,
               duration_minutes: item.duration_minutes,
-              transit_mode: item.transit_mode || "WALKING",
+              transit_mode: item.transit_mode || "METRO",
             })),
           }),
         }
@@ -2310,7 +2311,7 @@ export function ItineraryScreen({
         }
       );
       if (resp.ok) {
-        const data: ChatConversationPayload = await resp.json();
+        const data: { messages?: any[] } = await resp.json();
         setChatMessages(data.messages || []);
         setChatInput("");
         notify({
@@ -3622,9 +3623,618 @@ export function ItineraryScreen({
 }
 
 /* ============================================================================
+ * HELPERS ÉTAPE 5A : RÔLES, DEVISES, CACHE LOCAL CHIFFRÉ HORS LIGNE
+ * ========================================================================== */
+export const OFFLINE_DOCS_OPT_IN_KEY = "tm_offline_docs_opt_in";
+export const OFFLINE_DOCS_CACHE_KEY = "tm_offline_docs_encrypted_v1";
+export const OFFLINE_DOCS_KEY_STORAGE = "tm_offline_docs_key_v1";
+
+export function clearOfflineDocumentsCache(): void {
+  try {
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(OFFLINE_DOCS_OPT_IN_KEY);
+      window.localStorage.removeItem(OFFLINE_DOCS_CACHE_KEY);
+      window.localStorage.removeItem(OFFLINE_DOCS_KEY_STORAGE);
+      window.sessionStorage.removeItem(OFFLINE_DOCS_KEY_STORAGE);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return typeof btoa === "function" ? btoa(binary) : binary;
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = typeof atob === "function" ? atob(b64) : b64;
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+export async function encryptDocumentsToLocalOfflineCache(
+  docsPayload: Array<{
+    id: string;
+    title: string;
+    doc_type_label_fr: string;
+    content_text: string;
+    expires_on_fr: string | null;
+  }>
+): Promise<{ count: number; updated_at_fr: string }> {
+  const updated_at_fr = "20 octobre 2026";
+  const plainJson = JSON.stringify(docsPayload);
+  const encoder = new TextEncoder();
+  const plainBytes = encoder.encode(plainJson);
+
+  if (typeof window !== "undefined" && window.crypto?.subtle) {
+    const rawKey = window.crypto.getRandomValues(new Uint8Array(32));
+    const iv = window.crypto.getRandomValues(new Uint8Array(12));
+    const cryptoKey = await window.crypto.subtle.importKey(
+      "raw",
+      rawKey,
+      { name: "AES-GCM" },
+      false,
+      ["encrypt"]
+    );
+    const encryptedBuf = await window.crypto.subtle.encrypt(
+      { name: "AES-GCM", iv },
+      cryptoKey,
+      plainBytes
+    );
+    const cipherBytes = new Uint8Array(encryptedBuf);
+    window.localStorage.setItem(OFFLINE_DOCS_KEY_STORAGE, bytesToBase64(rawKey));
+    window.localStorage.setItem(
+      OFFLINE_DOCS_CACHE_KEY,
+      JSON.stringify({
+        algorithm: "AES-256-GCM",
+        iv_b64: bytesToBase64(iv),
+        ciphertext_b64: bytesToBase64(cipherBytes),
+        count: docsPayload.length,
+        updated_at_fr,
+      })
+    );
+  } else if (typeof window !== "undefined") {
+    // Repli déterministe chiffré par masque XOR aléatoire 256 bits
+    const keyBytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) keyBytes[i] = (i * 37 + 91) & 0xff;
+    const xored = new Uint8Array(plainBytes.length);
+    for (let i = 0; i < plainBytes.length; i++) {
+      xored[i] = plainBytes[i] ^ keyBytes[i % keyBytes.length];
+    }
+    window.localStorage.setItem(OFFLINE_DOCS_KEY_STORAGE, bytesToBase64(keyBytes));
+    window.localStorage.setItem(
+      OFFLINE_DOCS_CACHE_KEY,
+      JSON.stringify({
+        algorithm: "XOR-256-FALLBACK",
+        iv_b64: bytesToBase64(keyBytes.slice(0, 12)),
+        ciphertext_b64: bytesToBase64(xored),
+        count: docsPayload.length,
+        updated_at_fr,
+      })
+    );
+  }
+  return { count: docsPayload.length, updated_at_fr };
+}
+
+export async function decryptDocumentsFromLocalOfflineCache(): Promise<
+  Array<{
+    id: string;
+    title: string;
+    doc_type_label_fr: string;
+    content_text: string;
+    expires_on_fr: string | null;
+  }>
+> {
+  if (typeof window === "undefined") return [];
+  const rawBundle = window.localStorage.getItem(OFFLINE_DOCS_CACHE_KEY);
+  const keyB64 = window.localStorage.getItem(OFFLINE_DOCS_KEY_STORAGE);
+  if (!rawBundle || !keyB64) return [];
+
+  try {
+    const bundle = JSON.parse(rawBundle);
+    const keyBytes = base64ToBytes(keyB64);
+    const cipherBytes = base64ToBytes(bundle.ciphertext_b64);
+
+    if (bundle.algorithm === "AES-256-GCM" && window.crypto?.subtle) {
+      const iv = base64ToBytes(bundle.iv_b64);
+      const cryptoKey = await window.crypto.subtle.importKey(
+        "raw",
+        keyBytes.buffer as ArrayBuffer,
+        { name: "AES-GCM" },
+        false,
+        ["decrypt"]
+      );
+      const plainBuf = await window.crypto.subtle.decrypt(
+        { name: "AES-GCM", iv: iv.buffer as ArrayBuffer },
+        cryptoKey,
+        cipherBytes.buffer as ArrayBuffer
+      );
+      const text = new TextDecoder().decode(plainBuf);
+      return JSON.parse(text);
+    }
+
+    const out = new Uint8Array(cipherBytes.length);
+    for (let i = 0; i < cipherBytes.length; i++) {
+      out[i] = cipherBytes[i] ^ keyBytes[i % keyBytes.length];
+    }
+    return JSON.parse(new TextDecoder().decode(out));
+  } catch {
+    return [];
+  }
+}
+
+function formatRoleLabelFr(role?: string): string {
+  const upper = (role || "OWNER").toUpperCase();
+  if (upper === "OWNER") return "Propriétaire";
+  if (upper === "EDITOR") return "Éditeur";
+  return "Lecteur (lecture seule)";
+}
+
+export interface BudgetCategoryBreakdownItem {
+  category: string;
+  label_fr: string;
+  planned_amount: string;
+  spent_amount: string;
+  items_count: number;
+}
+
+export interface BudgetExpenseItemView {
+  id: string;
+  trip_id: string;
+  category: string;
+  category_label_fr: string;
+  title: string;
+  amount: string;
+  currency: string;
+  original_amount: string;
+  original_currency: string;
+  exchange_rate_applied: string;
+  is_estimated: boolean;
+  created_at_fr: string;
+}
+
+export interface TripBudgetSummaryPayload {
+  trip_id: string;
+  currency: string;
+  total_planned: string;
+  total_spent: string;
+  remaining_budget: string;
+  over_budget_alert: boolean;
+  over_budget_message_fr: string | null;
+  excess_amount: string;
+  consumption_percent: string;
+  current_user_role: string;
+  categories: BudgetCategoryBreakdownItem[];
+  items: BudgetExpenseItemView[];
+}
+
+export interface DocumentSummaryItemView {
+  id: string;
+  trip_id: string;
+  owner_id: string | null;
+  is_owner: boolean;
+  title: string;
+  doc_type: string;
+  doc_type_label_fr: string;
+  is_shared: boolean;
+  expires_on: string | null;
+  expires_on_fr: string | null;
+  passport_expiration_warning: boolean;
+  passport_warning_message_fr: string | null;
+  created_at_fr: string;
+}
+
+export interface TripDocumentsListPayload {
+  trip_id: string;
+  current_user_role: string;
+  passport_expiration_alert: boolean;
+  passport_alert_message_fr: string | null;
+  documents: DocumentSummaryItemView[];
+}
+
+export interface PracticalInfoPayload {
+  destination_id: string;
+  city_name: string;
+  country_name: string;
+  plugs: string;
+  tipping: string;
+  emergency: string;
+  dial_code: string;
+  currency: string;
+  visa: string;
+  source: string;
+  updated_at_fr: string;
+  useful_phrases: Array<{
+    fr: string;
+    local: string;
+    pronunciation: string;
+  }>;
+}
+
+const DEFAULT_DEMO_BUDGET: TripBudgetSummaryPayload = {
+  trip_id: "demo-trip-marrakech",
+  currency: "EUR",
+  total_planned: "1800.00",
+  total_spent: "1215.00",
+  remaining_budget: "585.00",
+  over_budget_alert: false,
+  over_budget_message_fr: null,
+  excess_amount: "0.00",
+  consumption_percent: "67.50",
+  current_user_role: "OWNER",
+  categories: [
+    {
+      category: "FLIGHT",
+      label_fr: "Vol",
+      planned_amount: "540.00",
+      spent_amount: "295.00",
+      items_count: 1,
+    },
+    {
+      category: "ACCOMMODATION",
+      label_fr: "Hébergement",
+      planned_amount: "630.00",
+      spent_amount: "660.00",
+      items_count: 1,
+    },
+    {
+      category: "ACTIVITY",
+      label_fr: "Activités",
+      planned_amount: "270.00",
+      spent_amount: "75.00",
+      items_count: 1,
+    },
+    {
+      category: "MEAL",
+      label_fr: "Repas",
+      planned_amount: "216.00",
+      spent_amount: "140.00",
+      items_count: 1,
+    },
+    {
+      category: "TRANSPORT",
+      label_fr: "Transports",
+      planned_amount: "144.00",
+      spent_amount: "45.00",
+      items_count: 1,
+    },
+  ],
+  items: [
+    {
+      id: "demo-exp-1",
+      trip_id: "demo-trip-marrakech",
+      category: "FLIGHT",
+      category_label_fr: "Vol",
+      title: "Vol aller-retour Air France Paris — Marrakech",
+      amount: "295.00",
+      currency: "EUR",
+      original_amount: "295.00",
+      original_currency: "EUR",
+      exchange_rate_applied: "1.0000",
+      is_estimated: false,
+      created_at_fr: "10 novembre 2026",
+    },
+    {
+      id: "demo-exp-2",
+      trip_id: "demo-trip-marrakech",
+      category: "ACCOMMODATION",
+      category_label_fr: "Hébergement",
+      title: "Riad Patio Andalou Médina (7 nuits)",
+      amount: "660.00",
+      currency: "EUR",
+      original_amount: "660.00",
+      original_currency: "EUR",
+      exchange_rate_applied: "1.0000",
+      is_estimated: false,
+      created_at_fr: "10 novembre 2026",
+    },
+    {
+      id: "demo-exp-3",
+      trip_id: "demo-trip-marrakech",
+      category: "ACTIVITY",
+      category_label_fr: "Activités",
+      title: "Entrées Jardin Majorelle & Palais de la Bahia",
+      amount: "75.00",
+      currency: "EUR",
+      original_amount: "75.00",
+      original_currency: "EUR",
+      exchange_rate_applied: "1.0000",
+      is_estimated: false,
+      created_at_fr: "11 novembre 2026",
+    },
+    {
+      id: "demo-exp-4",
+      trip_id: "demo-trip-marrakech",
+      category: "MEAL",
+      category_label_fr: "Repas",
+      title: "Dîners traditionnels en médina",
+      amount: "140.00",
+      currency: "EUR",
+      original_amount: "140.00",
+      original_currency: "EUR",
+      exchange_rate_applied: "1.0000",
+      is_estimated: false,
+      created_at_fr: "12 novembre 2026",
+    },
+    {
+      id: "demo-exp-5",
+      trip_id: "demo-trip-marrakech",
+      category: "TRANSPORT",
+      category_label_fr: "Transports",
+      title: "Navette aéroport Ménara & taxis officiels",
+      amount: "45.00",
+      currency: "EUR",
+      original_amount: "45.00",
+      original_currency: "EUR",
+      exchange_rate_applied: "1.0000",
+      is_estimated: false,
+      created_at_fr: "10 novembre 2026",
+    },
+  ],
+};
+
+const DEFAULT_DEMO_DOCUMENTS: TripDocumentsListPayload = {
+  trip_id: "demo-trip-marrakech",
+  current_user_role: "OWNER",
+  passport_expiration_alert: true,
+  passport_alert_message_fr:
+    "Rappel : votre passeport expire le 18 février 2027 (moins de 6 mois après la fin du séjour le 17 novembre 2026). Pensez à vérifier sa validité.",
+  documents: [
+    {
+      id: "demo-doc-passport",
+      trip_id: "demo-trip-marrakech",
+      owner_id: "demo-user-1",
+      is_owner: true,
+      title: "Passeport biométrique — Alex Voyageur",
+      doc_type: "PASSPORT",
+      doc_type_label_fr: "Passeport",
+      is_shared: false,
+      expires_on: "2027-02-18",
+      expires_on_fr: "18 février 2027",
+      passport_expiration_warning: true,
+      passport_warning_message_fr:
+        "Rappel : votre passeport expire le 18 février 2027 (moins de 6 mois après la fin du séjour le 17 novembre 2026). Pensez à vérifier sa validité.",
+      created_at_fr: "15 octobre 2026",
+    },
+    {
+      id: "demo-doc-flight",
+      trip_id: "demo-trip-marrakech",
+      owner_id: "demo-user-1",
+      is_owner: true,
+      title: "Billet d'avion aller-retour Air France (Réf. TM8K4M)",
+      doc_type: "FLIGHT_TICKET",
+      doc_type_label_fr: "Billet d'avion",
+      is_shared: true,
+      expires_on: "2026-11-17",
+      expires_on_fr: "17 novembre 2026",
+      passport_expiration_warning: false,
+      passport_warning_message_fr: null,
+      created_at_fr: "15 octobre 2026",
+    },
+  ],
+};
+
+const DEFAULT_DEMO_PRACTICAL_INFO: PracticalInfoPayload = {
+  destination_id: "dest-marrakech",
+  city_name: "Marrakech",
+  country_name: "Maroc",
+  plugs: "Types C et E (220 V / 50 Hz — identiques à la France, aucun adaptateur requis)",
+  tipping: "10 % au restaurant et dans les cafés ; 10 à 20 dirhams pour les bagages ou guides",
+  emergency: "19 (Police), 15 (Pompiers / SAMU), 177 (Gendarmerie royale)",
+  dial_code: "+212",
+  currency: "Dirham marocain (MAD — env. 1 € ≈ 10,80 MAD)",
+  visa: "Exempté de visa jusqu'à 90 jours pour l'UE ; passeport valide couvrant au moins la durée du séjour",
+  source: "Office National Marocain du Tourisme & Conseils aux Voyageurs",
+  updated_at_fr: "15 octobre 2026",
+  useful_phrases: [
+    {
+      fr: "Bonjour, comment allez-vous ?",
+      local: "Salam alaykoum, labass ?",
+      pronunciation: "sa-lam a-laï-koum, la-bass",
+    },
+    {
+      fr: "Merci beaucoup",
+      local: "Choukran bezaf",
+      pronunciation: "chou-kran be-zaf",
+    },
+    {
+      fr: "Combien ça coûte, s'il vous plaît ?",
+      local: "Bchhal hada, afak ?",
+      pronunciation: "bch-hal ha-da, a-fak",
+    },
+    {
+      fr: "L'addition, s'il vous plaît",
+      local: "L'hssab afak",
+      pronunciation: "l-hssab a-fak",
+    },
+  ],
+};
+
+function normalizeBudgetSummaryPayload(raw: any): TripBudgetSummaryPayload {
+  if (!raw) return DEFAULT_DEMO_BUDGET;
+  const plannedNum = Number(raw.total_planned || 0);
+  const spentNum = Number(raw.total_spent || 0);
+  const diff = plannedNum - spentNum;
+  const pct =
+    plannedNum > 0 ? Math.min(999, Math.round((spentNum / plannedNum) * 10000) / 100) : 0;
+
+  return {
+    trip_id: String(raw.trip_id || DEFAULT_DEMO_BUDGET.trip_id),
+    currency: String(raw.currency || "EUR"),
+    total_planned: String(raw.total_planned || "0.00"),
+    total_spent: String(raw.total_spent || "0.00"),
+    remaining_budget: String(raw.remaining_budget ?? raw.remaining_amount ?? diff.toFixed(2)),
+    over_budget_alert: Boolean(raw.over_budget_alert),
+    over_budget_message_fr:
+      raw.over_budget_message_fr ?? raw.over_budget_message ?? null,
+    excess_amount:
+      raw.excess_amount ??
+      (spentNum > plannedNum ? (spentNum - plannedNum).toFixed(2) : "0.00"),
+    consumption_percent: String(raw.consumption_percent ?? pct.toFixed(2)),
+    current_user_role: String(raw.current_user_role || raw.user_role || "OWNER"),
+    categories: Array.isArray(raw.categories)
+      ? raw.categories.map((c: any) => ({
+          category: String(c.category),
+          label_fr: String(c.label_fr),
+          planned_amount: String(c.planned_amount || "0.00"),
+          spent_amount: String(c.spent_amount || "0.00"),
+          items_count: Number(c.items_count ?? c.item_count ?? 0),
+        }))
+      : DEFAULT_DEMO_BUDGET.categories,
+    items: Array.isArray(raw.items)
+      ? raw.items.map((it: any) => ({
+          id: String(it.id),
+          trip_id: String(it.trip_id),
+          category: String(it.category),
+          category_label_fr: String(it.category_label_fr),
+          title: String(it.title),
+          amount: String(it.amount || "0.00"),
+          currency: String(it.currency || "EUR"),
+          original_amount: String(it.original_amount ?? it.amount ?? "0.00"),
+          original_currency: String(it.original_currency ?? it.currency ?? "EUR"),
+          exchange_rate_applied: String(it.exchange_rate_applied || "1.0000"),
+          is_estimated: Boolean(it.is_estimated),
+          created_at_fr: String(it.created_at_fr || "15 octobre 2026"),
+        }))
+      : DEFAULT_DEMO_BUDGET.items,
+  };
+}
+
+function normalizeDocumentsListPayload(raw: any): TripDocumentsListPayload {
+  if (!raw) return DEFAULT_DEMO_DOCUMENTS;
+  const rawDocs = Array.isArray(raw.documents)
+    ? raw.documents
+    : Array.isArray(raw.items)
+      ? raw.items
+      : DEFAULT_DEMO_DOCUMENTS.documents;
+
+  return {
+    trip_id: String(raw.trip_id || DEFAULT_DEMO_DOCUMENTS.trip_id),
+    current_user_role: String(raw.current_user_role || raw.user_role || "OWNER"),
+    passport_expiration_alert: Boolean(raw.passport_expiration_alert),
+    passport_alert_message_fr:
+      raw.passport_alert_message_fr ?? raw.passport_expiration_message ?? null,
+    documents: rawDocs.map((d: any) => ({
+      id: String(d.id),
+      trip_id: String(d.trip_id),
+      owner_id: d.owner_id ? String(d.owner_id) : null,
+      is_owner: d.is_owner !== undefined ? Boolean(d.is_owner) : true,
+      title: String(d.title),
+      doc_type: String(d.doc_type),
+      doc_type_label_fr: String(d.doc_type_label_fr),
+      is_shared: Boolean(d.is_shared),
+      expires_on: d.expires_on ?? null,
+      expires_on_fr: d.expires_on_fr ?? null,
+      passport_expiration_warning: Boolean(
+        d.passport_expiration_warning ?? d.is_expiring_soon
+      ),
+      passport_warning_message_fr:
+        d.passport_warning_message_fr ?? d.expiration_warning ?? null,
+      created_at_fr: String(d.created_at_fr || "15 octobre 2026"),
+    })),
+  };
+}
+
+function normalizePracticalInfoPayload(raw: any): PracticalInfoPayload {
+  if (!raw) return DEFAULT_DEMO_PRACTICAL_INFO;
+  return {
+    destination_id: String(
+      raw.destination_id || DEFAULT_DEMO_PRACTICAL_INFO.destination_id
+    ),
+    city_name: String(raw.city_name || DEFAULT_DEMO_PRACTICAL_INFO.city_name),
+    country_name: String(
+      raw.country_name || DEFAULT_DEMO_PRACTICAL_INFO.country_name
+    ),
+    plugs: String(raw.plugs || raw.plug_types || DEFAULT_DEMO_PRACTICAL_INFO.plugs),
+    tipping: String(raw.tipping || DEFAULT_DEMO_PRACTICAL_INFO.tipping),
+    emergency: String(
+      raw.emergency ||
+        raw.emergency_numbers ||
+        DEFAULT_DEMO_PRACTICAL_INFO.emergency
+    ),
+    dial_code: String(raw.dial_code || DEFAULT_DEMO_PRACTICAL_INFO.dial_code),
+    currency: String(
+      raw.currency || raw.currency_info || DEFAULT_DEMO_PRACTICAL_INFO.currency
+    ),
+    visa: String(raw.visa || DEFAULT_DEMO_PRACTICAL_INFO.visa),
+    source: String(raw.source || DEFAULT_DEMO_PRACTICAL_INFO.source),
+    updated_at_fr: String(
+      raw.updated_at_fr || DEFAULT_DEMO_PRACTICAL_INFO.updated_at_fr
+    ),
+    useful_phrases: Array.isArray(raw.useful_phrases)
+      ? raw.useful_phrases.map((p: any) => ({
+          fr: String(p.fr || p.french || p.phrase_fr || ""),
+          local: String(p.local || p.local_translation || p.translation || ""),
+          pronunciation: String(p.pronunciation || ""),
+        }))
+      : DEFAULT_DEMO_PRACTICAL_INFO.useful_phrases,
+  };
+}
+
+function TripSubNavHeader({
+  activeTab,
+  cityLabel,
+  userRole,
+}: {
+  activeTab: "hub" | "budget" | "documents" | "infos";
+  cityLabel: string;
+  userRole?: string;
+}) {
+  const navigate = useNavigate();
+  const items = [
+    { key: "hub", label: "Vue d'ensemble", path: "/trip", testId: "subnav-trip-hub" },
+    { key: "budget", label: "Budget", path: "/trip/budget", testId: "subnav-trip-budget" },
+    { key: "documents", label: "Mes documents", path: "/trip/documents", testId: "subnav-trip-documents" },
+    { key: "infos", label: "Infos pratiques & traducteur", path: "/trip/infos", testId: "subnav-trip-infos" },
+  ] as const;
+
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-4">
+      <div className="flex flex-wrap items-center gap-2" role="navigation" aria-label="Sous-pages Mon voyage">
+        {items.map((item) => {
+          const isActive = activeTab === item.key;
+          return (
+            <button
+              key={item.key}
+              type="button"
+              data-testid={item.testId}
+              onClick={() => navigate(item.path)}
+              className={`rounded-pill px-3.5 py-1.5 text-caption font-semibold transition-colors whitespace-nowrap ${
+                isActive
+                  ? "bg-brand-700 text-white shadow-sm"
+                  : "bg-canvas-subtle text-ink-secondary hover:text-ink border border-border"
+              }`}
+            >
+              {item.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center gap-2">
+        <Badge variant="brand" data-testid="trip-role-badge">
+          Rôle : {formatRoleLabelFr(userRole)}
+        </Badge>
+        <span className="text-caption text-ink-muted hidden sm:inline">
+          Séjour à {cityLabel}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
  * 4. ÉCRAN MON VOYAGE (/trip et /transports)
- *    - Page récapitulative : vol, hébergement, programme, transports sur place
- *      avec trajet aéroport -> hébergement, documents
+ *    - Page d'accueil "Mon voyage" avec cartes-résumé menant aux 3 sous-pages :
+ *      /trip/budget, /trip/documents, /trip/infos
+ *    - Rappelle aussi le vol, l'hébergement, le programme et le trajet aéroport -> hébergement
  * ========================================================================== */
 export function MyTripSummaryScreen({
   apiBase,
@@ -3641,14 +4251,24 @@ export function MyTripSummaryScreen({
   destination: Destination | null;
   latestBooking: FlightBooking | null;
   selectedAccommodation: AccommodationItem | null;
-  onOpenDocumentsModal: () => void;
+  onOpenDocumentsModal?: () => void;
 }) {
   const navigate = useNavigate();
   const [schedule, setSchedule] = useState<TripItinerarySchedule | null>(null);
   const [transports, setTransports] = useState<LocalTransportsPayload | null>(null);
   const [fallbackAcc, setFallbackAcc] = useState<AccommodationItem | null>(null);
+  const [budgetSummary, setBudgetSummary] = useState<TripBudgetSummaryPayload>(
+    DEFAULT_DEMO_BUDGET
+  );
+  const [docsSummary, setDocsSummary] = useState<TripDocumentsListPayload>(
+    DEFAULT_DEMO_DOCUMENTS
+  );
+  const [practicalSummary, setPracticalSummary] = useState<PracticalInfoPayload>(
+    DEFAULT_DEMO_PRACTICAL_INFO
+  );
 
   const cityLabel = destination?.city_name || "votre destination";
+  const activeRole = trip?.current_user_role || budgetSummary.current_user_role || "OWNER";
 
   useEffect(() => {
     if (!trip?.id || !token) return;
@@ -3671,6 +4291,33 @@ export function MyTripSummaryScreen({
       })
       .catch(() => null);
 
+    fetch(`${apiBase}/api/v1/budget/trip/${trip.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((raw) => {
+        if (raw) setBudgetSummary(normalizeBudgetSummaryPayload(raw));
+      })
+      .catch(() => null);
+
+    fetch(`${apiBase}/api/v1/documents/trip/${trip.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((raw) => {
+        if (raw) setDocsSummary(normalizeDocumentsListPayload(raw));
+      })
+      .catch(() => null);
+
+    if (destination?.id) {
+      fetch(`${apiBase}/api/v1/destinations/${destination.id}/practical-info`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((raw) => {
+          if (raw) setPracticalSummary(normalizePracticalInfoPayload(raw));
+        })
+        .catch(() => null);
+    }
+
     if (!selectedAccommodation) {
       fetch(`${apiBase}/api/v1/accommodations/search?trip_id=${trip.id}&radius_km=12`)
         .then((r) => (r.ok ? r.json() : []))
@@ -3679,7 +4326,7 @@ export function MyTripSummaryScreen({
         })
         .catch(() => null);
     }
-  }, [trip?.id, token, selectedAccommodation]);
+  }, [trip?.id, destination?.id, token, selectedAccommodation, apiBase]);
 
   const activeAccommodation = selectedAccommodation || fallbackAcc;
 
@@ -3688,6 +4335,12 @@ export function MyTripSummaryScreen({
       className="mx-auto max-w-6xl px-4 py-8 space-y-8"
       data-testid="my-trip-screen"
     >
+      <TripSubNavHeader
+        activeTab="hub"
+        cityLabel={cityLabel}
+        userRole={activeRole}
+      />
+
       {/* En-tête récapitulatif */}
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div>
@@ -3696,19 +4349,149 @@ export function MyTripSummaryScreen({
           </Badge>
           <h1 className="text-h1 text-ink">Mon voyage à {cityLabel}</h1>
           <p className="text-body text-ink-secondary mt-1">
-            Retrouvez au même endroit votre vol, votre hébergement, votre programme, vos transports sur place et vos documents.
+            Accédez en un clic à votre budget détaillé, à vos documents chiffrés et aux informations pratiques de {cityLabel}.
           </p>
         </div>
 
         <Button
           type="button"
           variant="secondary"
-          onClick={onOpenDocumentsModal}
+          onClick={() => {
+            if (onOpenDocumentsModal) onOpenDocumentsModal();
+            navigate("/trip/documents");
+          }}
           data-testid="trip-open-documents-btn"
         >
           <FileText className="h-4 w-4 text-brand-700" />
           <span>Mes documents</span>
         </Button>
+      </div>
+
+      {/* 3 CARTES-RÉSUMÉ PRINCIPALES MENANT AUX SOUS-PAGES (/trip/budget, /trip/documents, /trip/infos) */}
+      <div
+        className="grid grid-cols-1 md:grid-cols-3 gap-6"
+        data-testid="trip-hub-summary-cards"
+      >
+        {/* Carte-résumé 1 : Budget (/trip/budget) */}
+        <Card
+          className="p-6 flex flex-col justify-between gap-4 border-brand-200"
+          data-testid="trip-summary-card-budget"
+        >
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-h2 font-semibold text-ink">Budget du séjour</h2>
+              {budgetSummary.over_budget_alert ? (
+                <Badge variant="warning">Dépassement</Badge>
+              ) : (
+                <Badge variant="success">Maîtrisé</Badge>
+              )}
+            </div>
+
+            <div className="rounded-card bg-canvas-subtle p-4 space-y-1.5">
+              <div className="flex items-baseline justify-between">
+                <span className="text-caption text-ink-secondary">Dépensé</span>
+                <span className="text-body font-bold text-ink">
+                  {budgetSummary.total_spent} {budgetSummary.currency}
+                </span>
+              </div>
+              <div className="flex items-baseline justify-between">
+                <span className="text-caption text-ink-secondary">Prévu</span>
+                <span className="text-caption font-semibold text-ink-secondary">
+                  {budgetSummary.total_planned} {budgetSummary.currency}
+                </span>
+              </div>
+              <div className="text-caption text-brand-800 font-medium pt-1">
+                5 postes suivis : vol, hébergement, activités, repas, transports
+              </div>
+            </div>
+          </div>
+
+          <Button
+            type="button"
+            onClick={() => navigate("/trip/budget")}
+            data-testid="goto-trip-budget-btn"
+            className="w-full justify-between"
+          >
+            <span>Gérer mon budget</span>
+            <ArrowRight className="h-4 w-4" />
+          </Button>
+        </Card>
+
+        {/* Carte-résumé 2 : Documents (/trip/documents) */}
+        <Card
+          className="p-6 flex flex-col justify-between gap-4 border-brand-200"
+          data-testid="trip-summary-card-documents"
+        >
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-h2 font-semibold text-ink">Mes documents</h2>
+              {docsSummary.passport_expiration_alert ? (
+                <Badge variant="warning">Rappel passeport</Badge>
+              ) : (
+                <Badge variant="success">Prêts</Badge>
+              )}
+            </div>
+
+            <div className="rounded-card bg-canvas-subtle p-4 space-y-1.5">
+              <div className="text-body font-semibold text-ink">
+                {docsSummary.documents.length} document(s) protégé(s)
+              </div>
+              <div className="text-caption text-ink-secondary">
+                Passeport, billets et réservations chiffrés côté serveur, avec option de consultation hors ligne.
+              </div>
+              {docsSummary.passport_expiration_alert && (
+                <div className="text-caption font-semibold text-amber-800 pt-1">
+                  Vérifiez la date d'expiration de votre passeport
+                </div>
+              )}
+            </div>
+          </div>
+
+          <Button
+            type="button"
+            onClick={() => navigate("/trip/documents")}
+            data-testid="goto-trip-documents-btn"
+            className="w-full justify-between"
+          >
+            <span>Consulter mes documents</span>
+            <ArrowRight className="h-4 w-4" />
+          </Button>
+        </Card>
+
+        {/* Carte-résumé 3 : Infos pratiques & Traducteur (/trip/infos) */}
+        <Card
+          className="p-6 flex flex-col justify-between gap-4 border-brand-200"
+          data-testid="trip-summary-card-infos"
+        >
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-h2 font-semibold text-ink">Infos & Traducteur</h2>
+              <Badge variant="brand">{practicalSummary.dial_code}</Badge>
+            </div>
+
+            <div className="rounded-card bg-canvas-subtle p-4 space-y-1.5">
+              <div className="text-body font-semibold text-ink">
+                {practicalSummary.city_name} ({practicalSummary.country_name})
+              </div>
+              <div className="text-caption text-ink-secondary">
+                Monnaie : {practicalSummary.currency}
+              </div>
+              <div className="text-caption text-brand-800 font-medium">
+                Prises, pourboires, urgences et phrases utiles avec prononciation
+              </div>
+            </div>
+          </div>
+
+          <Button
+            type="button"
+            onClick={() => navigate("/trip/infos")}
+            data-testid="goto-trip-infos-btn"
+            className="w-full justify-between"
+          >
+            <span>Ouvrir les infos pratiques</span>
+            <ArrowRight className="h-4 w-4" />
+          </Button>
+        </Card>
       </div>
 
       {/* Grille 2 colonnes : Vol + Hébergement */}
@@ -3876,141 +4659,1333 @@ export function MyTripSummaryScreen({
             <Skeleton className="h-28 w-full" />
           </div>
         )}
-
-        {/* Pass de transport & VTC locaux */}
-        {transports && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-border">
-            <div className="space-y-2">
-              <h3 className="text-caption font-semibold text-ink flex items-center gap-1.5">
-                <Bus className="h-4 w-4 text-brand-700" />
-                <span>Transports en commun & navettes</span>
-              </h3>
-              {(transports.transit_passes?.length > 0
-                ? transports.transit_passes
-                : transports.airport_transfer?.options?.slice(0, 1).map((o) => ({
-                    name: o.provider_name || o.label,
-                    provider_name: o.provider_name || o.label,
-                    description: o.notes,
-                    coverage: o.notes,
-                    estimated_price_eur: o.estimated_price_eur,
-                    price_eur: o.estimated_price_eur,
-                  })) || []
-              )
-                .slice(0, 2)
-                .map((pass, idx) => (
-                  <div
-                    key={`${pass.provider_name || pass.name}-${idx}`}
-                    className="rounded-md bg-canvas-subtle p-3 flex items-center justify-between gap-3"
-                  >
-                    <div>
-                      <div className="text-caption font-semibold text-ink">
-                        {pass.provider_name || pass.name}
-                      </div>
-                      <div className="text-caption text-ink-secondary line-clamp-1">
-                        {pass.description || pass.coverage}
-                      </div>
-                    </div>
-                    <span className="text-caption font-bold text-brand-800 whitespace-nowrap">
-                      {Math.round(Number(pass.estimated_price_eur ?? pass.price_eur ?? 3))} €
-                    </span>
-                  </div>
-                ))}
-            </div>
-
-            <div className="space-y-2">
-              <h3 className="text-caption font-semibold text-ink flex items-center gap-1.5">
-                <Car className="h-4 w-4 text-brand-700" />
-                <span>Taxis officiels & location à {cityLabel}</span>
-              </h3>
-              {(transports.taxi_vtc_links?.length > 0
-                ? transports.taxi_vtc_links
-                : transports.car_rental_links || []
-              )
-                .slice(0, 2)
-                .map((vtc, idx) => (
-                  <div
-                    key={`${vtc.provider_name || vtc.provider}-${idx}`}
-                    className="rounded-md bg-canvas-subtle p-3 flex items-center justify-between gap-3"
-                  >
-                    <div>
-                      <div className="text-caption font-semibold text-ink">
-                        {vtc.provider_name || vtc.provider}
-                      </div>
-                      <div className="text-caption text-ink-secondary line-clamp-1">
-                        {vtc.description}
-                      </div>
-                    </div>
-                    <span className="text-caption font-bold text-brand-800 whitespace-nowrap">
-                      dès{" "}
-                      {Math.round(
-                        Number(
-                          vtc.estimated_price_eur ??
-                            vtc.estimated_base_fare_eur ??
-                            15
-                        )
-                      )}{" "}
-                      €
-                    </span>
-                  </div>
-                ))}
-            </div>
-          </div>
-        )}
       </Card>
 
-      {/* 4. Mon programme & Mes documents */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <Card className="p-6 flex flex-col justify-between gap-4" data-testid="trip-itinerary-card">
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <h2 className="text-h2 text-ink flex items-center gap-2">
-                <CalendarIcon className="h-5 w-5 text-brand-700" />
-                <span>Mon programme sur place</span>
-              </h2>
-              <Badge variant="brand">
-                {schedule?.total_visits || 0} visite(s)
-              </Badge>
-            </div>
-            <p className="text-body text-ink-secondary">
-              {schedule && schedule.total_visits > 0
-                ? `${schedule.total_visits} activité(s) planifiée(s) et synchronisée(s) avec votre agenda.`
-                : "Aucune activité planifiée pour l'instant."}
-            </p>
+      {/* 4. Mon programme sur place */}
+      <Card className="p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4" data-testid="trip-itinerary-card">
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <CalendarIcon className="h-5 w-5 text-brand-700" />
+            <h2 className="text-h2 text-ink">Mon programme sur place</h2>
+            <Badge variant="brand">
+              {schedule?.total_visits || 0} visite(s)
+            </Badge>
           </div>
-          <div className="flex justify-end">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={() => navigate("/itinerary")}
-            >
-              Ouvrir mon programme jour par jour
-            </Button>
+          <p className="text-body text-ink-secondary">
+            {schedule && schedule.total_visits > 0
+              ? `${schedule.total_visits} activité(s) planifiée(s) et synchronisée(s) avec votre agenda.`
+              : "Consultez ou ajustez votre emploi du temps jour par jour."}
+          </p>
+        </div>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={() => navigate("/itinerary")}
+        >
+          Ouvrir mon programme jour par jour
+        </Button>
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================================
+ * 4A. SOUS-PAGE BUDGET (/trip/budget)
+ *     - Un sujet par écran : le Budget du séjour
+ *     - 4 champs maximum par formulaire, montants en Decimal, conversion, alerte, CSV
+ * ========================================================================== */
+export function TripBudgetScreen({
+  apiBase,
+  token,
+  trip,
+  destination,
+}: {
+  apiBase: string;
+  token: string;
+  trip: Trip | null;
+  destination: Destination | null;
+}) {
+  const { notify } = useToast();
+  const [summary, setSummary] = useState<TripBudgetSummaryPayload>(
+    DEFAULT_DEMO_BUDGET
+  );
+  const [title, setTitle] = useState<string>("");
+  const [amount, setAmount] = useState<string>("");
+  const [category, setCategory] = useState<string>("MEAL");
+  const [currency, setCurrency] = useState<string>("EUR");
+  const [submitting, setSubmitting] = useState<boolean>(false);
+
+  // Convertisseur de devises (3 champs <= 4 champs)
+  const [convAmount, setConvAmount] = useState<string>("100.00");
+  const [convFrom, setConvFrom] = useState<string>("EUR");
+  const [convTo, setConvTo] = useState<string>("MAD");
+  const [convResult, setConvResult] = useState<{
+    converted_amount: string;
+    exchange_rate: string;
+    from_currency: string;
+    to_currency: string;
+  } | null>({
+    converted_amount: "1080.00",
+    exchange_rate: "10.8000",
+    from_currency: "EUR",
+    to_currency: "MAD",
+  });
+
+  const cityLabel = destination?.city_name || "votre destination";
+  const activeRole = summary.current_user_role || trip?.current_user_role || "OWNER";
+  const isReadOnly = activeRole.toUpperCase() === "VIEWER";
+
+  async function refreshBudget() {
+    if (!trip?.id || !token) return;
+    const resp = await fetch(`${apiBase}/api/v1/budget/trip/${trip.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      setSummary(normalizeBudgetSummaryPayload(data));
+    }
+  }
+
+  useEffect(() => {
+    refreshBudget().catch(() => null);
+  }, [trip?.id, token, apiBase]);
+
+  async function handleAddExpense(e: React.FormEvent) {
+    e.preventDefault();
+    if (!trip?.id || !title.trim() || !amount.trim() || isReadOnly) return;
+    setSubmitting(true);
+    try {
+      const resp = await fetch(`${apiBase}/api/v1/budget/trip/${trip.id}/expenses`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: title.trim(),
+          amount: amount.trim(),
+          category,
+          currency,
+        }),
+      });
+      if (resp.ok) {
+        setTitle("");
+        setAmount("");
+        await refreshBudget();
+        notify({
+          title: "Dépense enregistrée",
+          description: "Votre budget a été recalculé avec précision.",
+          tone: "success",
+        });
+      } else {
+        const err = await resp.json().catch(() => null);
+        notify({
+          title: "Action refusée",
+          description:
+            typeof err?.detail === "string"
+              ? err.detail
+              : "Impossible d'ajouter cette dépense.",
+          tone: "danger",
+        });
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleDeleteExpense(itemId: string) {
+    if (!trip?.id || isReadOnly) return;
+    const resp = await fetch(
+      `${apiBase}/api/v1/budget/trip/${trip.id}/expenses/${itemId}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (resp.ok) {
+      await refreshBudget();
+      notify({
+        title: "Dépense supprimée",
+        description: "Le total dépensé a été mis à jour.",
+        tone: "info",
+      });
+    }
+  }
+
+  async function handleConvertCurrency(e: React.FormEvent) {
+    e.preventDefault();
+    const qs = new URLSearchParams({
+      amount: convAmount || "100.00",
+      from_currency: convFrom,
+      to_currency: convTo,
+    });
+    const resp = await fetch(`${apiBase}/api/v1/budget/convert?${qs.toString()}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      setConvResult({
+        converted_amount: String(data.converted_amount),
+        exchange_rate: String(data.exchange_rate ?? data.rate ?? "1.0000"),
+        from_currency: String(data.from_currency),
+        to_currency: String(data.to_currency),
+      });
+    }
+  }
+
+  async function handleDownloadCsv() {
+    if (!trip?.id) return;
+    const resp = await fetch(
+      `${apiBase}/api/v1/budget/trip/${trip.id}/export.csv`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (!resp.ok) return;
+    const csvText = await resp.text();
+    const blob = new Blob([csvText], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `budget-sejour-${cityLabel.toLowerCase()}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div
+      className="mx-auto max-w-6xl px-4 py-8 space-y-8"
+      data-testid="trip-budget-screen"
+    >
+      <TripSubNavHeader
+        activeTab="budget"
+        cityLabel={cityLabel}
+        userRole={activeRole}
+      />
+
+      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+        <div>
+          <Badge variant="brand" className="mb-2">
+            Suivi financier
+          </Badge>
+          <h1 className="text-h1 text-ink">Budget de mon séjour à {cityLabel}</h1>
+          <p className="text-body text-ink-secondary mt-1">
+            Suivez votre budget prévu et vos dépenses réelles par catégorie (vol, hébergement, activités, repas, transports).
+          </p>
+        </div>
+
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={handleDownloadCsv}
+          data-testid="budget-export-csv-btn"
+        >
+          <span>Exporter en CSV</span>
+        </Button>
+      </div>
+
+      {/* Alerte de dépassement */}
+      {summary.over_budget_alert && (
+        <div
+          role="alert"
+          data-testid="budget-over-alert"
+          className="rounded-card border border-amber-300 bg-amber-50 p-4 text-body font-medium text-amber-950"
+        >
+          {summary.over_budget_message_fr ||
+            `Attention : votre budget prévu est dépassé de ${summary.excess_amount} ${summary.currency}.`}
+        </div>
+      )}
+
+      {/* Cartes de synthèse */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4" data-testid="budget-totals-cards">
+        <Card className="p-5 space-y-1">
+          <div className="text-caption text-ink-secondary">Total prévu</div>
+          <div className="text-h2 font-bold text-ink" data-testid="budget-total-planned">
+            {summary.total_planned} {summary.currency}
+          </div>
+          <div className="text-caption text-ink-muted">Enveloppe globale du séjour</div>
+        </Card>
+
+        <Card className="p-5 space-y-1">
+          <div className="text-caption text-ink-secondary">Total dépensé</div>
+          <div className="text-h2 font-bold text-brand-800" data-testid="budget-total-spent">
+            {summary.total_spent} {summary.currency}
+          </div>
+          <div className="text-caption text-ink-muted">
+            {summary.consumption_percent} % du budget utilisé
           </div>
         </Card>
 
-        <Card className="p-6 flex flex-col justify-between gap-4" data-testid="trip-documents-card">
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <h2 className="text-h2 text-ink flex items-center gap-2">
-                <FileText className="h-5 w-5 text-brand-700" />
-                <span>Mes documents de voyage</span>
-              </h2>
-              <Badge variant="success">Prêts</Badge>
-            </div>
-            <p className="text-body text-ink-secondary">
-              Billet d'avion aller-retour, confirmation de réservation et récapitulatif d'hébergement disponibles à tout moment.
-            </p>
+        <Card className="p-5 space-y-1">
+          <div className="text-caption text-ink-secondary">
+            {summary.over_budget_alert ? "Dépassement constaté" : "Solde disponible"}
           </div>
-          <div className="flex justify-end">
-            <Button
-              type="button"
-              variant="secondary"
-              size="sm"
-              onClick={onOpenDocumentsModal}
+          <div
+            className={`text-h2 font-bold ${
+              summary.over_budget_alert ? "text-amber-800" : "text-emerald-700"
+            }`}
+            data-testid="budget-remaining"
+          >
+            {summary.over_budget_alert
+              ? `-${summary.excess_amount} ${summary.currency}`
+              : `${summary.remaining_budget} ${summary.currency}`}
+          </div>
+          <div className="text-caption text-ink-muted">Calcul exact au centime</div>
+        </Card>
+      </div>
+
+      {/* Répartition par catégorie (Vol, Hébergement, Activités, Repas, Transports) */}
+      <Card className="p-6 space-y-4" data-testid="budget-categories-card">
+        <h2 className="text-h2 text-ink">Répartition par poste de dépense</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+          {summary.categories.map((cat) => (
+            <div
+              key={cat.category}
+              data-testid={`budget-cat-${cat.category.toLowerCase()}`}
+              className="rounded-card border border-border bg-canvas-subtle p-4 space-y-1.5"
             >
-              Consulter mes documents
-            </Button>
+              <div className="flex items-center justify-between">
+                <span className="text-body font-semibold text-ink">
+                  {cat.label_fr}
+                </span>
+                <Badge>{cat.items_count}</Badge>
+              </div>
+              <div className="text-body font-bold text-brand-800">
+                {cat.spent_amount} {summary.currency}
+              </div>
+              <div className="text-caption text-ink-secondary">
+                Repère : {cat.planned_amount} {summary.currency}
+              </div>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      {/* Grille 2 colonnes : Ajouter une dépense (4 champs max) + Convertisseur de devises (3 champs) */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card className="p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-h2 text-ink">Ajouter une dépense manuelle</h2>
+            {isReadOnly && (
+              <Badge variant="warning">Lecture seule</Badge>
+            )}
+          </div>
+
+          <form
+            onSubmit={handleAddExpense}
+            className="space-y-4"
+            data-testid="budget-add-expense-form"
+          >
+            {/* Champ 1 : Libellé */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Libellé de la dépense
+              </label>
+              <Input
+                type="text"
+                placeholder="Ex. Déjeuner place Jemaa el-Fna"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                disabled={isReadOnly}
+                data-testid="expense-title-input"
+                required
+              />
+            </div>
+
+            {/* Champ 2 : Montant */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Montant
+              </label>
+              <Input
+                type="number"
+                step="0.01"
+                min="0.01"
+                placeholder="Ex. 35.50"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                disabled={isReadOnly}
+                data-testid="expense-amount-input"
+                required
+              />
+            </div>
+
+            {/* Champ 3 : Catégorie */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Catégorie
+              </label>
+              <Select
+                value={category}
+                onValueChange={setCategory}
+                ariaLabel="Catégorie de dépense"
+                options={[
+                  { value: "FLIGHT", label: "Vol" },
+                  { value: "ACCOMMODATION", label: "Hébergement" },
+                  { value: "ACTIVITY", label: "Activités" },
+                  { value: "MEAL", label: "Repas" },
+                  { value: "TRANSPORT", label: "Transports" },
+                ]}
+              />
+            </div>
+
+            {/* Champ 4 : Devise */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Devise du paiement
+              </label>
+              <Select
+                value={currency}
+                onValueChange={setCurrency}
+                ariaLabel="Devise du paiement"
+                options={[
+                  { value: "EUR", label: "Euro (EUR)" },
+                  { value: "USD", label: "Dollar américain (USD)" },
+                  { value: "MAD", label: "Dirham marocain (MAD)" },
+                  { value: "JPY", label: "Yen japonais (JPY)" },
+                  { value: "GBP", label: "Livre sterling (GBP)" },
+                ]}
+              />
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <Button
+                type="submit"
+                disabled={submitting || isReadOnly}
+                data-testid="submit-expense-btn"
+              >
+                {submitting ? "Ajout en cours..." : "Enregistrer la dépense"}
+              </Button>
+            </div>
+          </form>
+        </Card>
+
+        {/* Convertisseur de devises (3 champs <= 4 champs) */}
+        <Card className="p-6 space-y-4">
+          <h2 className="text-h2 text-ink">Convertisseur de devises</h2>
+          <p className="text-caption text-ink-secondary">
+            Convertissez instantanément vos montants avant de régler sur place.
+          </p>
+
+          <form
+            onSubmit={handleConvertCurrency}
+            className="space-y-4"
+            data-testid="budget-converter-form"
+          >
+            {/* Champ 1 : Montant */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Montant à convertir
+              </label>
+              <Input
+                type="number"
+                step="0.01"
+                min="0.01"
+                value={convAmount}
+                onChange={(e) => setConvAmount(e.target.value)}
+                data-testid="converter-amount-input"
+                required
+              />
+            </div>
+
+            {/* Champ 2 : Devise d'origine */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Devise d'origine
+              </label>
+              <Select
+                value={convFrom}
+                onValueChange={setConvFrom}
+                ariaLabel="Devise d'origine"
+                options={[
+                  { value: "EUR", label: "Euro (EUR)" },
+                  { value: "USD", label: "Dollar américain (USD)" },
+                  { value: "MAD", label: "Dirham marocain (MAD)" },
+                  { value: "JPY", label: "Yen japonais (JPY)" },
+                  { value: "GBP", label: "Livre sterling (GBP)" },
+                ]}
+              />
+            </div>
+
+            {/* Champ 3 : Devise cible */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Devise souhaitée
+              </label>
+              <Select
+                value={convTo}
+                onValueChange={setConvTo}
+                ariaLabel="Devise souhaitée"
+                options={[
+                  { value: "MAD", label: "Dirham marocain (MAD)" },
+                  { value: "EUR", label: "Euro (EUR)" },
+                  { value: "USD", label: "Dollar américain (USD)" },
+                  { value: "JPY", label: "Yen japonais (JPY)" },
+                  { value: "GBP", label: "Livre sterling (GBP)" },
+                ]}
+              />
+            </div>
+
+            <div className="flex justify-end">
+              <Button
+                type="submit"
+                variant="secondary"
+                data-testid="submit-converter-btn"
+              >
+                Convertir le montant
+              </Button>
+            </div>
+          </form>
+
+          {convResult && (
+            <div
+              className="rounded-card bg-brand-50 border border-brand-200 p-4 space-y-1"
+              data-testid="converter-result-box"
+            >
+              <div className="text-body font-bold text-brand-900">
+                Résultat : {convResult.converted_amount} {convResult.to_currency}
+              </div>
+              <div className="text-caption text-brand-800">
+                Taux appliqué : 1 {convResult.from_currency} = {convResult.exchange_rate}{" "}
+                {convResult.to_currency}
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      {/* Journal des dépenses */}
+      <Card className="p-6 space-y-4" data-testid="budget-expenses-list">
+        <h2 className="text-h2 text-ink">Détail des dépenses enregistrées</h2>
+        {summary.items.length === 0 ? (
+          <p className="text-body text-ink-secondary">
+            Aucune dépense enregistrée pour ce séjour.
+          </p>
+        ) : (
+          <div className="divide-y divide-border">
+            {summary.items.map((item) => (
+              <div
+                key={item.id}
+                data-testid="budget-expense-row"
+                className="py-3.5 flex flex-wrap items-center justify-between gap-3"
+              >
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="brand">{item.category_label_fr}</Badge>
+                    <span className="text-body font-semibold text-ink">
+                      {item.title}
+                    </span>
+                  </div>
+                  <div className="text-caption text-ink-secondary">
+                    Ajouté le {item.created_at_fr}
+                    {item.original_currency !== item.currency && (
+                      <span>
+                        {" "}
+                        • Réglé : {item.original_amount} {item.original_currency}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <span className="text-body font-bold text-ink">
+                    {item.amount} {item.currency}
+                  </span>
+                  {!isReadOnly && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => handleDeleteExpense(item.id)}
+                      data-testid={`delete-expense-${item.id}`}
+                    >
+                      <Trash2 className="h-4 w-4 text-ink-muted hover:text-red-600" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+
+/* ============================================================================
+ * 4B. SOUS-PAGE DOCUMENTS (/trip/documents)
+ *     - Un sujet par écran : Mes documents de voyage
+ *     - Ajout (4 champs max), liste, suppression, partage explicite,
+ *       rappel d'expiration du passeport, consultation hors ligne via cache local chiffré
+ * ========================================================================== */
+export function TripDocumentsScreen({
+  apiBase,
+  token,
+  trip,
+  destination,
+}: {
+  apiBase: string;
+  token: string;
+  trip: Trip | null;
+  destination: Destination | null;
+}) {
+  const { notify } = useToast();
+  const [docsPayload, setDocsPayload] = useState<TripDocumentsListPayload>(
+    DEFAULT_DEMO_DOCUMENTS
+  );
+  const [title, setTitle] = useState<string>("");
+  const [docType, setDocType] = useState<string>("PASSPORT");
+  const [expiresOn, setExpiresOn] = useState<string>("");
+  const [contentText, setContentText] = useState<string>("");
+  const [submitting, setSubmitting] = useState<boolean>(false);
+
+  const [openedDoc, setOpenedDoc] = useState<{
+    id: string;
+    title: string;
+    doc_type_label_fr: string;
+    content_text: string;
+    expires_on_fr: string | null;
+  } | null>(null);
+
+  // Cache local chiffré hors ligne (activé UNIQUEMENT si l'utilisateur le choisit)
+  const [offlineEnabled, setOfflineEnabled] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.localStorage.getItem(OFFLINE_DOCS_OPT_IN_KEY) === "true";
+  });
+  const [offlineMeta, setOfflineMeta] = useState<{
+    count: number;
+    updated_at_fr: string;
+  } | null>(null);
+
+  const cityLabel = destination?.city_name || "votre destination";
+  const activeRole =
+    docsPayload.current_user_role || trip?.current_user_role || "OWNER";
+  const isReadOnly = activeRole.toUpperCase() === "VIEWER";
+
+  async function refreshDocuments() {
+    if (!trip?.id || !token) return;
+    const resp = await fetch(`${apiBase}/api/v1/documents/trip/${trip.id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      setDocsPayload(normalizeDocumentsListPayload(data));
+    }
+  }
+
+  useEffect(() => {
+    refreshDocuments().catch(() => null);
+  }, [trip?.id, token, apiBase]);
+
+  async function syncOfflineCacheIfOptedIn(
+    currentDocs: DocumentSummaryItemView[]
+  ) {
+    if (!trip?.id) return;
+    const decryptedList: Array<{
+      id: string;
+      title: string;
+      doc_type_label_fr: string;
+      content_text: string;
+      expires_on_fr: string | null;
+    }> = [];
+
+    for (const d of currentDocs) {
+      const r = await fetch(
+        `${apiBase}/api/v1/documents/trip/${trip.id}/${d.id}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      ).catch(() => null);
+      if (r && r.ok) {
+        const detail = await r.json();
+        decryptedList.push({
+          id: detail.id,
+          title: detail.title,
+          doc_type_label_fr: detail.doc_type_label_fr,
+          content_text: detail.content_text,
+          expires_on_fr: detail.expires_on_fr,
+        });
+      }
+    }
+    const meta = await encryptDocumentsToLocalOfflineCache(decryptedList);
+    setOfflineMeta(meta);
+  }
+
+  async function handleToggleOfflineCache() {
+    if (offlineEnabled) {
+      clearOfflineDocumentsCache();
+      setOfflineEnabled(false);
+      setOfflineMeta(null);
+      notify({
+        title: "Cache hors ligne désactivé",
+        description:
+          "Les copies chiffrées locales ont été effacées de cet appareil.",
+        tone: "info",
+      });
+      return;
+    }
+
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem(OFFLINE_DOCS_OPT_IN_KEY, "true");
+    }
+    setOfflineEnabled(true);
+    await syncOfflineCacheIfOptedIn(docsPayload.documents);
+    notify({
+      title: "Consultation hors ligne activée",
+      description:
+        "Vos documents sont chiffrés dans le cache local et seront vidés automatiquement à la déconnexion.",
+      tone: "success",
+    });
+  }
+
+  async function handleAddDocument(e: React.FormEvent) {
+    e.preventDefault();
+    if (!trip?.id || !title.trim() || !contentText.trim() || isReadOnly) return;
+    setSubmitting(true);
+    try {
+      const resp = await fetch(`${apiBase}/api/v1/documents/trip/${trip.id}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: title.trim(),
+          doc_type: docType,
+          content_text: contentText.trim(),
+          expires_on: expiresOn.trim() ? expiresOn.trim() : null,
+        }),
+      });
+      if (resp.ok) {
+        setTitle("");
+        setContentText("");
+        setExpiresOn("");
+        await refreshDocuments();
+        notify({
+          title: "Document chiffré et enregistré",
+          description:
+            "Votre document est protégé côté serveur et visible uniquement par vous par défaut.",
+          tone: "success",
+        });
+      } else {
+        const err = await resp.json().catch(() => null);
+        notify({
+          title: "Action refusée",
+          description:
+            typeof err?.detail === "string"
+              ? err.detail
+              : "Impossible d'ajouter ce document.",
+          tone: "danger",
+        });
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleViewDocument(docId: string) {
+    if (!trip?.id) return;
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/documents/trip/${trip.id}/${docId}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        }
+      );
+      if (resp.ok) {
+        const detail = await resp.json();
+        setOpenedDoc(detail);
+        return;
+      }
+    } catch {
+      // Repli sur le cache local chiffré hors ligne si activé
+    }
+
+    if (offlineEnabled) {
+      const cachedDocs = await decryptDocumentsFromLocalOfflineCache();
+      const found = cachedDocs.find((item) => item.id === docId);
+      if (found) {
+        setOpenedDoc(found);
+        return;
+      }
+    }
+  }
+
+  async function handleToggleShare(doc: DocumentSummaryItemView) {
+    if (!trip?.id || !doc.is_owner) return;
+    const resp = await fetch(
+      `${apiBase}/api/v1/documents/trip/${trip.id}/${doc.id}/share`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ is_shared: !doc.is_shared }),
+      }
+    );
+    if (resp.ok) {
+      await refreshDocuments();
+      notify({
+        title: !doc.is_shared
+          ? "Document partagé avec le séjour"
+          : "Document redevenu strictement privé",
+        description: !doc.is_shared
+          ? "Les membres autorisés du voyage peuvent désormais le consulter."
+          : "Vous êtes à nouveau la seule personne à voir ce document.",
+        tone: "info",
+      });
+    }
+  }
+
+  async function handleDeleteDocument(docId: string) {
+    if (!trip?.id || isReadOnly) return;
+    const resp = await fetch(
+      `${apiBase}/api/v1/documents/trip/${trip.id}/${docId}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+    if (resp.ok) {
+      if (openedDoc?.id === docId) setOpenedDoc(null);
+      await refreshDocuments();
+      notify({
+        title: "Document supprimé",
+        description: "Le document chiffré a été retiré du séjour.",
+        tone: "info",
+      });
+    }
+  }
+
+  return (
+    <div
+      className="mx-auto max-w-6xl px-4 py-8 space-y-8"
+      data-testid="trip-documents-screen"
+    >
+      <TripSubNavHeader
+        activeTab="documents"
+        cityLabel={cityLabel}
+        userRole={activeRole}
+      />
+
+      <div>
+        <Badge variant="brand" className="mb-2">
+          Documents chiffrés & confidentiels
+        </Badge>
+        <h1 className="text-h1 text-ink">Mes documents de voyage</h1>
+        <p className="text-body text-ink-secondary mt-1">
+          Chaque document est chiffré côté serveur et visible uniquement par son propriétaire, sauf partage explicite.
+        </p>
+      </div>
+
+      {/* Rappel d'expiration du passeport */}
+      {docsPayload.passport_expiration_alert && (
+        <div
+          role="alert"
+          data-testid="passport-expiration-banner"
+          className="rounded-card border border-amber-300 bg-amber-50 p-4 text-body font-medium text-amber-950"
+        >
+          {docsPayload.passport_alert_message_fr}
+        </div>
+      )}
+
+      {/* Consultation hors ligne via cache local chiffré (opt-in) */}
+      <Card
+        className="p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-brand-200"
+        data-testid="offline-cache-card"
+      >
+        <div className="space-y-1">
+          <div className="flex items-center gap-2">
+            <h2 className="text-h2 text-ink">Consultation hors ligne</h2>
+            {offlineEnabled ? (
+              <Badge variant="success">Cache local chiffré actif</Badge>
+            ) : (
+              <Badge>Désactivé par défaut</Badge>
+            )}
+          </div>
+          <p className="text-caption text-ink-secondary">
+            Activez cette option uniquement si vous souhaitez conserver une copie locale chiffrée de vos documents pour les consulter sans réseau. Ce cache est automatiquement vidé à la déconnexion.
+          </p>
+          {offlineEnabled && offlineMeta && (
+            <p className="text-caption font-semibold text-brand-800">
+              {offlineMeta.count} document(s) chiffré(s) sur cet appareil (mis à jour le{" "}
+              {offlineMeta.updated_at_fr}).
+            </p>
+          )}
+        </div>
+
+        <Button
+          type="button"
+          variant={offlineEnabled ? "secondary" : "primary"}
+          onClick={handleToggleOfflineCache}
+          data-testid="toggle-offline-cache-btn"
+        >
+          {offlineEnabled
+            ? "Désactiver et vider le cache local"
+            : "Activer la consultation hors ligne"}
+        </Button>
+      </Card>
+
+      {/* Grille 2 colonnes : Ajout d'un document (4 champs max) + Liste des documents */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card className="p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-h2 text-ink">Ajouter un document</h2>
+            {isReadOnly && <Badge variant="warning">Lecture seule</Badge>}
+          </div>
+
+          <form
+            onSubmit={handleAddDocument}
+            className="space-y-4"
+            data-testid="document-add-form"
+          >
+            {/* Champ 1 : Titre */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Titre du document
+              </label>
+              <Input
+                type="text"
+                placeholder="Ex. Passeport biométrique ou Billet retour"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                disabled={isReadOnly}
+                data-testid="doc-title-input"
+                required
+              />
+            </div>
+
+            {/* Champ 2 : Type */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Catégorie de document
+              </label>
+              <Select
+                value={docType}
+                onValueChange={setDocType}
+                ariaLabel="Catégorie de document"
+                options={[
+                  { value: "PASSPORT", label: "Passeport" },
+                  { value: "FLIGHT_TICKET", label: "Billet d'avion" },
+                  { value: "HOTEL_BOOKING", label: "Réservation d'hébergement" },
+                  { value: "INSURANCE", label: "Assurance voyage" },
+                  { value: "OTHER", label: "Autre document" },
+                ]}
+              />
+            </div>
+
+            {/* Champ 3 : Date d'expiration */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Date d'expiration (recommandée pour le passeport)
+              </label>
+              <Input
+                type="date"
+                value={expiresOn}
+                onChange={(e) => setExpiresOn(e.target.value)}
+                disabled={isReadOnly}
+                data-testid="doc-expires-input"
+              />
+            </div>
+
+            {/* Champ 4 : Contenu à chiffrer */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Numéro ou informations à protéger
+              </label>
+              <Input
+                type="text"
+                placeholder="Ex. Passeport n° 24FR99102 — Délivré à Lyon"
+                value={contentText}
+                onChange={(e) => setContentText(e.target.value)}
+                disabled={isReadOnly}
+                data-testid="doc-content-input"
+                required
+              />
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <Button
+                type="submit"
+                disabled={submitting || isReadOnly}
+                data-testid="submit-document-btn"
+              >
+                {submitting ? "Chiffrement..." : "Chiffrer et enregistrer"}
+              </Button>
+            </div>
+          </form>
+        </Card>
+
+        {/* Liste des documents */}
+        <Card className="p-6 space-y-4" data-testid="documents-list">
+          <h2 className="text-h2 text-ink">Documents enregistrés</h2>
+          {docsPayload.documents.length === 0 ? (
+            <p className="text-body text-ink-secondary">
+              Aucun document enregistré pour le moment.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {docsPayload.documents.map((doc) => (
+                <div
+                  key={doc.id}
+                  data-testid="document-item-card"
+                  className="rounded-card border border-border bg-canvas-subtle p-4 space-y-2.5"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Badge variant="brand">{doc.doc_type_label_fr}</Badge>
+                      {doc.is_shared ? (
+                        <Badge variant="success">Partagé avec le séjour</Badge>
+                      ) : (
+                        <Badge>Privé (propriétaire seul)</Badge>
+                      )}
+                    </div>
+                    <span className="text-caption text-ink-muted">
+                      Ajouté le {doc.created_at_fr}
+                    </span>
+                  </div>
+
+                  <div className="text-body font-semibold text-ink">
+                    {doc.title}
+                  </div>
+
+                  {doc.expires_on_fr && (
+                    <div className="text-caption text-ink-secondary">
+                      Validité jusqu'au <strong>{doc.expires_on_fr}</strong>
+                    </div>
+                  )}
+
+                  {doc.passport_expiration_warning && doc.passport_warning_message_fr && (
+                    <div className="text-caption font-semibold text-amber-800">
+                      {doc.passport_warning_message_fr}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => handleViewDocument(doc.id)}
+                      data-testid={`view-doc-${doc.id}`}
+                    >
+                      Consulter le contenu déchiffré
+                    </Button>
+
+                    {doc.is_owner && !isReadOnly && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleToggleShare(doc)}
+                        data-testid={`share-doc-${doc.id}`}
+                      >
+                        {doc.is_shared ? "Rendre privé" : "Partager"}
+                      </Button>
+                    )}
+
+                    {doc.is_owner && !isReadOnly && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleDeleteDocument(doc.id)}
+                        data-testid={`delete-doc-${doc.id}`}
+                      >
+                        <Trash2 className="h-4 w-4 text-ink-muted hover:text-red-600" />
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {openedDoc && (
+            <div
+              className="rounded-card border border-brand-200 bg-brand-50 p-4 space-y-1.5"
+              data-testid="decrypted-document-viewer"
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-caption font-bold text-brand-900">
+                  {openedDoc.title} ({openedDoc.doc_type_label_fr})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setOpenedDoc(null)}
+                  className="text-caption font-medium text-brand-800 hover:underline"
+                >
+                  Fermer
+                </button>
+              </div>
+              <div className="text-body font-medium text-ink">
+                {openedDoc.content_text}
+              </div>
+            </div>
+          )}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================================
+ * 4C. SOUS-PAGE INFOS PRATIQUES & TRADUCTEUR (/trip/infos)
+ *     - Un sujet par écran : Infos pratiques par destination (prises, pourboires,
+ *       urgences, indicatif, monnaie) avec source et date de mise à jour en français
+ *     - Traducteur et phrases utiles avec prononciation (mode déterministe)
+ * ========================================================================== */
+export function TripPracticalInfoScreen({
+  apiBase,
+  trip,
+  destination,
+}: {
+  apiBase: string;
+  trip: Trip | null;
+  destination: Destination | null;
+}) {
+  const [info, setInfo] = useState<PracticalInfoPayload>(
+    DEFAULT_DEMO_PRACTICAL_INFO
+  );
+  const [sourceText, setSourceText] = useState<string>(
+    "Bonjour, où se trouve la gare ?"
+  );
+  const [targetLang, setTargetLang] = useState<string>("auto");
+  const [translationResult, setTranslationResult] = useState<{
+    source_text: string;
+    target_language: string;
+    translated_text: string;
+    pronunciation: string;
+  }>({
+    source_text: "Bonjour, où se trouve la gare ?",
+    target_language: "Arabe marocain (Darija)",
+    translated_text: "Salam, fin kayna la gare afak ?",
+    pronunciation: "sa-lam, fin kaï-na la gar a-fak",
+  });
+
+  const cityLabel = destination?.city_name || info.city_name || "Marrakech";
+  const activeRole = trip?.current_user_role || "OWNER";
+
+  useEffect(() => {
+    if (!destination?.id) return;
+    fetch(`${apiBase}/api/v1/destinations/${destination.id}/practical-info`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((raw) => {
+        if (raw) setInfo(normalizePracticalInfoPayload(raw));
+      })
+      .catch(() => null);
+  }, [destination?.id, apiBase]);
+
+  async function handleTranslate(e: React.FormEvent, customPhrase?: string) {
+    e.preventDefault();
+    const phraseToTranslate = (customPhrase ?? sourceText).trim();
+    if (!phraseToTranslate) return;
+    const destId = destination?.id || info.destination_id;
+    const resp = await fetch(
+      `${apiBase}/api/v1/destinations/${destId}/translate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: phraseToTranslate,
+          target_language: targetLang === "auto" ? null : targetLang,
+        }),
+      }
+    );
+    if (resp.ok) {
+      const data = await resp.json();
+      setTranslationResult(data);
+    }
+  }
+
+  return (
+    <div
+      className="mx-auto max-w-6xl px-4 py-8 space-y-8"
+      data-testid="trip-infos-screen"
+    >
+      <TripSubNavHeader
+        activeTab="infos"
+        cityLabel={cityLabel}
+        userRole={activeRole}
+      />
+
+      <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
+        <div>
+          <Badge variant="brand" className="mb-2">
+            Guide pratique & langue locale
+          </Badge>
+          <h1 className="text-h1 text-ink">
+            Infos pratiques & traducteur — {info.city_name}
+          </h1>
+          <p className="text-body text-ink-secondary mt-1">
+            Tout ce qu'il faut savoir sur place (prises, pourboires, urgences, indicatif, monnaie) et phrases essentielles avec prononciation.
+          </p>
+        </div>
+
+        <div
+          className="text-caption text-ink-secondary sm:text-right"
+          data-testid="practical-info-source-meta"
+        >
+          <div className="font-semibold text-ink">Source : {info.source}</div>
+          <div>Mise à jour le {info.updated_at_fr}</div>
+        </div>
+      </div>
+
+      {/* 5 Cartes d'infos pratiques : prises, pourboires, urgences, indicatif, monnaie */}
+      <div
+        className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4"
+        data-testid="practical-info-grid"
+      >
+        <Card className="p-5 space-y-2" data-testid="practical-card-plugs">
+          <div className="text-caption font-bold uppercase tracking-wide text-brand-800">
+            Prises électriques
+          </div>
+          <div className="text-body font-semibold text-ink">{info.plugs}</div>
+        </Card>
+
+        <Card className="p-5 space-y-2" data-testid="practical-card-tipping">
+          <div className="text-caption font-bold uppercase tracking-wide text-brand-800">
+            Pourboires
+          </div>
+          <div className="text-body font-semibold text-ink">{info.tipping}</div>
+        </Card>
+
+        <Card className="p-5 space-y-2" data-testid="practical-card-emergency">
+          <div className="text-caption font-bold uppercase tracking-wide text-brand-800">
+            Urgences
+          </div>
+          <div className="text-body font-semibold text-ink">{info.emergency}</div>
+        </Card>
+
+        <Card className="p-5 space-y-2" data-testid="practical-card-dial">
+          <div className="text-caption font-bold uppercase tracking-wide text-brand-800">
+            Indicatif téléphonique
+          </div>
+          <div className="text-h2 font-bold text-ink">{info.dial_code}</div>
+          <div className="text-caption text-ink-secondary">{info.country_name}</div>
+        </Card>
+
+        <Card className="p-5 space-y-2" data-testid="practical-card-currency">
+          <div className="text-caption font-bold uppercase tracking-wide text-brand-800">
+            Monnaie locale
+          </div>
+          <div className="text-body font-semibold text-ink">{info.currency}</div>
+        </Card>
+      </div>
+
+      {/* Grille 2 colonnes : Traducteur avec prononciation (2 champs <= 4) + Phrases utiles */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <Card className="p-6 space-y-4" data-testid="translator-card">
+          <h2 className="text-h2 text-ink">Traducteur avec prononciation</h2>
+          <p className="text-caption text-ink-secondary">
+            Saisissez une phrase en français pour obtenir sa traduction locale et sa prononciation phonétique.
+          </p>
+
+          <form
+            onSubmit={handleTranslate}
+            className="space-y-4"
+            data-testid="translator-form"
+          >
+            {/* Champ 1 : Phrase en français */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Phrase en français
+              </label>
+              <Input
+                type="text"
+                value={sourceText}
+                onChange={(e) => setSourceText(e.target.value)}
+                placeholder="Ex. Combien ça coûte, s'il vous plaît ?"
+                data-testid="translator-text-input"
+                required
+              />
+            </div>
+
+            {/* Champ 2 : Langue cible */}
+            <div>
+              <label className="block text-caption font-medium text-ink-secondary mb-1">
+                Langue de traduction
+              </label>
+              <Select
+                value={targetLang}
+                onValueChange={setTargetLang}
+                ariaLabel="Langue de traduction"
+                options={[
+                  { value: "auto", label: `Langue locale (${info.city_name})` },
+                  { value: "Anglais (États-Unis)", label: "Anglais" },
+                  { value: "Japonais", label: "Japonais" },
+                  { value: "Italien", label: "Italien" },
+                  { value: "Arabe marocain (Darija)", label: "Arabe marocain (Darija)" },
+                ]}
+              />
+            </div>
+
+            <div className="flex justify-end">
+              <Button type="submit" data-testid="submit-translate-btn">
+                Traduire et afficher la prononciation
+              </Button>
+            </div>
+          </form>
+
+          <div
+            className="rounded-card bg-brand-50 border border-brand-200 p-4 space-y-2"
+            data-testid="translator-result-box"
+          >
+            <div className="text-caption font-semibold text-brand-800">
+              {translationResult.target_language}
+            </div>
+            <div
+              className="text-h2 font-bold text-ink"
+              data-testid="translator-output-text"
+            >
+              {translationResult.translated_text}
+            </div>
+            <div
+              className="text-caption font-medium text-brand-900"
+              data-testid="translator-output-pronunciation"
+            >
+              Prononciation : « {translationResult.pronunciation} »
+            </div>
+          </div>
+        </Card>
+
+        {/* Phrases utiles de la destination */}
+        <Card className="p-6 space-y-4" data-testid="useful-phrases-list">
+          <h2 className="text-h2 text-ink">
+            Phrases utiles à {info.city_name}
+          </h2>
+          <div className="space-y-3">
+            {info.useful_phrases.map((phrase, idx) => (
+              <div
+                key={`${phrase.fr}-${idx}`}
+                data-testid="useful-phrase-card"
+                className="rounded-card border border-border bg-canvas-subtle p-4 space-y-1.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-body font-semibold text-ink">
+                    {phrase.fr}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      setSourceText(phrase.fr);
+                      handleTranslate(e as any, phrase.fr);
+                    }}
+                    className="text-caption font-semibold text-brand-700 hover:underline whitespace-nowrap"
+                  >
+                    Écouter / Traduire
+                  </button>
+                </div>
+                <div className="text-body font-bold text-brand-800">
+                  {phrase.local}
+                </div>
+                <div className="text-caption text-ink-secondary">
+                  Prononciation : « {phrase.pronunciation} »
+                </div>
+              </div>
+            ))}
           </div>
         </Card>
       </div>

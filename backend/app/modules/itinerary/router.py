@@ -19,6 +19,7 @@ from app.core.itinerary_validator import (
     to_destination_local,
 )
 from app.core.providers import get_provider_registry
+from app.core.rbac import READ_ROLES, WRITE_ROLES, require_trip_access
 from app.core.route_optimizer import OptimizablePlaceItem, RouteOptimizer
 from app.models.entities import Destination, ItineraryItem, Place, Trip, User
 from app.modules.auth.router import get_current_user
@@ -36,20 +37,16 @@ router = APIRouter(prefix="/itinerary", tags=["Itinerary & Planning"])
 
 
 async def _load_trip_and_destination(
-    db: AsyncSession, trip_id: str, user_id: str
+    db: AsyncSession,
+    trip_id: str,
+    user_id: str,
+    *,
+    write: bool = False,
 ) -> tuple[Trip, Destination]:
-    trip = await db.scalar(select(Trip).where(Trip.id == trip_id, Trip.owner_id == user_id))
-    if not trip:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Voyage introuvable ou accès non autorisé.",
-        )
-    destination = await db.scalar(select(Destination).where(Destination.id == trip.destination_id))
-    if not destination:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Destination associée au voyage introuvable.",
-        )
+    allowed = WRITE_ROLES if write else READ_ROLES
+    trip, destination, _role = await require_trip_access(
+        db, trip_id, user_id, allowed_roles=allowed
+    )
     return trip, destination
 
 
@@ -105,6 +102,9 @@ async def _recompute_trip_day_transits(
     Recalcule l'ordre journalier (day_order_index) et les temps/distances de transport
     entre les visites consécutives d'une même journée locale via le fournisseur d'itinéraires
     hybride (temps réel ou estimé Haversine).
+    Au-delà de 1,8 km en ville, un trajet laissé par défaut en marche ('WALKING') bascule
+    automatiquement en transport urbain ('METRO') pour éviter des estimations irréalistes
+    (ex. 63 min à pied sur 4,7 km à New York au lieu de 17 min en métro).
     """
     registry = get_provider_registry()
     items, places_map = await _load_trip_items_with_places(db, trip_id)
@@ -126,7 +126,13 @@ async def _recompute_trip_day_transits(
                 p_cur = places_map.get(item.place_id)
                 p_nxt = places_map.get(nxt.place_id)
                 if p_cur and p_nxt:
+                    dist_km = haversine_distance_km(
+                        p_cur.latitude, p_cur.longitude, p_nxt.latitude, p_nxt.longitude
+                    )
                     mode_for_leg = normalize_transit_mode(nxt.transit_mode_to_next)
+                    if mode_for_leg == "WALKING" and dist_km > 1.8:
+                        mode_for_leg = "METRO"
+                        nxt.transit_mode_to_next = "METRO"
                     leg = await registry.routing.compute_transit_leg(
                         p_cur.latitude,
                         p_cur.longitude,
@@ -389,7 +395,9 @@ async def create_itinerary_item(
     3. Stocke les horaires en UTC et synchronise avec Google Calendar (avec statut 'PENDING_SYNC'
        et nouvelle tentative en cas d'échec Calendar, sans annuler la visite).
     """
-    trip, destination = await _load_trip_and_destination(db, payload.trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination(
+        db, payload.trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
 
     place = await db.scalar(select(Place).where(Place.id == payload.place_id))
@@ -503,7 +511,9 @@ async def update_or_move_itinerary_item(
             detail="Visite introuvable.",
         )
 
-    trip, destination = await _load_trip_and_destination(db, item.trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination(
+        db, item.trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
     place = await db.scalar(select(Place).where(Place.id == item.place_id))
     if not place:
@@ -601,7 +611,9 @@ async def delete_itinerary_item(
             detail="Visite introuvable.",
         )
 
-    trip, destination = await _load_trip_and_destination(db, item.trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination(
+        db, item.trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
     event_id = item.google_calendar_event_id
 
@@ -644,7 +656,9 @@ async def retry_item_calendar_sync(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Visite introuvable.",
         )
-    _trip, destination = await _load_trip_and_destination(db, item.trip_id, current_user.id)
+    _trip, destination = await _load_trip_and_destination(
+        db, item.trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
     place = await db.scalar(select(Place).where(Place.id == item.place_id))
     if not place:
@@ -677,7 +691,9 @@ async def preview_optimized_itinerary(
     + temps de transport entre chaque étape).
     Rien n'est enregistré en base sans validation explicite par l'utilisateur via /apply-optimization.
     """
-    trip, destination = await _load_trip_and_destination(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination(
+        db, trip_id, current_user.id, write=True
+    )
     if not trip.arrival_at or not trip.departure_at:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -796,7 +812,9 @@ async def apply_optimized_itinerary(
     Chaque étape proposée repasse obligatoirement par le moteur de validation (ItineraryValidationEngine)
     avant d'être persistée et synchronisée avec Google Calendar.
     """
-    trip, destination = await _load_trip_and_destination(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
 
     if not payload.proposed_items:

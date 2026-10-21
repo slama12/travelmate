@@ -13,6 +13,47 @@ class DestinationResolveRequest(BaseModel):
     longitude: float | None = None
 
 
+class UsefulPhraseSchema(BaseModel):
+    french: str
+    local_translation: str
+    pronunciation: str
+    context_fr: str = "Vie courante"
+
+
+class PracticalInfoResponse(BaseModel):
+    destination_id: str
+    city_name: str
+    country_name: str
+    target_language: str
+    plugs: str
+    tipping: str
+    emergency: str
+    dial_code: str
+    currency: str
+    source: str
+    updated_at_fr: str
+    useful_phrases: list[UsefulPhraseSchema]
+
+
+class TranslateRequest(BaseModel):
+    """Formulaire du traducteur (2 champs maximum <= 4 champs)."""
+
+    text: str = Field(..., min_length=1, max_length=500)
+    target_language: str | None = Field(default=None, max_length=80)
+
+
+class TranslateResponse(BaseModel):
+    destination_id: str
+    city_name: str
+    target_language: str
+    source_text: str
+    translated_text: str
+    translation: str = ""
+    pronunciation: str
+    mode: str = "SIMULATED_DETERMINISTIC"
+    provider_label_fr: str = "Traducteur de voyage déterministe"
+
+
 class DestinationResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

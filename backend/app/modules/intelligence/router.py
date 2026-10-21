@@ -112,6 +112,9 @@ def _validate_slot(
     )
 
 
+from app.core.rbac import READ_ROLES, WRITE_ROLES, require_trip_access
+
+
 # ==============================================================================
 # UTILITAIRES DE CONTRÔLE D'ACCÈS & SANITISATION ANTI-INJECTION
 # ==============================================================================
@@ -119,29 +122,19 @@ async def _load_trip_and_destination_strict(
     db: AsyncSession,
     trip_id: str,
     user_id: str,
+    *,
+    write: bool = False,
 ) -> tuple[Trip, Destination]:
     """
-    Contrôle d'accès strict côté backend :
+    Contrôle d'accès strict par rôle côté backend :
     - 404 si le voyage n'existe pas ;
-    - 403 si le voyage appartient à un autre utilisateur.
+    - 403 si l'utilisateur n'est pas membre du voyage ou si son rôle (ex. lecteur/VIEWER)
+      ne permet pas l'action demandée.
     """
-    trip = await db.scalar(select(Trip).where(Trip.id == trip_id))
-    if not trip:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Séjour introuvable.",
-        )
-    if trip.owner_id != user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Accès refusé : vous ne pouvez consulter ou modifier que vos propres voyages.",
-        )
-    destination = await db.scalar(select(Destination).where(Destination.id == trip.destination_id))
-    if not destination:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Destination du séjour introuvable.",
-        )
+    allowed = WRITE_ROLES if write else READ_ROLES
+    trip, destination, _role = await require_trip_access(
+        db, trip_id, user_id, allowed_roles=allowed
+    )
     return trip, destination
 
 
@@ -599,7 +592,9 @@ async def accept_weather_alert_suggestion(
     Applique en un clic la suggestion météo choisie par l'utilisateur après re-validation stricte
     par le moteur de validation, puis synchronise Google Calendar.
     """
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
 
     item = await db.scalar(
@@ -682,7 +677,9 @@ async def reject_weather_alert_suggestion(
     """
     L'utilisateur refuse la suggestion météo : la visite reste inchangée et l'alerte est masquée.
     """
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
 
     item = await db.scalar(
@@ -777,7 +774,9 @@ async def generate_ai_itinerary_draft(
     - Intègre la météo et l'optimisation des temps de trajet.
     """
     registry = get_provider_registry()
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
     trip_dates = _compute_trip_dates_local(trip, dest_tz)
 
@@ -1220,7 +1219,9 @@ async def apply_ai_itinerary_draft(
     Valide et enregistre le brouillon IA après confirmation explicite de l'utilisateur,
     puis synchronise chaque visite avec Google Calendar.
     """
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
     registry = get_provider_registry()
 
@@ -1514,7 +1515,9 @@ async def reset_trip_chat_history(
     Réinitialise la conversation de l'assistant pour ce voyage ("Nouvelle conversation") :
     supprime l'historique des messages du chat sans toucher aux visites du programme.
     """
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     await db.execute(delete(ChatMessage).where(ChatMessage.trip_id == trip.id))
     await db.commit()
     return ChatConversationResponse(
@@ -1824,7 +1827,9 @@ async def send_trip_chat_message(
     """
     registry = get_provider_registry()
     settings = get_settings()
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
 
     hist_res = await db.scalars(
@@ -2668,7 +2673,9 @@ async def confirm_chat_proposed_action(
     de l'utilisateur ET validation par le moteur de validation.
     """
     registry = get_provider_registry()
-    trip, destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     dest_tz = destination.timezone or "UTC"
 
     msg = await db.scalar(
@@ -2865,7 +2872,9 @@ async def reject_chat_proposed_action(
     """
     Refuse la proposition de l'assistant : aucune modification n'est apportée au programme.
     """
-    trip, _destination = await _load_trip_and_destination_strict(db, trip_id, current_user.id)
+    trip, _destination = await _load_trip_and_destination_strict(
+        db, trip_id, current_user.id, write=True
+    )
     msg = await db.scalar(
         select(ChatMessage).where(
             ChatMessage.id == message_id,

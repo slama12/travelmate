@@ -63,6 +63,7 @@ class BudgetCategory(str, Enum):
     ACCOMMODATION = "ACCOMMODATION"
     ACTIVITY = "ACTIVITY"
     RESTAURANT = "RESTAURANT"
+    MEAL = "MEAL"
     TRANSPORT = "TRANSPORT"
     OTHER = "OTHER"
 

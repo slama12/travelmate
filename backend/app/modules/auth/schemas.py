@@ -34,4 +34,10 @@ class UserResponse(BaseModel):
 class AuthTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    csrf_token: str = ""
     user: UserResponse
+
+
+class CsrfTokenResponse(BaseModel):
+    csrf_token: str
+

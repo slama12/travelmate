@@ -16,7 +16,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from app.core.database import Base
 from app.models.enums import (
@@ -343,7 +343,28 @@ class BudgetItem(Base):
     currency: Mapped[str] = mapped_column(String(3), default="EUR", nullable=False)
     incurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
+    amount = synonym("actual_amount")
+    created_at = synonym("incurred_at")
+
     trip: Mapped["Trip"] = relationship("Trip", back_populates="budget_items")
+
+    def __init__(self, **kwargs: Any) -> None:
+        if "amount" in kwargs and "actual_amount" not in kwargs:
+            kwargs["actual_amount"] = kwargs.pop("amount")
+        if "actual_amount" in kwargs and "planned_amount" not in kwargs:
+            kwargs["planned_amount"] = kwargs["actual_amount"]
+        kwargs.pop("is_committed", None)
+        kwargs.pop("is_estimated", None)
+        kwargs.pop("metadata_json", None)
+        super().__init__(**kwargs)
+
+    @property
+    def is_committed(self) -> bool:
+        return True
+
+    @property
+    def is_estimated(self) -> bool:
+        return False
 
 
 class VaultDocument(Base):
@@ -353,16 +374,23 @@ class VaultDocument(Base):
     trip_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("trips.id", ondelete="CASCADE"), index=True, nullable=False
     )
+    owner_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     doc_type: Mapped[str] = mapped_column(
         String(32), default=DocumentType.FLIGHT_TICKET.value, nullable=False
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(100), default="application/pdf", nullable=False)
+    is_shared: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    expires_on: Mapped[date | None] = mapped_column(Date, nullable=True)
     encrypted_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     encryption_iv: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     encrypted_dek: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     checksum_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    created_at = synonym("updated_at")
 
     trip: Mapped["Trip"] = relationship("Trip", back_populates="vault_documents")
 
