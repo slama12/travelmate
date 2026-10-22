@@ -910,7 +910,14 @@ def test_step5v_frontend_render_microphone_button_tts_settings_and_accessibility
     assert 'data-testid="voice-confirm-silence-btn"' in source
     assert 'data-testid="double-confirmation-badge"' in source
 
-    # 4. Mode mains libres + message de confidentialité + fournisseur Whisper local dans Paramètres
+    # 4. Mode mains libres + Assistant vocal toujours actif + Exécuter sans confirmation + délais 3s/30s + message de confidentialité + fournisseur Whisper local dans Paramètres
+    assert 'data-testid="settings-always-active-voice-toggle"' in source
+    assert 'data-testid="settings-execute-without-confirmation-toggle"' in source
+    assert 'data-testid="settings-phrase-delay-group"' in source
+    assert 'data-testid="settings-standby-delay-group"' in source
+    assert 'data-testid="voice-listening-pill"' in source
+    assert 'data-testid="voice-undo-banner"' in source
+    assert 'data-testid="voice-undo-btn"' in source
     assert 'data-testid="settings-hands-free-toggle"' in source
     assert 'data-testid="voice-privacy-notice"' in source
     assert "service de reconnaissance du navigateur" in source
@@ -918,6 +925,7 @@ def test_step5v_frontend_render_microphone_button_tts_settings_and_accessibility
     assert 'data-testid="settings-stt-provider-whisper"' in source
 
     # 5. Accessibilité (lecteur d'écran, focus visible, grands boutons >= 44px)
+    assert "Assistant vocal actif, dites une commande" in source
     assert 'aria-live="polite"' in source
     assert 'role="status"' in source
     assert "focus-visible:ring-2" in source
@@ -938,3 +946,231 @@ def test_step5v_frontend_render_microphone_button_tts_settings_and_accessibility
     for idx, form_block in enumerate(forms, start=1):
         fields = re.findall(r"<(Input|Select|Textarea)\b", form_block)
         assert len(fields) <= 4, f"Formulaire #{idx} dépasse 4 champs ({len(fields)})"
+
+
+@pytest.mark.anyio
+async def test_hands_free_voice_direct_execution_undo_ambiguity_low_confidence_and_mandatory_confirmations():
+    """
+    Mode mains libres vocal :
+    1. Arrêt par la voix ("Arrête d'écouter") et reprise par "Écoute".
+    2. Jamais d'action sur une transcription de confiance faible (< 0.60).
+    3. Exécution directe sans confirmation pour ajouter ou déplacer une visite uniquement si :
+       lieu reconnu avec score élevé, date et heure explicites, créneau valide pour le moteur de validation.
+       Annonce à voix haute et fenêtre de 30 s pour dire "Annule" ou cliquer sur Annuler, qui restaure l'état précédent.
+    4. Confirmation toujours obligatoire (double confirmation) pour supprimer, réserver et payer.
+       Si lieu ambigu/inconnu ou créneau impossible : question à voix haute, aucune exécution.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        _user, token, _csrf = await _register_test_user(client, "handsfree")
+        headers = {"Authorization": f"Bearer {token}"}
+        trip, _dest, places = await _create_trip_for_user(client, token, "Marrakech", "1600.00")
+        trip_id = trip["id"]
+        first_place_name = places[0]["name"]  # Jardin Majorelle (11 nov 10:00)
+
+        # 1. Arrêt par la voix ("Arrête d'écouter") et reprise par "Écoute"
+        stop_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": "Arrête d'écouter",
+                "signal": "SPEECH",
+                "confidence": 0.95,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert stop_res.status_code == 200, stop_res.text
+        assert stop_res.json()["status"] == "LISTENING_STOPPED"
+        assert stop_res.json()["applied_change"] is False
+
+        resume_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": "Écoute",
+                "signal": "SPEECH",
+                "confidence": 0.95,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert resume_res.status_code == 200, resume_res.text
+        assert resume_res.json()["status"] == "LISTENING_RESUMED"
+        assert "Assistant vocal actif, dites une commande" in resume_res.json()["spoken_reply_fr"]
+
+        # 2. Jamais d'action sur une transcription de confiance faible (< 0.60)
+        low_conf_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": f"déplace {first_place_name} le 12 novembre à 14h",
+                "signal": "SPEECH",
+                "confidence": 0.42,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert low_conf_res.status_code == 200, low_conf_res.text
+        low_payload = low_conf_res.json()
+        assert low_payload["status"] == "REPEAT_REQUIRED"
+        assert low_payload["error_code"] == "LOW_CONFIDENCE"
+        assert low_payload["applied_change"] is False
+        assert low_payload["executed_directly"] is False
+
+        # 3. Exécution directe d'un déplacement (lieu score élevé, date + heure explicites, créneau valide)
+        move_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": f"déplace {first_place_name} le 12 novembre à 14h",
+                "signal": "SPEECH",
+                "confidence": 0.96,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert move_res.status_code == 200, move_res.text
+        move_payload = move_res.json()
+        assert move_payload["status"] == "EXECUTED_DIRECTLY"
+        assert move_payload["executed_directly"] is True
+        assert move_payload["applied_change"] is True
+        assert move_payload["can_undo"] is True
+        assert move_payload["undo_window_seconds"] == 30
+        assert move_payload["last_modification_history"] is not None
+        assert move_payload["last_modification_history"]["previous_visit_date"] == "2026-11-11"
+        assert move_payload["last_modification_history"]["previous_local_start_time"] == "10:00"
+        assert move_payload["last_modification_history"]["new_visit_date"] == "2026-11-12"
+        assert move_payload["last_modification_history"]["new_local_start_time"] == "14:00"
+        assert "Annule" in move_payload["spoken_reply_fr"]
+
+        sched_after_move = (
+            await client.get(f"/api/v1/itinerary/trip/{trip_id}", headers=headers)
+        ).json()["items"]
+        assert sched_after_move[0]["local_visit_date"] == "2026-11-12"
+        assert sched_after_move[0]["local_start_time"] == "14:00"
+
+        # 4. Dire "Annule" dans les 30 s restaure l'état précédent (visite, horaire, synchronisation agenda)
+        undo_voice_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": "Annule",
+                "signal": "SPEECH",
+                "confidence": 0.96,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert undo_voice_res.status_code == 200, undo_voice_res.text
+        undo_payload = undo_voice_res.json()
+        assert undo_payload["status"] == "UNDONE"
+        assert undo_payload["applied_change"] is True
+        assert "10:00" in undo_payload["spoken_reply_fr"]
+
+        sched_after_undo = (
+            await client.get(f"/api/v1/itinerary/trip/{trip_id}", headers=headers)
+        ).json()["items"]
+        assert sched_after_undo[0]["local_visit_date"] == "2026-11-11"
+        assert sched_after_undo[0]["local_start_time"] == "10:00"
+
+        # 5. Exécution directe d'un ajout ("ajoute Le Jardin Secret le 13 novembre à 10h") puis clic sur Annuler (/voice/undo)
+        add_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": "ajoute Le Jardin Secret le 13 novembre à 10h",
+                "signal": "SPEECH",
+                "confidence": 0.96,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert add_res.status_code == 200, add_res.text
+        add_payload = add_res.json()
+        assert add_payload["status"] == "EXECUTED_DIRECTLY"
+        assert add_payload["executed_directly"] is True
+        assert add_payload["applied_change"] is True
+
+        sched_after_add = (
+            await client.get(f"/api/v1/itinerary/trip/{trip_id}", headers=headers)
+        ).json()["items"]
+        assert len(sched_after_add) == 2
+
+        undo_btn_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/undo",
+            headers=headers,
+            json={"message_id": add_payload["undo_message_id"]},
+        )
+        assert undo_btn_res.status_code == 200, undo_btn_res.text
+        assert undo_btn_res.json()["status"] == "UNDONE"
+
+        sched_after_btn_undo = (
+            await client.get(f"/api/v1/itinerary/trip/{trip_id}", headers=headers)
+        ).json()["items"]
+        assert len(sched_after_btn_undo) == 1
+
+        # 6. Lieu ambigu ("mets le Jardin le 12 novembre à 10h") -> question à voix haute, aucune exécution
+        ambig_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": "mets le Jardin le 12 novembre à 10h",
+                "signal": "SPEECH",
+                "confidence": 0.96,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert ambig_res.status_code == 200, ambig_res.text
+        ambig_payload = ambig_res.json()
+        assert ambig_payload["status"] == "ASK"
+        assert ambig_payload["executed_directly"] is False
+        assert ambig_payload["applied_change"] is False
+        assert "?" in ambig_payload["spoken_reply_fr"]
+        assert "Jardin" in ambig_payload["spoken_reply_fr"]
+
+        # 7. Créneau impossible (lieu fermé à 23h) -> question à voix haute, aucune exécution
+        closed_res = await client.post(
+            f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+            headers=headers,
+            json={
+                "transcript": "mets le Jardin Secret le 13 novembre à 23h",
+                "signal": "SPEECH",
+                "confidence": 0.96,
+                "hands_free": True,
+                "execute_without_confirmation": True,
+            },
+        )
+        assert closed_res.status_code == 200, closed_res.text
+        closed_payload = closed_res.json()
+        assert closed_payload["status"] == "ASK"
+        assert closed_payload["executed_directly"] is False
+        assert closed_payload["applied_change"] is False
+        assert "?" in closed_payload["spoken_reply_fr"]
+
+        # 8. Confirmation toujours obligatoire pour supprimer, réserver et payer (même avec execute_without_confirmation=True)
+        for sensitive_cmd, expected_type in [
+            (f"supprime la visite {first_place_name}", "REMOVE_VISIT"),
+            (f"réserve la visite {first_place_name}", "BOOK_RESERVATION"),
+            (f"paie la réservation {first_place_name}", "PROCESS_PAYMENT"),
+        ]:
+            sens_res = await client.post(
+                f"/api/v1/itinerary/trip/{trip_id}/voice/command",
+                headers=headers,
+                json={
+                    "transcript": sensitive_cmd,
+                    "signal": "SPEECH",
+                    "confidence": 0.96,
+                    "hands_free": True,
+                    "execute_without_confirmation": True,
+                },
+            )
+            assert sens_res.status_code == 200, sens_res.text
+            sens_payload = sens_res.json()
+            assert sens_payload["status"] == "PENDING_CONFIRMATION"
+            assert sens_payload["executed_directly"] is False
+            assert sens_payload["applied_change"] is False
+            assert sens_payload["requires_double_confirmation"] is True
+            assert sens_payload["proposed_action"]["action_type"] == expected_type
+

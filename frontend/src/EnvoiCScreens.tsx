@@ -380,6 +380,10 @@ export interface VoiceAccessibilitySettings {
   ttsEnabled: boolean;
   ttsRate: number;
   handsFree: boolean;
+  alwaysActiveAssistant: boolean;
+  executeWithoutConfirmation: boolean;
+  phraseEndDelaySeconds: number;
+  standbyDelaySeconds: number;
   sttProvider: VoiceSTTProviderId;
 }
 
@@ -388,15 +392,19 @@ export const VOICE_SETTINGS_STORAGE_KEY = "tm_voice_settings_v1";
 export const DEFAULT_VOICE_SETTINGS: VoiceAccessibilitySettings = {
   ttsEnabled: true,
   ttsRate: 1.0,
-  handsFree: false,
+  handsFree: true,
+  alwaysActiveAssistant: true,
+  executeWithoutConfirmation: true,
+  phraseEndDelaySeconds: 3,
+  standbyDelaySeconds: 30,
   sttProvider: "web_speech",
 };
 
 export const WEB_SPEECH_PRIVACY_NOTICE_FR =
-  "Confidentialité : en mode reconnaissance vocale du navigateur (Web Speech API, fr-FR), l'audio peut transiter par le service de reconnaissance du navigateur. Vous pouvez sélectionner Whisper local pour un traitement 100 % local.";
+  "Confidentialité audio : en mode reconnaissance vocale du navigateur (Web Speech API, fr-FR) et avec l'exécution sans confirmation activée, le flux audio du microphone est analysé uniquement pendant l'écoute active (« J'écoute ») et peut transiter par le service de reconnaissance du navigateur. Le micro se met automatiquement en pause après 30 s de silence ou sur la commande « Arrête d'écouter ». Vous pouvez désactiver l'exécution sans confirmation ou choisir Whisper local à tout moment.";
 
 export const WHISPER_LOCAL_PRIVACY_NOTICE_FR =
-  "Confidentialité : avec Whisper local (fr-FR), l'audio est traité localement sans transiter par le service de reconnaissance externe du navigateur.";
+  "Confidentialité audio : avec Whisper local (fr-FR), l'audio du microphone est traité localement sans transiter par le service de reconnaissance externe du navigateur.";
 
 export function loadVoiceAccessibilitySettings(): VoiceAccessibilitySettings {
   if (typeof window === "undefined") return DEFAULT_VOICE_SETTINGS;
@@ -404,6 +412,8 @@ export function loadVoiceAccessibilitySettings(): VoiceAccessibilitySettings {
     const raw = window.localStorage.getItem(VOICE_SETTINGS_STORAGE_KEY);
     if (!raw) return DEFAULT_VOICE_SETTINGS;
     const parsed = JSON.parse(raw);
+    const phraseDelay = Number(parsed.phraseEndDelaySeconds);
+    const standbyDelay = Number(parsed.standbyDelaySeconds);
     return {
       ttsEnabled:
         typeof parsed.ttsEnabled === "boolean"
@@ -412,7 +422,26 @@ export function loadVoiceAccessibilitySettings(): VoiceAccessibilitySettings {
       ttsRate: [0.8, 1.0, 1.2, 1.5].includes(Number(parsed.ttsRate))
         ? Number(parsed.ttsRate)
         : DEFAULT_VOICE_SETTINGS.ttsRate,
-      handsFree: Boolean(parsed.handsFree),
+      handsFree:
+        typeof parsed.handsFree === "boolean"
+          ? parsed.handsFree
+          : DEFAULT_VOICE_SETTINGS.handsFree,
+      alwaysActiveAssistant:
+        typeof parsed.alwaysActiveAssistant === "boolean"
+          ? parsed.alwaysActiveAssistant
+          : DEFAULT_VOICE_SETTINGS.alwaysActiveAssistant,
+      executeWithoutConfirmation:
+        typeof parsed.executeWithoutConfirmation === "boolean"
+          ? parsed.executeWithoutConfirmation
+          : DEFAULT_VOICE_SETTINGS.executeWithoutConfirmation,
+      phraseEndDelaySeconds:
+        Number.isFinite(phraseDelay) && phraseDelay >= 1 && phraseDelay <= 10
+          ? phraseDelay
+          : DEFAULT_VOICE_SETTINGS.phraseEndDelaySeconds,
+      standbyDelaySeconds:
+        Number.isFinite(standbyDelay) && standbyDelay >= 5 && standbyDelay <= 120
+          ? standbyDelay
+          : DEFAULT_VOICE_SETTINGS.standbyDelaySeconds,
       sttProvider:
         parsed.sttProvider === "whisper_local" ? "whisper_local" : "web_speech",
     };
@@ -437,7 +466,21 @@ export function speakFrenchResponse(
   text: string,
   options?: { rate?: number; enabled?: boolean }
 ): boolean {
-  if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    const w = window as any;
+    if (! Array.isArray(w.__TM_SPOKEN_UTTERANCES__)) {
+      w.__TM_SPOKEN_UTTERANCES__ = [];
+    }
+    if (text.trim()) {
+      w.__TM_SPOKEN_UTTERANCES__.push(text.trim());
+    }
+  } catch {
+    // ignore
+  }
+  if (!("speechSynthesis" in window)) {
     return false;
   }
   const settings = loadVoiceAccessibilitySettings();
@@ -485,15 +528,19 @@ export function stopSpeechSynthesis(): void {
 
 export interface FrontendVoiceRecognitionCallbacks {
   onListeningChange: (listening: boolean) => void;
-  onTranscript: (transcript: string, isFinal: boolean) => void;
+  onTranscript: (transcript: string, isFinal: boolean, confidence?: number) => void;
   onSilenceStop: () => void;
+  onStandbyPause?: (messageFr: string) => void;
+  onLowConfidence?: (transcript: string, confidence: number, messageFr: string) => void;
+  onAntiLoopStop?: (messageFr: string) => void;
   onError: (
     errorCode:
       | "MIC_DENIED"
       | "BROWSER_UNSUPPORTED"
       | "UNRECOGNIZED_SPEECH"
       | "NOISE"
-      | "SILENCE",
+      | "SILENCE"
+      | "LOW_CONFIDENCE",
     messageFr: string
   ) => void;
 }
@@ -505,6 +552,30 @@ export interface FrontendVoiceSTTProvider {
   readonly privacyNoticeFr: string;
   isSupported(): boolean;
   startListening(callbacks: FrontendVoiceRecognitionCallbacks): () => void;
+}
+
+function isIncompleteActionPhraseWithoutTime(text: string): boolean {
+  const norm = text.trim().toLowerCase();
+  if (!norm) return false;
+  const hasActionVerb =
+    /\b(ajoute|ajouter|rajoute|mets|mettre|planifie|d[ée]place|d[ée]placer|change|modifie|d[ée]cale)\b/i.test(
+      norm
+    );
+  const hasTime = /\b\d{1,2}\s*(?:h|:)\s*\d{0,2}\b/i.test(norm);
+  return hasActionVerb && !hasTime;
+}
+
+function isContinuationDateOrTimeFragment(text: string): boolean {
+  const norm = text.trim().toLowerCase();
+  if (!norm) return false;
+  const hasActionVerb =
+    /\b(ajoute|ajouter|rajoute|mets|mettre|planifie|d[ée]place|d[ée]placer|supprime|supprimer|retire|retirer|annule|annuler|[ée]coute|arr[êe]te|oui|non)\b/i.test(
+      norm
+    );
+  if (hasActionVerb) return false;
+  return /\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|demain|aujourd|\d{1,2}\s*(?:novembre|octobre|d[ée]cembre|janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[ûu]t|septembre)|\d{1,2}\s*(?:h|:)\s*\d{0,2}|au\s+\d{1,2}|le\s+\d{1,2}|[àa]\s*\d{1,2})\b/i.test(
+    norm
+  );
 }
 
 export class WebSpeechFrontendProvider implements FrontendVoiceSTTProvider {
@@ -528,71 +599,289 @@ export class WebSpeechFrontendProvider implements FrontendVoiceSTTProvider {
       return () => {};
     }
 
+    const w = window as any;
+    if (w.__TM_MIC_DENIED__ === true) {
+      callbacks.onListeningChange(false);
+      callbacks.onError(
+        "MIC_DENIED",
+        "Accès au microphone refusé. Veuillez autoriser le microphone dans votre navigateur ou activer l'écoute après autorisation."
+      );
+      return () => {};
+    }
+
+    const settings = loadVoiceAccessibilitySettings();
+    const getPhraseScale = () => {
+      const scale = w.__TM_VOICE_PHRASE_SCALE__ ?? w.__TM_VOICE_TIMER_SCALE__;
+      return typeof scale === "number" && scale > 0 ? scale : 1;
+    };
+    const getStandbyScale = () => {
+      const scale = w.__TM_VOICE_STANDBY_SCALE__ ?? w.__TM_VOICE_TIMER_SCALE__;
+      return typeof scale === "number" && scale > 0 ? scale : 1;
+    };
+    const getPhraseEndMs = () =>
+      Math.max(
+        120,
+        Math.round((settings.phraseEndDelaySeconds || 3) * 1000 * getPhraseScale())
+      );
+    const getStandbyMs = () =>
+      Math.max(
+        250,
+        Math.round((settings.standbyDelaySeconds || 30) * 1000 * getStandbyScale())
+      );
+
     const SpeechRecognitionCtor =
       window.SpeechRecognition || window.webkitSpeechRecognition;
     const recognition = new SpeechRecognitionCtor();
     recognition.lang = "fr-FR";
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
+    w.__TM_ACTIVE_SPEECH_RECOGNITION__ = recognition;
 
-    let stopped = false;
-    const silenceTimer = window.setTimeout(() => {
-      if (!stopped) {
-        stopped = true;
-        try {
-          recognition.stop();
-        } catch {
-          // ignore
-        }
-        callbacks.onListeningChange(false);
-        callbacks.onSilenceStop();
+    let stoppedManually = false;
+    let inStandby = false;
+    let pausedByVoice = false;
+    let phraseTimer: number | null = null;
+    let standbyTimer: number | null = null;
+    let accumulatedChunks: string[] = [];
+    let currentInterim = "";
+    let lastConfidence = 0.95;
+    let lastIncompletePrefix = "";
+    let lastIncompleteTimestamp = 0;
+    const restartTimestamps: number[] = [];
+    const MAX_RESTARTS_IN_WINDOW = 5;
+    const RESTART_WINDOW_MS = 10000;
+
+    const clearTimers = () => {
+      if (phraseTimer !== null) {
+        window.clearTimeout(phraseTimer);
+        phraseTimer = null;
       }
-    }, 6500);
+      if (standbyTimer !== null) {
+        window.clearTimeout(standbyTimer);
+        standbyTimer = null;
+      }
+    };
+
+    const flushAccumulatedPhrase = () => {
+      phraseTimer = null;
+      const combined = [...accumulatedChunks, currentInterim]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      accumulatedChunks = [];
+      currentInterim = "";
+      if (!combined) return;
+
+      const phraseEndMs = getPhraseEndMs();
+      let finalSentence = combined;
+      if (
+        lastIncompletePrefix &&
+        Date.now() - lastIncompleteTimestamp <= Math.max(10000, phraseEndMs * 2.5) &&
+        isContinuationDateOrTimeFragment(combined)
+      ) {
+        finalSentence = `${lastIncompletePrefix} ${combined}`.replace(/\s+/g, " ").trim();
+        lastIncompletePrefix = "";
+      } else if (isIncompleteActionPhraseWithoutTime(combined)) {
+        lastIncompletePrefix = combined;
+        lastIncompleteTimestamp = Date.now();
+      } else {
+        lastIncompletePrefix = "";
+      }
+
+      callbacks.onTranscript(finalSentence, true, lastConfidence);
+    };
+
+    const resetStandbyTimer = () => {
+      if (standbyTimer !== null) {
+        window.clearTimeout(standbyTimer);
+      }
+      const standbyMs = getStandbyMs();
+      standbyTimer = window.setTimeout(() => {
+        if (!stoppedManually && !inStandby && !pausedByVoice) {
+          if (accumulatedChunks.length > 0 || currentInterim.trim()) {
+            flushAccumulatedPhrase();
+          }
+          inStandby = true;
+          try {
+            recognition.stop();
+          } catch {
+            // ignore
+          }
+          callbacks.onListeningChange(false);
+          const standbyMsg = `Veille vocale activée après ${settings.standbyDelaySeconds || 30} s sans parole : microphone mis en pause. Dites « Écoute » ou cliquez sur le bouton pour reprendre.`;
+          if (callbacks.onStandbyPause) {
+            callbacks.onStandbyPause(standbyMsg);
+          } else {
+            callbacks.onSilenceStop();
+          }
+        }
+      }, standbyMs);
+    };
+
+    const schedulePhraseEndTimer = (currentFullText: string) => {
+      if (phraseTimer !== null) {
+        window.clearTimeout(phraseTimer);
+      }
+      const phraseEndMs = getPhraseEndMs();
+      // Si la phrase est manifestement en cours ("Déplace le Jardin Secret" sans date ni heure),
+      // on laisse une marge supplémentaire pour absorber une pause de 3 s au milieu d'une phrase.
+      const extraHold = isIncompleteActionPhraseWithoutTime(currentFullText)
+        ? Math.round(phraseEndMs * 0.45)
+        : 0;
+      phraseTimer = window.setTimeout(() => {
+        flushAccumulatedPhrase();
+      }, phraseEndMs + extraHold);
+    };
 
     recognition.onstart = () => {
-      callbacks.onListeningChange(true);
+      if (!stoppedManually && !inStandby && !pausedByVoice) {
+        callbacks.onListeningChange(true);
+        resetStandbyTimer();
+      }
     };
 
     recognition.onresult = (event: any) => {
-      let transcript = "";
-      let isFinal = false;
-      for (let i = event.resultIndex || 0; i < event.results.length; i++) {
-        transcript += event.results[i][0].transcript;
-        if (event.results[i].isFinal) isFinal = true;
+      if (stoppedManually) return;
+
+      let latestPiece = "";
+      let pieceIsFinal = false;
+      let pieceConfidence = 0.95;
+
+      const startIdx = typeof event?.resultIndex === "number" ? event.resultIndex : 0;
+      const resultsLen = event?.results?.length || 0;
+      for (let i = startIdx; i < resultsLen; i++) {
+        const resItem = event.results[i];
+        const alt = resItem && resItem[0] ? resItem[0] : null;
+        if (!alt) continue;
+        latestPiece += String(alt.transcript || "");
+        if (typeof alt.confidence === "number" && alt.confidence > 0) {
+          pieceConfidence = alt.confidence;
+        }
+        if (resItem.isFinal) {
+          pieceIsFinal = true;
+        }
       }
-      if (transcript.trim()) {
-        callbacks.onTranscript(transcript.trim(), isFinal);
+
+      const trimmedPiece = latestPiece.trim();
+      if (!trimmedPiece) return;
+
+      // Exigence 6 : Jamais d'action sur une transcription de confiance faible (< 0.60)
+      if (pieceConfidence < 0.6) {
+        if (phraseTimer !== null) {
+          window.clearTimeout(phraseTimer);
+          phraseTimer = null;
+        }
+        accumulatedChunks = [];
+        currentInterim = "";
+        const lowConfMsg =
+          "Confiance de transcription vocale trop faible : aucune action n'a été exécutée. Pouvez-vous répéter ?";
+        if (callbacks.onLowConfidence) {
+          callbacks.onLowConfidence(trimmedPiece, pieceConfidence, lowConfMsg);
+        }
+        callbacks.onError("LOW_CONFIDENCE", lowConfMsg);
+        return;
       }
+
+      // En veille ou en pause vocale, seul le mot de reprise ("Écoute") réactive l'écoute
+      if (inStandby || pausedByVoice) {
+        if (/^\s*(?:[ée]coute|reprends\s+l['’ ]?[ée]coute)\s*[.!]*\s*$/i.test(trimmedPiece)) {
+          inStandby = false;
+          pausedByVoice = false;
+          accumulatedChunks = [];
+          currentInterim = "";
+          callbacks.onListeningChange(true);
+          resetStandbyTimer();
+          callbacks.onTranscript("Écoute", true, pieceConfidence);
+        }
+        return;
+      }
+
+      resetStandbyTimer();
+      lastConfidence = pieceConfidence;
+
+      // Arrêt immédiat par la voix ("Arrête d'écouter")
+      if (
+        pieceIsFinal &&
+        /^\s*(?:arr[êe]te\s+d['’ ]?[ée]couter|stop\s+[ée]coute|arr[êe]te\s+l['’ ]?[ée]coute)\s*[.!]*\s*$/i.test(
+          trimmedPiece
+        )
+      ) {
+        clearTimers();
+        accumulatedChunks = [];
+        currentInterim = "";
+        pausedByVoice = true;
+        callbacks.onListeningChange(false);
+        callbacks.onTranscript(trimmedPiece, true, lastConfidence);
+        return;
+      }
+
+      if (pieceIsFinal) {
+        const prevJoined = accumulatedChunks.join(" ").trim();
+        if (prevJoined && trimmedPiece.toLowerCase().startsWith(prevJoined.toLowerCase())) {
+          accumulatedChunks = [trimmedPiece];
+        } else {
+          accumulatedChunks.push(trimmedPiece);
+        }
+        currentInterim = "";
+      } else {
+        currentInterim = trimmedPiece;
+      }
+
+      const previewText = [...accumulatedChunks, currentInterim]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      // Commandes immédiates de contrôle ("Écoute", "Annule", "Oui", "Non")
+      if (
+        pieceIsFinal &&
+        /^\s*(?:[ée]coute|annule|annuler|oui|non)\s*[.!]*\s*$/i.test(previewText) &&
+        accumulatedChunks.length === 1 &&
+        !lastIncompletePrefix
+      ) {
+        if (phraseTimer !== null) {
+          window.clearTimeout(phraseTimer);
+          phraseTimer = null;
+        }
+        accumulatedChunks = [];
+        currentInterim = "";
+        callbacks.onTranscript(previewText, true, lastConfidence);
+        return;
+      }
+
+      callbacks.onTranscript(previewText, false, lastConfidence);
+      schedulePhraseEndTimer(previewText);
     };
 
     recognition.onspeechend = () => {
-      window.clearTimeout(silenceTimer);
-      try {
-        recognition.stop();
-      } catch {
-        // ignore
+      // En écoute continue, on laisse le minuteur de fin de phrase (3 s par défaut) décider de l'envoi.
+      const previewText = [...accumulatedChunks, currentInterim]
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      if (previewText && phraseTimer === null) {
+        schedulePhraseEndTimer(previewText);
       }
-      callbacks.onListeningChange(false);
-      callbacks.onSilenceStop();
     };
 
     recognition.onerror = (event: any) => {
-      window.clearTimeout(silenceTimer);
-      stopped = true;
-      callbacks.onListeningChange(false);
       const err = String(event?.error || "").toLowerCase();
       if (err === "not-allowed" || err === "permission-denied" || err === "service-not-allowed") {
+        stoppedManually = true;
+        clearTimers();
+        callbacks.onListeningChange(false);
         callbacks.onError(
           "MIC_DENIED",
           "Accès au microphone refusé. Veuillez autoriser le microphone dans votre navigateur ou saisir votre demande au clavier."
         );
       } else if (err === "no-speech") {
-        callbacks.onSilenceStop();
-        callbacks.onError(
-          "SILENCE",
-          "Silence détecté : l'écoute vocale s'est arrêtée automatiquement."
-        );
+        // En mode continu, la veille est gérée par standbyTimer (30 s par défaut)
       } else if (err === "audio-capture" || err === "network") {
         callbacks.onError(
           "NOISE",
@@ -604,14 +893,46 @@ export class WebSpeechFrontendProvider implements FrontendVoiceSTTProvider {
     };
 
     recognition.onend = () => {
-      window.clearTimeout(silenceTimer);
-      callbacks.onListeningChange(false);
+      if (stoppedManually || inStandby) {
+        clearTimers();
+        callbacks.onListeningChange(false);
+        return;
+      }
+      // Exigence 2 : Redémarrage automatique après onend avec limite anti-boucle
+      const now = Date.now();
+      while (restartTimestamps.length > 0 && now - restartTimestamps[0] > RESTART_WINDOW_MS) {
+        restartTimestamps.shift();
+      }
+      if (restartTimestamps.length >= MAX_RESTARTS_IN_WINDOW) {
+        stoppedManually = true;
+        clearTimers();
+        callbacks.onListeningChange(false);
+        const loopMsg =
+          "Écoute vocale mise en pause automatiquement (limite anti-boucle atteinte). Cliquez sur « Écoute » pour reprendre.";
+        if (callbacks.onAntiLoopStop) {
+          callbacks.onAntiLoopStop(loopMsg);
+        } else {
+          callbacks.onSilenceStop();
+        }
+        return;
+      }
+      restartTimestamps.push(now);
+      try {
+        recognition.start();
+      } catch {
+        clearTimers();
+        callbacks.onListeningChange(false);
+      }
     };
 
     try {
       recognition.start();
+      if (!stoppedManually && !inStandby && !pausedByVoice) {
+        callbacks.onListeningChange(true);
+        resetStandbyTimer();
+      }
     } catch {
-      window.clearTimeout(silenceTimer);
+      clearTimers();
       callbacks.onListeningChange(false);
       callbacks.onError(
         "MIC_DENIED",
@@ -620,8 +941,8 @@ export class WebSpeechFrontendProvider implements FrontendVoiceSTTProvider {
     }
 
     return () => {
-      stopped = true;
-      window.clearTimeout(silenceTimer);
+      stoppedManually = true;
+      clearTimers();
       try {
         recognition.stop();
       } catch {
@@ -643,8 +964,6 @@ export class WhisperLocalFrontendProvider implements FrontendVoiceSTTProvider {
   }
 
   startListening(callbacks: FrontendVoiceRecognitionCallbacks): () => void {
-    // Si l'API SpeechRecognition du navigateur est présente pour capturer le flux localement, on l'utilise ;
-    // sinon l'arrêt par silence reste pris en charge de façon déterministe.
     const webProvider = new WebSpeechFrontendProvider();
     if (webProvider.isSupported()) {
       return webProvider.startListening(callbacks);
@@ -2051,12 +2370,18 @@ export function VoiceAccessibilityToolbar({
   tripId,
   defaultSummaryFr,
   onSelectDayNumber,
+  onScheduleUpdated,
+  onChatUpdated,
+  onPendingProposalReceived,
 }: {
   apiBase: string;
   token: string;
   tripId?: string | null;
   defaultSummaryFr?: string;
   onSelectDayNumber?: (dayNumber: number) => void;
+  onScheduleUpdated?: () => void;
+  onChatUpdated?: () => void;
+  onPendingProposalReceived?: () => void;
 }) {
   const navigate = useNavigate();
   const [voiceSettings, setVoiceSettings] = useState<VoiceAccessibilitySettings>(
@@ -2066,9 +2391,53 @@ export function VoiceAccessibilityToolbar({
   const [spokenReplyFr, setSpokenReplyFr] = useState<string>(
     defaultSummaryFr || ""
   );
+  const [liveTranscriptFr, setLiveTranscriptFr] = useState<string>("");
+  const [autoStartStatusFr, setAutoStartStatusFr] = useState<string>("");
+  const [standbyStatusFr, setStandbyStatusFr] = useState<string>("");
   const [errorFr, setErrorFr] = useState<string>("");
   const [ttsPaused, setTtsPaused] = useState<boolean>(false);
+  const [undoBanner, setUndoBanner] = useState<{
+    messageId: string;
+    summaryFr: string;
+    history: Record<string, any> | null;
+    remainingSeconds: number;
+  } | null>(null);
+  const [undoRestoredFr, setUndoRestoredFr] = useState<string>("");
+  const [pendingConfirmMsgId, setPendingConfirmMsgId] = useState<string>("");
+  const [pendingConfirmSummaryFr, setPendingConfirmSummaryFr] = useState<string>("");
   const stopRef = useRef<(() => void) | null>(null);
+  const tripIdRef = useRef<string | null | undefined>(tripId);
+  const tokenRef = useRef<string>(token);
+  const voiceSettingsRef = useRef<VoiceAccessibilitySettings>(voiceSettings);
+  const pendingConfirmMsgIdRef = useRef<string>(pendingConfirmMsgId);
+  const callbacksRef = useRef({
+    onSelectDayNumber,
+    onScheduleUpdated,
+    onChatUpdated,
+    onPendingProposalReceived,
+  });
+  callbacksRef.current = {
+    onSelectDayNumber,
+    onScheduleUpdated,
+    onChatUpdated,
+    onPendingProposalReceived,
+  };
+
+  useEffect(() => {
+    tripIdRef.current = tripId;
+  }, [tripId]);
+
+  useEffect(() => {
+    tokenRef.current = token;
+  }, [token]);
+
+  useEffect(() => {
+    voiceSettingsRef.current = voiceSettings;
+  }, [voiceSettings]);
+
+  useEffect(() => {
+    pendingConfirmMsgIdRef.current = pendingConfirmMsgId;
+  }, [pendingConfirmMsgId]);
 
   useEffect(() => {
     const sync = () => setVoiceSettings(loadVoiceAccessibilitySettings());
@@ -2082,60 +2451,302 @@ export function VoiceAccessibilityToolbar({
     }
   }, [defaultSummaryFr]);
 
-  async function runVoiceCommand(transcriptText: string) {
+  // Compte à rebours de 30 s pour l'annulation d'une modification directe
+  useEffect(() => {
+    if (!undoBanner) return;
+    const interval = window.setInterval(() => {
+      setUndoBanner((prev) => {
+        if (!prev) return null;
+        if (prev.remainingSeconds <= 1) return null;
+        return { ...prev, remainingSeconds: prev.remainingSeconds - 1 };
+      });
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [Boolean(undoBanner)]);
+
+  async function resolveActiveTripId(): Promise<string | null> {
+    if (tripIdRef.current) return tripIdRef.current;
+    if (typeof localStorage !== "undefined") {
+      const storedId = localStorage.getItem("travelmate_active_trip_id");
+      if (storedId) {
+        tripIdRef.current = storedId;
+        return storedId;
+      }
+    }
+    const activeToken = tokenRef.current;
+    if (!activeToken) return null;
+    try {
+      const resp = await fetch(`${apiBase}/api/v1/trips`, {
+        headers: { Authorization: `Bearer ${activeToken}` },
+      });
+      if (!resp.ok) return null;
+      const trips = await resp.json();
+      if (Array.isArray(trips) && trips.length > 0 && trips[0]?.id) {
+        tripIdRef.current = String(trips[0].id);
+        return tripIdRef.current;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
+  async function handleUndoDirectModification(explicitMessageId?: string) {
+    const activeTripId = await resolveActiveTripId();
+    const activeToken = tokenRef.current;
+    if (!activeTripId || !activeToken) return;
     setErrorFr("");
-    if (!tripId || !token) {
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/itinerary/trip/${activeTripId}/voice/undo`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${activeToken}`,
+          },
+          body: JSON.stringify({
+            message_id: explicitMessageId || undoBanner?.messageId || null,
+          }),
+        }
+      );
+      const data = await resp.json().catch(() => null);
+      if (resp.ok && data) {
+        setUndoBanner(null);
+        const msg =
+          data.spoken_reply_fr ||
+          "Modification annulée : l'état précédent (visite, horaire et synchronisation agenda) a été restauré.";
+        setUndoRestoredFr(msg);
+        setSpokenReplyFr(msg);
+        speakFrenchResponse(msg, {
+          rate: voiceSettingsRef.current.ttsRate,
+          enabled: voiceSettingsRef.current.ttsEnabled,
+        });
+        callbacksRef.current.onScheduleUpdated?.();
+        callbacksRef.current.onChatUpdated?.();
+      } else {
+        const errMsg =
+          data?.spoken_reply_fr ||
+          "Le délai de 30 secondes pour annuler est dépassé ou aucune modification récente n'est annulable.";
+        setErrorFr(errMsg);
+      }
+    } catch {
+      setErrorFr("Impossible d'annuler la dernière modification vocale.");
+    }
+  }
+
+  async function handleVoiceConfirmPending(word: string) {
+    const activeTripId = await resolveActiveTripId();
+    const activeToken = tokenRef.current;
+    const msgId = pendingConfirmMsgIdRef.current;
+    if (!activeTripId || !activeToken || !msgId) return;
+    setErrorFr("");
+    try {
+      const resp = await fetch(
+        `${apiBase}/api/v1/itinerary/trip/${activeTripId}/chat/${msgId}/voice-confirm`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${activeToken}`,
+          },
+          body: JSON.stringify({
+            message_id: msgId,
+            transcript: word,
+            signal: "SPEECH",
+            confidence: 0.95,
+            provider: voiceSettingsRef.current.sttProvider,
+          }),
+        }
+      );
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.spoken_reply_fr) {
+        setSpokenReplyFr(data.spoken_reply_fr);
+        speakFrenchResponse(data.spoken_reply_fr, {
+          rate: voiceSettingsRef.current.ttsRate,
+          enabled: voiceSettingsRef.current.ttsEnabled,
+        });
+      }
+      if (
+        data.action_status === "CONFIRMED" ||
+        data.action_status === "REJECTED"
+      ) {
+        setPendingConfirmMsgId("");
+        setPendingConfirmSummaryFr("");
+      } else if (data.action_status === "AWAITING_SECOND_CONFIRMATION") {
+        setPendingConfirmSummaryFr(data.spoken_reply_fr || "");
+      }
+      callbacksRef.current.onScheduleUpdated?.();
+      callbacksRef.current.onChatUpdated?.();
+    } catch {
+      // ignore
+    }
+  }
+
+  async function runVoiceCommand(
+    transcriptText: string,
+    confidenceScore: number = 0.95
+  ) {
+    setErrorFr("");
+    setUndoRestoredFr("");
+    const cleanText = transcriptText.trim();
+    if (!cleanText) return;
+
+    // Exigence 6 : Jamais d'action sur une transcription de confiance faible
+    if (confidenceScore < 0.6) {
+      const lowMsg =
+        "Confiance de transcription vocale trop faible : aucune action n'a été exécutée. Pouvez-vous répéter ?";
+      setErrorFr(lowMsg);
+      speakFrenchResponse(lowMsg, {
+        rate: voiceSettingsRef.current.ttsRate,
+        enabled: voiceSettingsRef.current.ttsEnabled,
+      });
+      return;
+    }
+
+    // Exigence 1 : Arrêt par la voix ("Arrête d'écouter") et reprise par "Écoute"
+    if (
+      /^\s*(?:arr[êe]te\s+d['’ ]?[ée]couter|stop\s+[ée]coute|arr[êe]te\s+l['’ ]?[ée]coute)\s*[.!]*\s*$/i.test(
+        cleanText
+      )
+    ) {
+      setListening(false);
+      const stopMsg =
+        "Écoute vocale mise en pause. Dites « Écoute » ou cliquez sur le bouton pour reprendre.";
+      setStandbyStatusFr(stopMsg);
+      setSpokenReplyFr(stopMsg);
+      speakFrenchResponse(stopMsg, {
+        rate: voiceSettingsRef.current.ttsRate,
+        enabled: voiceSettingsRef.current.ttsEnabled,
+      });
+      return;
+    }
+
+    if (
+      /^\s*(?:[ée]coute|reprends\s+l['’ ]?[ée]coute)\s*[.!]*\s*$/i.test(
+        cleanText
+      )
+    ) {
+      setStandbyStatusFr("");
+      setErrorFr("");
+      setListening(true);
+      const resumeMsg = "Assistant vocal actif, dites une commande";
+      setAutoStartStatusFr(resumeMsg);
+      setSpokenReplyFr(resumeMsg);
+      speakFrenchResponse(resumeMsg, {
+        rate: voiceSettingsRef.current.ttsRate,
+        enabled: voiceSettingsRef.current.ttsEnabled,
+      });
+      return;
+    }
+
+    // Exigence 3 : "Annule" restaure l'état précédent dans les 30 s
+    if (/^\s*(?:annule|annuler|annule\s+la\s+modification)\s*[.!]*\s*$/i.test(cleanText)) {
+      await handleUndoDirectModification();
+      return;
+    }
+
+    // Exigence 4 : Si une confirmation est en attente et que l'utilisateur dit "oui" ou "non"
+    if (
+      pendingConfirmMsgIdRef.current &&
+      /^\s*(?:oui|non)\s*[.!]*\s*$/i.test(cleanText)
+    ) {
+      await handleVoiceConfirmPending(cleanText);
+      return;
+    }
+
+    const activeTripId = await resolveActiveTripId();
+    const activeToken = tokenRef.current;
+    const currentSettings = voiceSettingsRef.current;
+
+    if (!activeTripId || !activeToken) {
       const fallback =
-        defaultSummaryFr ||
-        `Commande vocale reçue : ${transcriptText}.`;
+        defaultSummaryFr || `Commande vocale reçue : ${cleanText}.`;
       setSpokenReplyFr(fallback);
       speakFrenchResponse(fallback, {
-        rate: voiceSettings.ttsRate,
-        enabled: voiceSettings.ttsEnabled,
+        rate: currentSettings.ttsRate,
+        enabled: currentSettings.ttsEnabled,
       });
       return;
     }
 
     try {
       const resp = await fetch(
-        `${apiBase}/api/v1/itinerary/trip/${tripId}/voice/command`,
+        `${apiBase}/api/v1/itinerary/trip/${activeTripId}/voice/command`,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
+            Authorization: `Bearer ${activeToken}`,
           },
           body: JSON.stringify({
-            transcript: transcriptText,
+            transcript: cleanText,
             signal: "SPEECH",
-            confidence: 0.95,
-            provider: voiceSettings.sttProvider,
+            confidence: confidenceScore,
+            provider: currentSettings.sttProvider,
             hands_free: true,
+            execute_without_confirmation:
+              currentSettings.executeWithoutConfirmation,
           }),
         }
       );
       if (!resp.ok) {
-        setErrorFr("Accès refusé ou commande vocale indisponible pour votre rôle.");
+        setErrorFr(
+          "Accès refusé ou commande vocale indisponible pour votre rôle."
+        );
         return;
       }
       const data = await resp.json();
       if (data.status === "ERROR" || data.status === "REPEAT_REQUIRED") {
-        const msg = data.error_message_fr || data.spoken_reply_fr || "Pouvez-vous répéter ?";
+        const msg =
+          data.error_message_fr ||
+          data.spoken_reply_fr ||
+          "Pouvez-vous répéter ?";
         setErrorFr(msg);
         speakFrenchResponse(msg, {
-          rate: voiceSettings.ttsRate,
-          enabled: voiceSettings.ttsEnabled,
+          rate: currentSettings.ttsRate,
+          enabled: currentSettings.ttsEnabled,
         });
         return;
       }
+
       const reply = data.spoken_reply_fr || defaultSummaryFr || "";
       setSpokenReplyFr(reply);
       speakFrenchResponse(reply, {
-        rate: voiceSettings.ttsRate,
-        enabled: voiceSettings.ttsEnabled,
+        rate: currentSettings.ttsRate,
+        enabled: currentSettings.ttsEnabled,
       });
-      if (data.day_number && onSelectDayNumber) {
-        onSelectDayNumber(Number(data.day_number));
+
+      if (data.status === "EXECUTED_DIRECTLY" && data.executed_directly) {
+        setUndoBanner({
+          messageId: data.undo_message_id || data.message_id || "",
+          summaryFr: reply,
+          history: data.last_modification_history || null,
+          remainingSeconds: Number(data.undo_window_seconds || 30),
+        });
+        setPendingConfirmMsgId("");
+        setPendingConfirmSummaryFr("");
+        callbacksRef.current.onScheduleUpdated?.();
+        callbacksRef.current.onChatUpdated?.();
+      } else if (data.status === "UNDONE") {
+        setUndoBanner(null);
+        setUndoRestoredFr(reply);
+        callbacksRef.current.onScheduleUpdated?.();
+        callbacksRef.current.onChatUpdated?.();
+      } else if (data.status === "PENDING_CONFIRMATION") {
+        if (data.message_id) {
+          setPendingConfirmMsgId(String(data.message_id));
+          setPendingConfirmSummaryFr(reply);
+        }
+        callbacksRef.current.onChatUpdated?.();
+        callbacksRef.current.onPendingProposalReceived?.();
+      } else if (data.status === "ASK") {
+        callbacksRef.current.onChatUpdated?.();
+      }
+
+      if (data.day_number && callbacksRef.current.onSelectDayNumber) {
+        callbacksRef.current.onSelectDayNumber(Number(data.day_number));
       }
       if (data.navigation_target) {
         navigate(data.navigation_target);
@@ -2145,29 +2756,184 @@ export function VoiceAccessibilityToolbar({
     }
   }
 
-  function handleToggleMic() {
+  function startListeningSession(isAutoStart: boolean = false) {
     setErrorFr("");
-    if (listening && stopRef.current) {
+    setStandbyStatusFr("");
+    if (stopRef.current) {
       stopRef.current();
       stopRef.current = null;
-      setListening(false);
-      return;
     }
-    const provider = createFrontendVoiceSTTProvider(voiceSettings.sttProvider);
-    stopRef.current = provider.startListening({
-      onListeningChange: (active) => setListening(active),
-      onTranscript: (text, isFinal) => {
+    const currentSettings = voiceSettingsRef.current;
+    const provider = createFrontendVoiceSTTProvider(currentSettings.sttProvider);
+    let errorOccurredOnStart = false;
+
+    const cleanup = provider.startListening({
+      onListeningChange: (active) => {
+        setListening(active);
+      },
+      onTranscript: (text, isFinal, conf) => {
+        setLiveTranscriptFr(text);
         if (isFinal && text.trim()) {
-          runVoiceCommand(text.trim());
+          setLiveTranscriptFr("");
+          runVoiceCommand(text.trim(), conf ?? 0.95);
         }
       },
-      onSilenceStop: () => setListening(false),
-      onError: (_code, msgFr) => {
+      onSilenceStop: () => {
+        setListening(false);
+      },
+      onStandbyPause: (standbyMsg) => {
+        setListening(false);
+        setStandbyStatusFr(standbyMsg);
+        setAutoStartStatusFr("");
+      },
+      onLowConfidence: (_txt, _conf, lowMsg) => {
+        setErrorFr(lowMsg);
+        speakFrenchResponse(lowMsg, {
+          rate: voiceSettingsRef.current.ttsRate,
+          enabled: voiceSettingsRef.current.ttsEnabled,
+        });
+      },
+      onAntiLoopStop: (loopMsg) => {
+        setListening(false);
+        setStandbyStatusFr(loopMsg);
+      },
+      onError: (code, msgFr) => {
+        errorOccurredOnStart = true;
         setListening(false);
         setErrorFr(msgFr);
+        if (code === "MIC_DENIED") {
+          setAutoStartStatusFr(
+            "Accès au microphone refusé : autorisez le microphone dans le navigateur pour activer l'écoute vocale."
+          );
+        }
       },
     });
+
+    stopRef.current = cleanup;
+    if (isAutoStart && !errorOccurredOnStart && provider.isSupported()) {
+      const w = window as any;
+      if (w.__TM_MIC_DENIED__ !== true && w.__TM_MIC_AUTHORIZED__ !== false) {
+        const openingAnnouncement = "Assistant vocal actif, dites une commande";
+        setAutoStartStatusFr(openingAnnouncement);
+        setSpokenReplyFr(openingAnnouncement);
+        speakFrenchResponse(openingAnnouncement, {
+          rate: currentSettings.ttsRate,
+          enabled: currentSettings.ttsEnabled,
+        });
+      }
+    }
   }
+
+  function handleStopListening() {
+    if (stopRef.current) {
+      stopRef.current();
+      stopRef.current = null;
+    }
+    setListening(false);
+    setStandbyStatusFr(
+      "Écoute vocale arrêtée. Cliquez sur « Écoute » ou dites « Écoute » pour reprendre."
+    );
+  }
+
+  function handleResumeListening() {
+    setErrorFr("");
+    setStandbyStatusFr("");
+    startListeningSession(false);
+    const resumeMsg = "Assistant vocal actif, dites une commande";
+    setAutoStartStatusFr(resumeMsg);
+    setSpokenReplyFr(resumeMsg);
+    speakFrenchResponse(resumeMsg, {
+      rate: voiceSettingsRef.current.ttsRate,
+      enabled: voiceSettingsRef.current.ttsEnabled,
+    });
+  }
+
+  function handleToggleMic() {
+    if (listening) {
+      handleStopListening();
+    } else {
+      handleResumeListening();
+    }
+  }
+
+  // Exigence 1 & 6 : Démarrage automatique de l'écoute à l'ouverture si le micro est déjà autorisé
+  // et si le mode "Assistant vocal toujours actif" est activé dans Paramètres. Sinon, un message clair.
+  useEffect(() => {
+    let cancelled = false;
+    const settingsOnMount = loadVoiceAccessibilitySettings();
+
+    async function checkPermissionAndAutoStart() {
+      if (!settingsOnMount.alwaysActiveAssistant) {
+        setAutoStartStatusFr(
+          "Mode « Assistant vocal toujours actif » désactivé dans Paramètres. Cliquez sur « Écoute » pour parler."
+        );
+        return;
+      }
+
+      const w = window as any;
+      if (w.__TM_MIC_DENIED__ === true || w.__TM_MIC_AUTHORIZED__ === false) {
+        const deniedMsg =
+          "Accès au microphone refusé ou non autorisé. Autorisez le microphone dans votre navigateur ou cliquez sur « Écoute ».";
+        setAutoStartStatusFr(deniedMsg);
+        setErrorFr(deniedMsg);
+        return;
+      }
+
+      const provider = createFrontendVoiceSTTProvider(settingsOnMount.sttProvider);
+      if (!provider.isSupported()) {
+        setAutoStartStatusFr(
+          "Microphone en attente d'activation — cliquez sur « Écoute » pour démarrer la commande vocale."
+        );
+        return;
+      }
+
+      let permState: string =
+        w.__TM_MIC_AUTHORIZED__ === true ? "granted" : "unknown";
+      if (
+        permState === "unknown" &&
+        typeof navigator !== "undefined" &&
+        navigator.permissions?.query
+      ) {
+        try {
+          const status = await navigator.permissions.query({
+            name: "microphone" as PermissionName,
+          });
+          permState = status?.state || "unknown";
+        } catch {
+          permState = "unknown";
+        }
+      }
+
+      if (cancelled) return;
+
+      if (permState === "denied") {
+        const deniedMsg =
+          "Accès au microphone refusé : veuillez autoriser l'accès au microphone dans votre navigateur.";
+        setAutoStartStatusFr(deniedMsg);
+        setErrorFr(deniedMsg);
+        return;
+      }
+
+      if (permState === "prompt" && w.__TM_MIC_AUTHORIZED__ !== true && !w.SpeechRecognition && !w.webkitSpeechRecognition) {
+        setAutoStartStatusFr(
+          "Microphone non encore autorisé : cliquez sur « Écoute » pour autoriser le microphone."
+        );
+        return;
+      }
+
+      // Micro autorisé et mode "Assistant vocal toujours actif" activé -> démarrage automatique
+      startListeningSession(true);
+    }
+
+    checkPermissionAndAutoStart();
+    return () => {
+      cancelled = true;
+      if (stopRef.current) {
+        stopRef.current();
+        stopRef.current = null;
+      }
+    };
+  }, []);
 
   function handleRateChange(nextRate: number) {
     const updated: VoiceAccessibilitySettings = {
@@ -2187,13 +2953,35 @@ export function VoiceAccessibilityToolbar({
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
+          {/* Pastille "J'écoute" toujours visible (Exigence 1) */}
+          <div
+            role="status"
+            aria-live="polite"
+            data-testid="voice-listening-pill"
+            className={`inline-flex min-h-[40px] items-center gap-2 rounded-pill border px-3.5 py-1.5 text-caption font-bold ${
+              listening
+                ? "bg-amber-100 border-amber-400 text-amber-950"
+                : "bg-canvas-subtle border-border text-ink-secondary"
+            }`}
+          >
+            <span
+              className={`h-2.5 w-2.5 rounded-full ${
+                listening ? "bg-amber-600 animate-pulse" : "bg-ink-muted"
+              }`}
+              aria-hidden="true"
+            />
+            <span data-testid="screen-voice-listening-status">
+              {listening ? "J'écoute…" : "Micro en pause"}
+            </span>
+          </div>
+
           <button
             type="button"
             data-testid="screen-voice-mic-btn"
             aria-label={
               listening
                 ? "Arrêter l'écoute vocale (J'écoute…)"
-                : "Dicter une commande vocale en français (fr-FR)"
+                : "Reprendre l'écoute vocale en français (Écoute)"
             }
             aria-pressed={listening}
             onClick={handleToggleMic}
@@ -2211,20 +2999,20 @@ export function VoiceAccessibilityToolbar({
             ) : (
               <>
                 <Mic className="h-4 w-4 shrink-0" />
-                <span>Commande vocale (fr-FR)</span>
+                <span>Écoute</span>
               </>
             )}
           </button>
 
-          {listening && (
-            <span
-              role="status"
-              aria-live="polite"
-              data-testid="screen-voice-listening-status"
-              className="inline-flex items-center gap-1.5 rounded-pill bg-amber-100 border border-amber-400 px-3 py-1 text-caption font-bold text-amber-950"
+          {!listening && (
+            <button
+              type="button"
+              data-testid="voice-resume-listening-btn"
+              onClick={handleResumeListening}
+              className="inline-flex min-h-[40px] items-center gap-1.5 rounded-card border border-brand-300 bg-brand-50 px-3 py-1.5 text-caption font-semibold text-brand-900 hover:bg-brand-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700"
             >
-              J'écoute…
-            </span>
+              Reprendre (« Écoute »)
+            </button>
           )}
         </div>
 
@@ -2308,6 +3096,107 @@ export function VoiceAccessibilityToolbar({
           </div>
         </div>
       </div>
+
+      {/* Statut d'ouverture / veille / transcription en cours */}
+      {(autoStartStatusFr || standbyStatusFr || liveTranscriptFr) && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="voice-autostart-status"
+          className="rounded-card border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-medium text-ink-secondary flex flex-wrap items-center justify-between gap-2"
+        >
+          <span>
+            {standbyStatusFr ||
+              (liveTranscriptFr
+                ? `En cours de dictée : « ${liveTranscriptFr} »`
+                : autoStartStatusFr)}
+          </span>
+          <span className="text-[11px] text-ink-muted">
+            Fin de phrase : {voiceSettings.phraseEndDelaySeconds} s • Veille :{" "}
+            {voiceSettings.standbyDelaySeconds} s
+          </span>
+        </div>
+      )}
+
+      {/* Exigence 3 : Bandeau d'annulation pendant 30 s après exécution directe (avec historique de la dernière modification) */}
+      {undoBanner && (
+        <div
+          role="status"
+          aria-live="assertive"
+          data-testid="voice-undo-banner"
+          className="rounded-card border border-emerald-400 bg-emerald-50 p-3 space-y-1.5"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-caption font-bold text-emerald-950">
+              Modification exécutée directement ({undoBanner.remainingSeconds} s pour dire « Annule » ou cliquer sur Annuler)
+            </div>
+            <button
+              type="button"
+              data-testid="voice-undo-btn"
+              onClick={() => handleUndoDirectModification(undoBanner.messageId)}
+              className="min-h-[40px] rounded-card bg-emerald-800 px-3.5 py-1.5 text-caption font-bold text-white hover:bg-emerald-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-900"
+            >
+              Annuler
+            </button>
+          </div>
+          {undoBanner.history && (
+            <div
+              data-testid="voice-last-modification-history"
+              className="text-[11px] font-medium text-emerald-900"
+            >
+              Historique de la dernière modification :{" "}
+              {undoBanner.history.place_name || "Visite"} (
+              {undoBanner.history.action_type === "ADD_VISIT"
+                ? `ajoutée le ${undoBanner.history.new_visit_date || ""} à ${undoBanner.history.new_local_start_time || ""}`
+                : `déplacée de ${undoBanner.history.previous_visit_date || ""} ${undoBanner.history.previous_local_start_time || ""} vers ${undoBanner.history.new_visit_date || ""} ${undoBanner.history.new_local_start_time || ""}`}
+              )
+            </div>
+          )}
+        </div>
+      )}
+
+      {undoRestoredFr && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="voice-undo-restored-banner"
+          className="rounded-card border border-brand-300 bg-brand-50 px-3 py-2 text-caption font-semibold text-brand-900"
+        >
+          {undoRestoredFr}
+        </div>
+      )}
+
+      {/* Exigence 4 : Confirmation obligatoire pour supprimer, réserver et payer */}
+      {pendingConfirmMsgId && (
+        <div
+          role="region"
+          aria-label="Confirmation vocale obligatoire"
+          data-testid="voice-toolbar-confirmation-box"
+          className="rounded-card border border-amber-400 bg-amber-50 p-3 flex flex-wrap items-center justify-between gap-2"
+        >
+          <span className="text-caption font-bold text-amber-950">
+            Confirmation obligatoire : {pendingConfirmSummaryFr || "Dites « oui » pour confirmer ou « non » pour annuler."}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="voice-toolbar-confirm-yes-btn"
+              onClick={() => handleVoiceConfirmPending("oui")}
+              className="min-h-[38px] rounded-card bg-brand-700 px-3 py-1 text-caption font-bold text-white hover:bg-brand-800"
+            >
+              Dire « oui »
+            </button>
+            <button
+              type="button"
+              data-testid="voice-toolbar-confirm-no-btn"
+              onClick={() => handleVoiceConfirmPending("non")}
+              className="min-h-[38px] rounded-card border border-border bg-white px-3 py-1 text-caption font-semibold text-ink hover:border-brand-700"
+            >
+              Dire « non »
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Parcours complet faisable sans souris ni clavier grâce aux commandes vocales */}
       <div
@@ -2957,6 +3846,8 @@ export function ItineraryScreen({
             confidence: 0.95,
             provider: voiceSettings.sttProvider,
             hands_free: voiceSettings.handsFree,
+            execute_without_confirmation:
+              voiceSettings.executeWithoutConfirmation,
           }),
         }
       );
@@ -2991,6 +3882,13 @@ export function ItineraryScreen({
       }
       if (data.day_number && tripDays[data.day_number - 1]) {
         setSelectedDayDate(tripDays[data.day_number - 1]);
+      }
+      if (
+        data.applied_change ||
+        data.status === "EXECUTED_DIRECTLY" ||
+        data.status === "UNDONE"
+      ) {
+        await refreshSchedule();
       }
       await refreshChatHistory(trip.id);
       if (data.navigation_target && data.navigation_target !== "/itinerary") {
@@ -3981,6 +4879,12 @@ export function ItineraryScreen({
           onSelectDayNumber={(dayNum) => {
             const targetDate = tripDays[dayNum - 1];
             if (targetDate) setSelectedDayDate(targetDate);
+          }}
+          onScheduleUpdated={() => {
+            refreshSchedule();
+          }}
+          onChatUpdated={() => {
+            if (trip?.id) refreshChatHistory(trip.id);
           }}
         />
       </div>
@@ -7349,9 +8253,71 @@ export function SettingsScreen({
           </div>
         </div>
 
-        {/* 3. Mode mains libres activable avec message de confidentialité */}
+        {/* 3. Mode "Assistant vocal toujours actif" (démarrage automatique à l'ouverture si micro autorisé) */}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-card border border-border bg-canvas-subtle p-4">
+          <div className="space-y-0.5">
+            <div className="text-body font-semibold text-ink">
+              Assistant vocal toujours actif
+            </div>
+            <div className="text-caption text-ink-secondary">
+              Démarre automatiquement l'écoute à l'ouverture de l'application si le microphone est déjà autorisé.
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={voiceSettings.alwaysActiveAssistant}
+            data-testid="settings-always-active-voice-toggle"
+            onClick={() =>
+              updateVoiceSetting({
+                alwaysActiveAssistant: !voiceSettings.alwaysActiveAssistant,
+              })
+            }
+            className={`min-h-[44px] rounded-card px-4 py-2 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 ${
+              voiceSettings.alwaysActiveAssistant
+                ? "bg-brand-700 text-white"
+                : "bg-white border border-border text-ink"
+            }`}
+          >
+            {voiceSettings.alwaysActiveAssistant ? "Activé" : "Désactivé"}
+          </button>
+        </div>
+
+        {/* 4. Option "Exécuter sans confirmation" (activée par défaut pour ajouter/déplacer, désactivable) + Mode mains libres + Message de confidentialité */}
         <div className="space-y-3 rounded-card border border-brand-200 bg-brand-50/70 p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="space-y-0.5">
+              <div className="text-body font-semibold text-ink">
+                Exécuter sans confirmation
+              </div>
+              <div className="text-caption text-ink-secondary">
+                Activée par défaut pour ajouter ou déplacer une visite (si le lieu est reconnu avec un score élevé, date et heure explicites et créneau valide). Supprimer, réserver et payer demandent toujours une double confirmation.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={voiceSettings.executeWithoutConfirmation}
+              data-testid="settings-execute-without-confirmation-toggle"
+              onClick={() =>
+                updateVoiceSetting({
+                  executeWithoutConfirmation:
+                    !voiceSettings.executeWithoutConfirmation,
+                })
+              }
+              className={`min-h-[44px] rounded-card px-4 py-2 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 focus-visible:ring-offset-2 ${
+                voiceSettings.executeWithoutConfirmation
+                  ? "bg-brand-700 text-white"
+                  : "bg-white border border-border text-ink"
+              }`}
+            >
+              {voiceSettings.executeWithoutConfirmation
+                ? "Activée (ajouter/déplacer)"
+                : "Désactivée"}
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-brand-200">
             <div className="space-y-0.5">
               <div className="text-body font-semibold text-ink">
                 Mode mains libres
@@ -7386,6 +8352,71 @@ export function SettingsScreen({
             className="rounded-card border border-amber-300 bg-amber-50 p-3 text-caption font-medium text-amber-950"
           >
             Confidentialité : en mode Web Speech API (fr-FR), l'audio peut transiter par le service de reconnaissance du navigateur. Vous pouvez sélectionner le fournisseur Whisper local ci-dessous pour un traitement local sans transit externe.
+          </div>
+        </div>
+
+        {/* 5. Délais réglables dans Paramètres : fin de phrase (défaut 3 s) et veille (défaut 30 s sans parole) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 rounded-card border border-border bg-canvas-subtle p-4">
+          <div className="space-y-2">
+            <div className="text-caption font-semibold text-ink">
+              Délai de fin de phrase ({voiceSettings.phraseEndDelaySeconds} s — défaut 3 s)
+            </div>
+            <div
+              className="flex flex-wrap items-center gap-1.5"
+              data-testid="settings-phrase-delay-group"
+              role="group"
+              aria-label="Délai de fin de phrase"
+            >
+              {[2, 3, 4, 5].map((sec) => (
+                <button
+                  key={sec}
+                  type="button"
+                  data-testid={`settings-phrase-delay-${sec}s`}
+                  aria-pressed={voiceSettings.phraseEndDelaySeconds === sec}
+                  onClick={() =>
+                    updateVoiceSetting({ phraseEndDelaySeconds: sec })
+                  }
+                  className={`min-h-[40px] min-w-[52px] rounded-card px-3 py-1.5 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                    voiceSettings.phraseEndDelaySeconds === sec
+                      ? "bg-brand-700 text-white"
+                      : "bg-white border border-border text-ink hover:border-brand-700"
+                  }`}
+                >
+                  {sec} s
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-2">
+            <div className="text-caption font-semibold text-ink">
+              Délai de veille sans parole ({voiceSettings.standbyDelaySeconds} s — défaut 30 s)
+            </div>
+            <div
+              className="flex flex-wrap items-center gap-1.5"
+              data-testid="settings-standby-delay-group"
+              role="group"
+              aria-label="Délai de veille sans parole"
+            >
+              {[15, 30, 45, 60].map((sec) => (
+                <button
+                  key={sec}
+                  type="button"
+                  data-testid={`settings-standby-delay-${sec}s`}
+                  aria-pressed={voiceSettings.standbyDelaySeconds === sec}
+                  onClick={() =>
+                    updateVoiceSetting({ standbyDelaySeconds: sec })
+                  }
+                  className={`min-h-[40px] min-w-[52px] rounded-card px-3 py-1.5 text-caption font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-700 ${
+                    voiceSettings.standbyDelaySeconds === sec
+                      ? "bg-brand-700 text-white"
+                      : "bg-white border border-border text-ink hover:border-brand-700"
+                  }`}
+                >
+                  {sec} s
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

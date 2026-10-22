@@ -1812,11 +1812,19 @@ class SimulatedAIProvider(BaseAIProvider):
                     }
                 new_date = named_date_str if named_date_str else target_item["visit_date"]
                 new_time = extracted_time if extracted_time else target_item["local_start_time"]
+                sim_score = (
+                    round(_score_place_candidate(str(target_item.get("place_name", ""))), 3)
+                    if explicit_sched is not None
+                    else 0.85
+                )
                 return {
                     "action_type": "MOVE_VISIT",
                     "place_name": target_item["place_name"],
                     "visit_date": new_date,
                     "local_start_time": new_time,
+                    "place_similarity_score": sim_score,
+                    "explicit_date": bool(named_date_str is not None),
+                    "explicit_time": bool(extracted_time is not None),
                     "reply": (
                         f"Je vous propose de déplacer « {target_item['place_name']} » au "
                         f"{_fmt_date_fr(new_date)} à {new_time}. Souhaitez-vous appliquer ce changement ?"
@@ -1830,6 +1838,9 @@ class SimulatedAIProvider(BaseAIProvider):
                         "local_start_time": new_time,
                         "duration_minutes": int(target_item.get("duration_minutes", 90)),
                         "transit_mode": target_item.get("transit_mode", "METRO"),
+                        "place_similarity_score": sim_score,
+                        "explicit_date": bool(named_date_str is not None),
+                        "explicit_time": bool(extracted_time is not None),
                     },
                 }
 
@@ -1852,11 +1863,19 @@ class SimulatedAIProvider(BaseAIProvider):
                         "proposed_action": None,
                     }
                 new_time = extracted_time or "14:00"
+                sim_score = (
+                    round(best_catalog_score, 3)
+                    if explicit_catalog_place is not None
+                    else 0.85
+                )
                 return {
                     "action_type": "MOVE_VISIT" if has_move_verb else "ADD_VISIT",
                     "place_name": target_unscheduled["name"],
                     "visit_date": named_date_str,
                     "local_start_time": new_time,
+                    "place_similarity_score": sim_score,
+                    "explicit_date": bool(named_date_str is not None),
+                    "explicit_time": bool(extracted_time is not None),
                     "reply": (
                         f"Je vous propose d'ajouter « {target_unscheduled['name']} » le "
                         f"{_fmt_date_fr(named_date_str)} à {new_time} ({target_unscheduled.get('recommended_duration_min', 90)} min). "
@@ -1871,6 +1890,9 @@ class SimulatedAIProvider(BaseAIProvider):
                         "local_start_time": new_time,
                         "duration_minutes": int(target_unscheduled.get("recommended_duration_min", 90)),
                         "transit_mode": "METRO",
+                        "place_similarity_score": sim_score,
+                        "explicit_date": bool(named_date_str is not None),
+                        "explicit_time": bool(extracted_time is not None),
                     },
                 }
 
@@ -1902,6 +1924,11 @@ class SimulatedAIProvider(BaseAIProvider):
             wants_second_time = bool(
                 re.search(r"(deuxi[èe]me\s+fois|seconde\s+fois|une\s+autre\s+fois|encore\s+une\s+fois)", msg_lower)
             )
+            sim_score = (
+                round(best_catalog_score, 3)
+                if explicit_catalog_place is not None
+                else 0.85
+            )
 
             # Si ce lieu est déjà au programme et que l'utilisateur n'a pas demandé un ajout explicite ("ajoute"), ADD devient MOVE
             if existing_for_place is not None and not has_strict_add_verb and not wants_second_time:
@@ -1912,6 +1939,9 @@ class SimulatedAIProvider(BaseAIProvider):
                     "place_name": target_place["name"],
                     "visit_date": move_date,
                     "local_start_time": move_time,
+                    "place_similarity_score": sim_score,
+                    "explicit_date": bool(named_date_str is not None),
+                    "explicit_time": bool(extracted_time is not None),
                     "reply": (
                         f"Je vous propose de déplacer « {target_place['name']} » au "
                         f"{_fmt_date_fr(move_date)} à {move_time}. Souhaitez-vous appliquer ce changement ?"
@@ -1925,6 +1955,9 @@ class SimulatedAIProvider(BaseAIProvider):
                         "local_start_time": move_time,
                         "duration_minutes": int(existing_for_place.get("duration_minutes", 90)),
                         "transit_mode": existing_for_place.get("transit_mode", "METRO"),
+                        "place_similarity_score": sim_score,
+                        "explicit_date": bool(named_date_str is not None),
+                        "explicit_time": bool(extracted_time is not None),
                     },
                 }
 
@@ -1946,6 +1979,9 @@ class SimulatedAIProvider(BaseAIProvider):
                 "place_name": target_place["name"],
                 "visit_date": named_date_str,
                 "local_start_time": new_time,
+                "place_similarity_score": sim_score,
+                "explicit_date": bool(named_date_str is not None),
+                "explicit_time": bool(extracted_time is not None),
                 "reply": (
                     f"Je vous propose d'ajouter « {target_place['name']} » le "
                     f"{_fmt_date_fr(named_date_str)} à {new_time} ({target_place.get('recommended_duration_min', 90)} min). "
@@ -1960,6 +1996,9 @@ class SimulatedAIProvider(BaseAIProvider):
                     "local_start_time": new_time,
                     "duration_minutes": int(target_place.get("recommended_duration_min", 90)),
                     "transit_mode": "METRO",
+                    "place_similarity_score": sim_score,
+                    "explicit_date": bool(named_date_str is not None),
+                    "explicit_time": bool(extracted_time is not None),
                 },
             }
 
@@ -2130,7 +2169,22 @@ def _normalize_voice_stt_signal(
             "message_fr": "Silence détecté : écoute arrêtée sans aucune modification.",
         }
 
-    if sig == "UNRECOGNIZED_SPEECH" or confidence < 0.35 or (not cleaned_text and not audio_base64):
+    if confidence < 0.60 and sig == "SPEECH":
+        return {
+            "ok": False,
+            "signal": "UNRECOGNIZED_SPEECH",
+            "error_code": "LOW_CONFIDENCE",
+            "transcript": cleaned_text,
+            "confidence": float(confidence),
+            "language": "fr-FR",
+            "provider_id": provider_id,
+            "provider_label_fr": provider_label_fr,
+            "transits_browser_service": transits_browser_service,
+            "privacy_notice_fr": privacy_notice_fr,
+            "message_fr": "Pouvez-vous répéter ? La confiance de transcription vocale est trop faible, aucune action n'a été exécutée.",
+        }
+
+    if sig == "UNRECOGNIZED_SPEECH" or confidence < 0.60 or (not cleaned_text and not audio_base64):
         return {
             "ok": False,
             "signal": "UNRECOGNIZED_SPEECH",

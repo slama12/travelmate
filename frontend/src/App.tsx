@@ -1639,8 +1639,14 @@ export function TravelMateShell({
     if (!tResp.ok) return [];
     const loadedTrips: Trip[] = await tResp.json();
     if (loadedTrips.length > 0) {
+      const storedTripId =
+        typeof localStorage !== "undefined"
+          ? localStorage.getItem("travelmate_active_trip_id") || ""
+          : "";
+      const preferred =
+        loadedTrips.find((t) => t.id === storedTripId) || loadedTrips[0];
       setTrips(loadedTrips);
-      setActiveTripId(loadedTrips[0].id);
+      setActiveTripId(preferred.id);
       return loadedTrips;
     }
     if (destList.length > 0) {

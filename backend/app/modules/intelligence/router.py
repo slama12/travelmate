@@ -64,6 +64,8 @@ from app.modules.intelligence.schemas import (
     VoiceConfirmRequest,
     VoiceConfirmResponse,
     VoiceProvidersConfigResponse,
+    VoiceUndoRequest,
+    VoiceUndoResponse,
     WeatherAdaptationOptionSchema,
     WeatherVisitAlertSchema,
 )
@@ -1712,6 +1714,13 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         "confirmation_step",
         "spoken_summary_fr",
         "ask_reason",
+        "place_similarity_score",
+        "explicit_date",
+        "explicit_time",
+        "executed_directly",
+        "undo_available",
+        "undo_window_seconds",
+        "undo_snapshot",
     }
     unknown_top = set(raw_res.keys()) - allowed_keys
     if unknown_top:
@@ -1889,8 +1898,15 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
         }
 
     needs_double = norm_act in {"REMOVE_VISIT", "BOOK_RESERVATION", "PROCESS_PAYMENT"}
+    raw_sim = act_src.get("place_similarity_score") if "place_similarity_score" in act_src else raw_res.get("place_similarity_score")
+    norm_sim = float(raw_sim) if isinstance(raw_sim, (int, float)) else None
+    raw_exp_date = act_src.get("explicit_date") if "explicit_date" in act_src else raw_res.get("explicit_date")
+    raw_exp_time = act_src.get("explicit_time") if "explicit_time" in act_src else raw_res.get("explicit_time")
     return {
         "action_type": norm_act,
+        "place_similarity_score": norm_sim,
+        "explicit_date": bool(raw_exp_date),
+        "explicit_time": bool(raw_exp_time),
         "reply": str(reply_val or ""),
         "proposed_action": {
             "action_type": norm_act,
@@ -1904,6 +1920,9 @@ def _validate_and_normalize_chat_llm_payload(raw_res: Any) -> dict[str, Any]:
             "requires_double_confirmation": needs_double,
             "confirmation_steps_required": 2 if needs_double else 1,
             "confirmation_step": 1,
+            "place_similarity_score": norm_sim,
+            "explicit_date": bool(raw_exp_date),
+            "explicit_time": bool(raw_exp_time),
         },
     }
 
@@ -2886,6 +2905,22 @@ async def send_trip_chat_message(
                             "Rien n'est modifié tant que vous ne confirmez pas."
                         )
 
+                raw_sim_val = raw_action.get("place_similarity_score") if isinstance(raw_action, dict) else None
+                computed_sim = round(_score_place_text_similarity(place_obj.name, payload.message), 3)
+                place_sim_score = (
+                    float(raw_sim_val)
+                    if isinstance(raw_sim_val, (int, float))
+                    else max(computed_sim, 0.85 if _has_pronoun_ref_in_msg(payload.message) else computed_sim)
+                )
+                has_explicit_date = bool(
+                    named_trip_date is not None
+                    or (isinstance(raw_action, dict) and raw_action.get("explicit_date"))
+                )
+                has_explicit_time = bool(
+                    msg_extracted_time is not None
+                    or (isinstance(raw_action, dict) and raw_action.get("explicit_time"))
+                )
+
                 proposed_action_dict = {
                     "action_type": act_type,
                     "item_id": item_id,
@@ -2905,6 +2940,9 @@ async def send_trip_chat_message(
                     "confirmation_steps_required": 1,
                     "confirmation_step": 1,
                     "spoken_summary_fr": reply_text,
+                    "place_similarity_score": place_sim_score,
+                    "explicit_date": has_explicit_date,
+                    "explicit_time": has_explicit_time,
                 }
                 action_status = "PENDING_CONFIRMATION"
 
@@ -3229,6 +3267,256 @@ async def get_voice_providers_config(
     )
 
 
+async def _execute_voice_undo_for_trip(
+    *,
+    db: AsyncSession,
+    trip: Trip,
+    destination: Destination,
+    message_id: str | None = None,
+    source: str = "VOICE",
+) -> VoiceUndoResponse:
+    dest_tz = destination.timezone or "UTC"
+    registry = get_provider_registry()
+
+    if message_id:
+        target_msg = await db.scalar(
+            select(ChatMessage).where(
+                ChatMessage.id == message_id,
+                ChatMessage.trip_id == trip.id,
+            )
+        )
+    else:
+        recent_msgs_res = await db.scalars(
+            select(ChatMessage)
+            .where(ChatMessage.trip_id == trip.id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(20)
+        )
+        target_msg = None
+        for cand in recent_msgs_res.all():
+            if cand.action_status == "EXECUTED_DIRECTLY" and isinstance(cand.proposed_action, dict):
+                snap = cand.proposed_action.get("undo_snapshot")
+                if isinstance(snap, dict) and not snap.get("undone"):
+                    target_msg = cand
+                    break
+
+    if not target_msg or not isinstance(target_msg.proposed_action, dict):
+        msg_no_undo = "Aucune modification directe récente à annuler dans le délai de 30 secondes."
+        return VoiceUndoResponse(
+            ok=False,
+            status="NO_RECENT_MODIFICATION",
+            trip_id=trip.id,
+            message_id=message_id,
+            restored=False,
+            operation_undone=None,
+            spoken_reply_fr=msg_no_undo,
+            detail_fr=msg_no_undo,
+            restored_item=None,
+            deleted_item_id=None,
+            calendar_sync_restored=False,
+            last_modification_history=None,
+            message=None,
+        )
+
+    prop_dict = dict(target_msg.proposed_action)
+    snap = dict(prop_dict.get("undo_snapshot") or {})
+    if not snap or snap.get("undone"):
+        msg_already = "Cette modification a déjà été annulée."
+        return VoiceUndoResponse(
+            ok=False,
+            status="ALREADY_UNDONE",
+            trip_id=trip.id,
+            message_id=target_msg.id,
+            restored=False,
+            operation_undone=None,
+            spoken_reply_fr=msg_already,
+            detail_fr=msg_already,
+            restored_item=None,
+            deleted_item_id=None,
+            calendar_sync_restored=False,
+            last_modification_history=snap or None,
+            message=_serialize_chat_message(target_msg),
+        )
+
+    executed_epoch = float(snap.get("executed_at_epoch") or 0.0)
+    if executed_epoch > 0 and (time.time() - executed_epoch) > 35.0:
+        msg_exp = "Le délai de 30 secondes pour annuler cette modification est écoulé."
+        return VoiceUndoResponse(
+            ok=False,
+            status="UNDO_WINDOW_EXPIRED",
+            trip_id=trip.id,
+            message_id=target_msg.id,
+            restored=False,
+            operation_undone=str(snap.get("action_type") or ""),
+            spoken_reply_fr=msg_exp,
+            detail_fr=msg_exp,
+            restored_item=None,
+            deleted_item_id=None,
+            calendar_sync_restored=False,
+            last_modification_history=snap,
+            message=_serialize_chat_message(target_msg),
+        )
+
+    op_type = str(snap.get("action_type") or prop_dict.get("action_type") or "")
+    place_name = str(snap.get("place_name") or prop_dict.get("place_name") or "la visite")
+    item_id = str(snap.get("item_id") or prop_dict.get("item_id") or "")
+
+    restored_item_resp = None
+    deleted_id: str | None = None
+
+    if op_type == "ADD_VISIT":
+        it_obj = await db.scalar(
+            select(ItineraryItem).where(
+                ItineraryItem.id == item_id,
+                ItineraryItem.trip_id == trip.id,
+            )
+        )
+        if it_obj is not None:
+            if it_obj.google_calendar_event_id:
+                try:
+                    await registry.calendar.delete_visit_event(
+                        calendar_id="primary",
+                        event_id=it_obj.google_calendar_event_id,
+                    )
+                except Exception:
+                    pass
+            deleted_id = it_obj.id
+            await db.delete(it_obj)
+        snap["undone"] = True
+        snap["undone_at_iso"] = datetime.now().isoformat()
+        snap["undone_by"] = source
+        prop_dict["undo_available"] = False
+        prop_dict["undo_snapshot"] = snap
+        target_msg.proposed_action = prop_dict
+        target_msg.action_status = "UNDONE"
+        spoken_undo = (
+            f"Modification annulée : l'ajout de « {place_name} » a été retiré et votre programme ainsi que "
+            "la synchronisation agenda ont été restaurés à leur état précédent."
+        )
+        undo_chat_msg = ChatMessage(
+            trip_id=trip.id,
+            sender_role="assistant",
+            content=spoken_undo,
+            proposed_action=None,
+            action_status="UNDONE",
+        )
+        db.add(undo_chat_msg)
+        await db.commit()
+        await _recompute_trip_day_transits(db, trip.id, dest_tz)
+        await db.refresh(target_msg)
+        return VoiceUndoResponse(
+            ok=True,
+            status="UNDONE",
+            trip_id=trip.id,
+            message_id=target_msg.id,
+            restored=True,
+            operation_undone="ADD_VISIT",
+            spoken_reply_fr=spoken_undo,
+            detail_fr=spoken_undo,
+            restored_item=None,
+            deleted_item_id=deleted_id,
+            calendar_sync_restored=True,
+            last_modification_history=snap,
+            message=_serialize_chat_message(target_msg),
+        )
+
+    # MOVE_VISIT : restauration de la date, de l'horaire, du trajet et de l'agenda
+    it_obj = await db.scalar(
+        select(ItineraryItem).where(
+            ItineraryItem.id == item_id,
+            ItineraryItem.trip_id == trip.id,
+        )
+    )
+    if it_obj is None:
+        raise HTTPException(status_code=404, detail="Visite à restaurer introuvable.")
+
+    place_obj = await db.scalar(
+        select(Place).where(Place.id == it_obj.place_id)
+    )
+    prev_visit_date = date.fromisoformat(str(snap["previous_visit_date"]))
+    prev_start_utc = ensure_utc(datetime.fromisoformat(str(snap["previous_start_at_utc"])))
+    prev_end_utc = ensure_utc(datetime.fromisoformat(str(snap["previous_end_at_utc"])))
+    prev_dur = int(snap.get("previous_duration_minutes") or it_obj.duration_minutes)
+    prev_tmode = normalize_transit_mode(str(snap.get("previous_transit_mode") or it_obj.transit_mode_to_next))
+    prev_local_time = str(snap.get("previous_local_start_time") or "")
+
+    it_obj.visit_date = prev_visit_date
+    it_obj.start_at = prev_start_utc
+    it_obj.end_at = prev_end_utc
+    it_obj.duration_minutes = prev_dur
+    it_obj.transit_mode_to_next = prev_tmode
+
+    snap["undone"] = True
+    snap["undone_at_iso"] = datetime.now().isoformat()
+    snap["undone_by"] = source
+    prop_dict["undo_available"] = False
+    prop_dict["undo_snapshot"] = snap
+    target_msg.proposed_action = prop_dict
+    target_msg.action_status = "UNDONE"
+
+    spoken_undo = (
+        f"Modification annulée : « {place_name} » a été remis au {_format_date_fr(prev_visit_date)} "
+        f"à {prev_local_time} et la synchronisation agenda a été restaurée."
+    )
+    undo_chat_msg = ChatMessage(
+        trip_id=trip.id,
+        sender_role="assistant",
+        content=spoken_undo,
+        proposed_action=None,
+        action_status="UNDONE",
+    )
+    db.add(undo_chat_msg)
+    await db.commit()
+    await _recompute_trip_day_transits(db, trip.id, dest_tz)
+    if place_obj is not None:
+        await _sync_item_with_google_calendar(db, it_obj, place_obj, dest_tz, action="update")
+        restored_item_resp = _to_item_response(it_obj, place_obj, dest_tz)
+    await db.refresh(target_msg)
+
+    return VoiceUndoResponse(
+        ok=True,
+        status="UNDONE",
+        trip_id=trip.id,
+        message_id=target_msg.id,
+        restored=True,
+        operation_undone="MOVE_VISIT",
+        spoken_reply_fr=spoken_undo,
+        detail_fr=spoken_undo,
+        restored_item=restored_item_resp,
+        deleted_item_id=None,
+        calendar_sync_restored=True,
+        last_modification_history=snap,
+        message=_serialize_chat_message(target_msg),
+    )
+
+
+@router.post("/trip/{trip_id}/voice/undo", response_model=VoiceUndoResponse)
+async def undo_last_voice_direct_modification(
+    trip_id: str,
+    payload: VoiceUndoRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VoiceUndoResponse:
+    """
+    Restaure l'état précédent (visite, horaire, trajets, synchronisation agenda)
+    suite à une exécution vocale directe dans le délai de 30 secondes.
+    """
+    trip, destination, _role = await require_trip_access(
+        db,
+        trip_id,
+        current_user.id,
+        allowed_roles=WRITE_ROLES,
+    )
+    req = payload or VoiceUndoRequest()
+    return await _execute_voice_undo_for_trip(
+        db=db,
+        trip=trip,
+        destination=destination,
+        message_id=req.message_id,
+        source=req.source,
+    )
+
+
 @router.post("/trip/{trip_id}/voice/command", response_model=VoiceCommandResponse)
 async def process_trip_voice_command(
     trip_id: str,
@@ -3239,13 +3527,6 @@ async def process_trip_voice_command(
     """
     Traite une commande vocale (ou un signal d'erreur micro/navigateur/silence/bruit)
     via le même analyseur que le chat et le même contrôle d'accès (cookie HttpOnly, CSRF, RBAC).
-    - Commandes de lecture / navigation ("va à mon programme", "ouvre l'hébergement",
-      "lis-moi le jour 2", "lis-moi mon budget", "ouvre mes documents", "infos pratiques") :
-      accessibles aux rôles OWNER, EDITOR et VIEWER.
-    - Commandes de modification / action (ajout, déplacement, suppression, réservation, paiement) :
-      réservées aux rôles OWNER et EDITOR (403 pour VIEWER), et JAMAIS validées automatiquement :
-      l'assistant relit l'action comprise et exige une confirmation vocale explicite ("oui"),
-      avec double confirmation ("oui" deux fois) pour réservation, paiement et suppression.
     """
     trip, destination, user_role = await require_trip_access(
         db,
@@ -3267,7 +3548,7 @@ async def process_trip_voice_command(
         raw_err_code = str(stt_res.get("error_code") or payload.signal)
         err_code = "NOISE_DETECTED" if raw_err_code == "NOISE" else raw_err_code
         msg_fr = str(stt_res.get("message_fr") or "Pouvez-vous répéter ?")
-        if err_code == "UNRECOGNIZED_SPEECH" and (payload.transcript or "").strip():
+        if err_code in {"UNRECOGNIZED_SPEECH", "LOW_CONFIDENCE"} and (payload.transcript or "").strip():
             db.add(
                 ChatUnrecognized(
                     trip_id=trip.id,
@@ -3280,7 +3561,7 @@ async def process_trip_voice_command(
             await db.commit()
         status_label = (
             "REPEAT_REQUIRED"
-            if err_code in {"NOISE", "NOISE_DETECTED", "UNRECOGNIZED_SPEECH"}
+            if err_code in {"NOISE", "NOISE_DETECTED", "UNRECOGNIZED_SPEECH", "LOW_CONFIDENCE"}
             else "ERROR"
         )
         return VoiceCommandResponse(
@@ -3294,6 +3575,7 @@ async def process_trip_voice_command(
             transits_browser_service=stt_provider.transits_browser_service,
             privacy_notice_fr=stt_provider.privacy_notice_fr,
             hands_free=bool(payload.hands_free),
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
             editable_before_send=not bool(payload.hands_free),
             auto_submitted=bool(payload.hands_free),
             signal=str(stt_res.get("signal") or payload.signal),
@@ -3318,6 +3600,147 @@ async def process_trip_voice_command(
         )
 
     transcript_clean = str(stt_res.get("transcript") or "").strip()
+    transcript_lower = transcript_clean.lower()
+
+    # Commandes vocales de contrôle d'écoute ("Arrête d'écouter", "Écoute")
+    if re.match(
+        r"^\s*(?:arr[êe]te\s+d['’ ]?[ée]couter|arr[êe]ter\s+d['’ ]?[ée]couter|stop\s+[ée]coute|pause\s+[ée]coute)\s*[.!]*\s*$",
+        transcript_lower,
+    ):
+        spoken_stop = "Écoute vocale mise en pause. Dites « Écoute » ou cliquez sur le bouton micro pour reprendre."
+        return VoiceCommandResponse(
+            ok=True,
+            status="LISTENING_STOPPED",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="SPEECH",
+            error_code=None,
+            error_message_fr=None,
+            recognized_transcript=transcript_clean,
+            action_type="STOP_LISTENING",
+            voice_command="STOP_LISTENING",
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=spoken_stop,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=None,
+            proposed_action=None,
+            applied_change=False,
+            message=None,
+        )
+
+    if re.match(
+        r"^\s*(?:[ée]coute|reprends?\s+l['’ ]?[ée]coute|active\s+l['’ ]?[ée]coute)\s*[.!]*\s*$",
+        transcript_lower,
+    ):
+        spoken_resume = "Assistant vocal actif, dites une commande."
+        return VoiceCommandResponse(
+            ok=True,
+            status="LISTENING_RESUMED",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="SPEECH",
+            error_code=None,
+            error_message_fr=None,
+            recognized_transcript=transcript_clean,
+            action_type="RESUME_LISTENING",
+            voice_command="RESUME_LISTENING",
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=spoken_resume,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=None,
+            proposed_action=None,
+            applied_change=False,
+            message=None,
+        )
+
+    # Commande vocale "Annule" / "Annuler" (sans nom de lieu derrière) -> restaure la dernière modification directe (< 30 s)
+    if re.match(
+        r"^\s*(?:annule|annuler|annulez|annule\s+la\s+modification|annuler\s+la\s+modification|annule\s+le\s+changement)\s*[.!]*\s*$",
+        transcript_lower,
+    ):
+        await require_trip_access(
+            db,
+            trip_id,
+            current_user.id,
+            allowed_roles=WRITE_ROLES,
+        )
+        undo_res = await _execute_voice_undo_for_trip(
+            db=db,
+            trip=trip,
+            destination=destination,
+            message_id=None,
+            source="VOICE",
+        )
+        return VoiceCommandResponse(
+            ok=undo_res.ok,
+            status=undo_res.status,
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="SPEECH",
+            error_code=None if undo_res.ok else undo_res.status,
+            error_message_fr=None if undo_res.ok else undo_res.detail_fr,
+            recognized_transcript=transcript_clean,
+            action_type="UNDO",
+            voice_command="UNDO_LAST_MODIFICATION",
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=undo_res.spoken_reply_fr,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=undo_res.message_id,
+            proposed_action=None,
+            applied_change=undo_res.restored,
+            executed_directly=False,
+            can_undo=False,
+            undo_window_seconds=0,
+            restored_item=undo_res.restored_item,
+            deleted_item_id=undo_res.deleted_item_id,
+            last_modification_history=undo_res.last_modification_history,
+            message=undo_res.message,
+        )
 
     # Analyse de l'intention avec le même analyseur que le chat
     safe_context, _places_by_id, _existing_items = await _build_safe_trip_context_for_chat(
@@ -3395,6 +3818,7 @@ async def process_trip_voice_command(
             transits_browser_service=stt_provider.transits_browser_service,
             privacy_notice_fr=stt_provider.privacy_notice_fr,
             hands_free=is_hf,
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
             editable_before_send=not is_hf,
             auto_submitted=is_hf,
             signal="SPEECH",
@@ -3418,10 +3842,80 @@ async def process_trip_voice_command(
             message=msg_schema,
         )
 
-    # 2. Parole non comprise (ASK / NONE sans action reconnue) -> "Pouvez-vous répéter ?" sans aucune modification
+    # 2. Lieu ambigu, lieu inconnu avec intention d'action, ou parole non comprise
     raw_prop = validated_voice.get("proposed_action")
+    ask_reason = str(validated_voice.get("ask_reason") or "")
+    has_action_verb_in_transcript = bool(
+        re.search(
+            r"\b(ajoute|ajouter|rajoute|rajouter|mets|mettre|planifie|planifier|programme|programmer|"
+            r"d[ée]place|d[ée]placer|change|changer|modifie|modifier|d[ée]cale|d[ée]caler|repousse|repousser|"
+            r"avance|avancer|supprime|supprimer|retire|retirer|enl[èe]ve|enlever|visite|visiter|aller)\b",
+            transcript_lower,
+        )
+    )
     if act_type in {"ASK", "NONE"} and not isinstance(raw_prop, dict):
         base_reply = str(validated_voice.get("reply") or "").strip()
+        # Si c'est une question de clarification (lieu ambigu, lieu inconnu sur commande d'action, ou date/heure manquante) :
+        # question posée à voix haute et enregistrée dans le chat, aucune exécution.
+        if (
+            ask_reason == "AMBIGUOUS_PLACE"
+            or (ask_reason == "UNKNOWN_PLACE" and has_action_verb_in_transcript)
+            or bool(validated_voice.get("place_name"))
+        ):
+            user_msg = ChatMessage(
+                trip_id=trip.id,
+                sender_role="user",
+                content=transcript_clean,
+                proposed_action=None,
+                action_status="NONE",
+            )
+            assistant_msg = ChatMessage(
+                trip_id=trip.id,
+                sender_role="assistant",
+                content=base_reply,
+                proposed_action=None,
+                action_status="NONE",
+            )
+            db.add(user_msg)
+            db.add(assistant_msg)
+            await db.commit()
+            await db.refresh(assistant_msg)
+            return VoiceCommandResponse(
+                ok=True,
+                status="ASK",
+                trip_id=trip.id,
+                provider_id=stt_provider.provider_id,
+                provider_used=stt_provider.provider_id,
+                provider_label_fr=stt_provider.provider_label_fr,
+                language=stt_provider.language,
+                transits_browser_service=stt_provider.transits_browser_service,
+                privacy_notice_fr=stt_provider.privacy_notice_fr,
+                hands_free=bool(payload.hands_free),
+                execute_without_confirmation=bool(payload.execute_without_confirmation),
+                editable_before_send=not bool(payload.hands_free),
+                auto_submitted=bool(payload.hands_free),
+                signal="SPEECH",
+                error_code=ask_reason or None,
+                error_message_fr=None,
+                recognized_transcript=transcript_clean,
+                action_type="ASK",
+                voice_command=None,
+                navigation_target=None,
+                day_number=None,
+                spoken_reply_fr=base_reply,
+                requires_voice_confirmation=False,
+                requires_confirmation=False,
+                requires_double_confirmation=False,
+                confirmation_steps_required=0,
+                confirmation_step=0,
+                pending_message_id=None,
+                message_id=assistant_msg.id,
+                proposed_action=None,
+                applied_change=False,
+                executed_directly=False,
+                message=_serialize_chat_message(assistant_msg),
+            )
+
         if "pouvez-vous répéter" not in base_reply.lower():
             spoken_repeat = f"Pouvez-vous répéter ? {base_reply}".strip()
         else:
@@ -3447,6 +3941,7 @@ async def process_trip_voice_command(
             transits_browser_service=stt_provider.transits_browser_service,
             privacy_notice_fr=stt_provider.privacy_notice_fr,
             hands_free=bool(payload.hands_free),
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
             editable_before_send=not bool(payload.hands_free),
             auto_submitted=bool(payload.hands_free),
             signal="UNRECOGNIZED_SPEECH",
@@ -3472,14 +3967,33 @@ async def process_trip_voice_command(
 
     # 3. Commande d'action (ADD_VISIT, MOVE_VISIT, REMOVE_VISIT, BOOK_RESERVATION, PROCESS_PAYMENT) :
     #    - Contrôle d'accès en écriture strict (OWNER / EDITOR uniquement -> 403 pour VIEWER)
-    #    - Délègue à send_trip_chat_message qui crée la proposition en attente (PENDING_CONFIRMATION)
-    #      sans JAMAIS l'exécuter automatiquement.
     await require_trip_access(
         db,
         trip_id,
         current_user.id,
         allowed_roles=WRITE_ROLES,
     )
+
+    # Capture de l'état avant modification pour l'historique d'annulation (si exécution directe)
+    pre_items_map: dict[str, dict[str, Any]] = {}
+    if payload.execute_without_confirmation:
+        dest_tz = destination.timezone or "UTC"
+        existing_before, _ = await _load_trip_items_with_places(db, trip.id)
+        for it_b in existing_before:
+            loc_b = to_destination_local(ensure_utc(it_b.start_at), dest_tz)
+            pre_items_map[it_b.id] = {
+                "item_id": it_b.id,
+                "place_id": it_b.place_id,
+                "previous_visit_date": it_b.visit_date.isoformat(),
+                "previous_local_start_time": loc_b.strftime("%H:%M"),
+                "previous_start_at_utc": ensure_utc(it_b.start_at).isoformat(),
+                "previous_end_at_utc": ensure_utc(it_b.end_at).isoformat(),
+                "previous_duration_minutes": it_b.duration_minutes,
+                "previous_transit_mode": it_b.transit_mode_to_next,
+                "previous_calendar_sync_status": it_b.calendar_sync_status,
+                "previous_google_calendar_event_id": it_b.google_calendar_event_id,
+            }
+
     conv_resp = await send_trip_chat_message(
         trip_id=trip.id,
         payload=ChatSendMessageRequest(message=transcript_clean),
@@ -3502,6 +4016,7 @@ async def process_trip_voice_command(
             transits_browser_service=stt_provider.transits_browser_service,
             privacy_notice_fr=stt_provider.privacy_notice_fr,
             hands_free=bool(payload.hands_free),
+            execute_without_confirmation=bool(payload.execute_without_confirmation),
             editable_before_send=not bool(payload.hands_free),
             auto_submitted=bool(payload.hands_free),
             signal="SPEECH",
@@ -3523,6 +4038,183 @@ async def process_trip_voice_command(
             proposed_action=None,
             applied_change=False,
             message=last_msg,
+        )
+
+    # Si le créneau demandé est impossible (fermé, hors voyage, chevauchement) et que l'exécution sans confirmation est activée :
+    # question à voix haute, aucune exécution directe (Exigence 4).
+    if payload.execute_without_confirmation and not prop.validated_by_engine:
+        base_invalid = last_msg.content.strip()
+        if "?" not in base_invalid:
+            spoken_invalid_q = f"{base_invalid} Souhaitez-vous retenir ce créneau proposé ou choisir une autre heure ?"
+        else:
+            spoken_invalid_q = base_invalid
+        return VoiceCommandResponse(
+            ok=True,
+            status="ASK",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            execute_without_confirmation=True,
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="SPEECH",
+            error_code=prop.validation_error_code,
+            error_message_fr=prop.validation_message_fr,
+            recognized_transcript=transcript_clean,
+            action_type="ASK",
+            voice_command=prop.action_type,
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=spoken_invalid_q,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=last_msg.id,
+            message_id=last_msg.id,
+            proposed_action=prop,
+            applied_change=False,
+            executed_directly=False,
+            place_similarity_score=prop.place_similarity_score,
+            has_explicit_date=prop.explicit_date,
+            has_explicit_time=prop.explicit_time,
+            message=last_msg,
+        )
+
+    # Exigence 3 & 4 : Exécution directe sans confirmation UNIQUEMENT pour ADD_VISIT ou MOVE_VISIT si :
+    # - Option execute_without_confirmation activée
+    # - Lieu reconnu avec un score élevé (>= 0.75)
+    # - Date et heure explicites (explicit_date et explicit_time)
+    # - Créneau valide pour le moteur de validation (validated_by_engine == True)
+    # - Confiance STT élevée (>= 0.75)
+    # Jamais pour REMOVE_VISIT, BOOK_RESERVATION ou PROCESS_PAYMENT.
+    sim_score = float(prop.place_similarity_score if prop.place_similarity_score is not None else 0.0)
+    can_execute_directly = bool(
+        payload.execute_without_confirmation
+        and prop.action_type in {"ADD_VISIT", "MOVE_VISIT"}
+        and prop.validated_by_engine
+        and sim_score >= 0.75
+        and prop.explicit_date
+        and prop.explicit_time
+        and float(payload.confidence) >= 0.75
+    )
+
+    if can_execute_directly:
+        decision_res = await confirm_chat_proposed_action(
+            trip_id=trip.id,
+            message_id=last_msg.id,
+            override_visit_date=None,
+            override_local_start_time=None,
+            current_user=current_user,
+            db=db,
+        )
+        updated_it = decision_res.updated_item
+        applied_item_id = updated_it.id if updated_it else prop.item_id
+        prev_snap = pre_items_map.get(str(applied_item_id or prop.item_id or ""), {})
+        v_date_obj = date.fromisoformat(prop.visit_date)
+        if prop.action_type == "MOVE_VISIT":
+            spoken_done = (
+                f"C'est fait : « {prop.place_name} » a été déplacé au "
+                f"{_format_date_fr(v_date_obj)} à {prop.local_start_time}. "
+                "Vous avez 30 secondes pour dire « Annule » ou cliquer sur Annuler."
+            )
+        else:
+            spoken_done = (
+                f"C'est fait : « {prop.place_name} » a été ajouté le "
+                f"{_format_date_fr(v_date_obj)} à {prop.local_start_time}. "
+                "Vous avez 30 secondes pour dire « Annule » ou cliquer sur Annuler."
+            )
+
+        undo_snapshot: dict[str, Any] = {
+            "action_type": prop.action_type,
+            "item_id": applied_item_id,
+            "place_id": prop.place_id,
+            "place_name": prop.place_name,
+            "new_visit_date": prop.visit_date,
+            "new_local_start_time": prop.local_start_time,
+            "previous_visit_date": prev_snap.get("previous_visit_date"),
+            "previous_local_start_time": prev_snap.get("previous_local_start_time"),
+            "previous_start_at_utc": prev_snap.get("previous_start_at_utc"),
+            "previous_end_at_utc": prev_snap.get("previous_end_at_utc"),
+            "previous_duration_minutes": prev_snap.get("previous_duration_minutes"),
+            "previous_transit_mode": prev_snap.get("previous_transit_mode"),
+            "previous_calendar_sync_status": prev_snap.get("previous_calendar_sync_status"),
+            "calendar_sync_status": updated_it.calendar_sync_status if updated_it else "SYNCED",
+            "executed_at_epoch": round(time.time(), 3),
+            "executed_at_iso": datetime.now().isoformat(),
+            "undo_window_seconds": 30,
+            "undone": False,
+        }
+
+        msg_db = await db.scalar(
+            select(ChatMessage).where(ChatMessage.id == last_msg.id, ChatMessage.trip_id == trip.id)
+        )
+        if msg_db is not None and isinstance(msg_db.proposed_action, dict):
+            updated_prop_dict = dict(msg_db.proposed_action)
+            updated_prop_dict["executed_directly"] = True
+            updated_prop_dict["undo_available"] = True
+            updated_prop_dict["undo_window_seconds"] = 30
+            updated_prop_dict["undo_snapshot"] = undo_snapshot
+            updated_prop_dict["spoken_summary_fr"] = spoken_done
+            msg_db.proposed_action = updated_prop_dict
+            msg_db.action_status = "EXECUTED_DIRECTLY"
+            msg_db.content = spoken_done
+            await db.commit()
+            await db.refresh(msg_db)
+            serialized_msg = _serialize_chat_message(msg_db)
+            prop_out = serialized_msg.proposed_action
+        else:
+            serialized_msg = decision_res.message
+            prop_out = prop
+
+        return VoiceCommandResponse(
+            ok=True,
+            status="EXECUTED_DIRECTLY",
+            trip_id=trip.id,
+            provider_id=stt_provider.provider_id,
+            provider_used=stt_provider.provider_id,
+            provider_label_fr=stt_provider.provider_label_fr,
+            language=stt_provider.language,
+            transits_browser_service=stt_provider.transits_browser_service,
+            privacy_notice_fr=stt_provider.privacy_notice_fr,
+            hands_free=bool(payload.hands_free),
+            execute_without_confirmation=True,
+            editable_before_send=not bool(payload.hands_free),
+            auto_submitted=bool(payload.hands_free),
+            signal="SPEECH",
+            error_code=None,
+            error_message_fr=None,
+            recognized_transcript=transcript_clean,
+            action_type=prop.action_type,
+            voice_command=prop.action_type,
+            navigation_target=None,
+            day_number=None,
+            spoken_reply_fr=spoken_done,
+            requires_voice_confirmation=False,
+            requires_confirmation=False,
+            requires_double_confirmation=False,
+            confirmation_steps_required=0,
+            confirmation_step=0,
+            pending_message_id=None,
+            message_id=last_msg.id,
+            proposed_action=prop_out,
+            applied_change=True,
+            executed_directly=True,
+            can_undo=True,
+            undo_window_seconds=30,
+            undo_message_id=last_msg.id,
+            place_similarity_score=sim_score,
+            has_explicit_date=prop.explicit_date,
+            has_explicit_time=prop.explicit_time,
+            updated_item=updated_it,
+            last_modification_history=undo_snapshot,
+            message=serialized_msg,
         )
 
     needs_double = bool(
@@ -3563,6 +4255,7 @@ async def process_trip_voice_command(
         transits_browser_service=stt_provider.transits_browser_service,
         privacy_notice_fr=stt_provider.privacy_notice_fr,
         hands_free=bool(payload.hands_free),
+        execute_without_confirmation=bool(payload.execute_without_confirmation),
         editable_before_send=not bool(payload.hands_free),
         auto_submitted=bool(payload.hands_free),
         signal="SPEECH",
@@ -3583,6 +4276,10 @@ async def process_trip_voice_command(
         message_id=last_msg.id,
         proposed_action=prop,
         applied_change=False,
+        executed_directly=False,
+        place_similarity_score=sim_score,
+        has_explicit_date=prop.explicit_date,
+        has_explicit_time=prop.explicit_time,
         message=last_msg,
     )
 

@@ -658,8 +658,430 @@ def test_real_chat_marrakech_jardin_secret_medina_and_single_row_header() -> Non
             bridge_proc.terminate()
 
 
+def test_hands_free_voice_fake_speech_recognition_playwright():
+    """
+    Exigence 7 — Tests Playwright avec un faux SpeechRecognition :
+    1. Démarrage automatique à l'ouverture si le micro est autorisé et "Assistant vocal toujours actif" est activé,
+       annonce vocale à l'ouverture ("Assistant vocal actif, dites une commande") et pastille "J'écoute" toujours visible.
+    2. Pause de 3 s au milieu d'une phrase ("déplace Jardin Majorelle" ... pause 3 s ... "le 12 novembre à 14h").
+    3. Déplacement exécuté directement sans confirmation, puis "Annule" qui restaure l'état précédent (visite, horaire, synchronisation agenda).
+    4. Suppression qui demande une confirmation obligatoire (jamais d'exécution directe).
+    5. Lieu ambigu ("mets le Jardin le 12 novembre à 10h") qui pose une question à voix haute sans exécution.
+    6. Veille après 30 s sans parole (micro en pause avec message), arrêt par "Arrête d'écouter" et reprise par "Écoute".
+    7. Micro refusé (pas de démarrage automatique et message clair).
+    """
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    bridge_proc = _ensure_wsl_bridge()
+
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1280, "height": 900})
+            page = context.new_page()
+
+            # Injection du faux SpeechRecognition (Web Speech API fr-FR) avec microphone autorisé
+            page.add_init_script(
+                """(() => {
+                  window.__TM_MIC_AUTHORIZED__ = true;
+                  window.__TM_MIC_DENIED__ = false;
+                  window.__TM_VOICE_TIMER_SCALE__ = 1;
+                  window.__FAKE_SR_INSTANCES__ = [];
+
+                  class FakeSpeechRecognition {
+                    constructor() {
+                      this.lang = "fr-FR";
+                      this.continuous = false;
+                      this.interimResults = false;
+                      this.maxAlternatives = 1;
+                      this.onstart = null;
+                      this.onresult = null;
+                      this.onerror = null;
+                      this.onend = null;
+                      this.started = false;
+                      this._resultsHistory = [];
+                      window.__FAKE_SR_INSTANCES__.push(this);
+                      window.__ACTIVE_FAKE_SR__ = this;
+                    }
+                    start() {
+                      if (window.__TM_MIC_DENIED__ === true) {
+                        this.started = false;
+                        if (this.onerror) {
+                          this.onerror({ error: "not-allowed" });
+                        }
+                        return;
+                      }
+                      this.started = true;
+                      window.__ACTIVE_FAKE_SR__ = this;
+                      if (this.onstart) {
+                        this.onstart({});
+                      }
+                    }
+                    stop() {
+                      this.started = false;
+                    }
+                    abort() {
+                      this.started = false;
+                    }
+                    emitSpeech(transcript, isFinal = true, confidence = 0.96) {
+                      const entry = {
+                        isFinal: Boolean(isFinal),
+                        length: 1,
+                        0: { transcript: String(transcript), confidence: Number(confidence) }
+                      };
+                      this._resultsHistory.push(entry);
+                      const resultIndex = this._resultsHistory.length - 1;
+                      if (this.onresult) {
+                        this.onresult({
+                          resultIndex,
+                          results: this._resultsHistory
+                        });
+                      }
+                    }
+                  }
+
+                  window.SpeechRecognition = FakeSpeechRecognition;
+                  window.webkitSpeechRecognition = FakeSpeechRecognition;
+                  window.__emitFakeSpeech = (text, isFinal = true, confidence = 0.96) => {
+                    const inst = window.__TM_ACTIVE_SPEECH_RECOGNITION__ || window.__ACTIVE_FAKE_SR__;
+                    if (!inst) {
+                      throw new Error("Aucune instance FakeSpeechRecognition active");
+                    }
+                    inst.emitSpeech(text, isFinal, confidence);
+                  };
+                })();"""
+            )
+
+            page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_timeout(1200)
+
+            trip_info = page.evaluate(
+                """async (apiUrl) => {
+                  localStorage.clear();
+                  const email = `voice.hf.${Date.now()}@travelmate.app`;
+                  const regResp = await fetch(`${apiUrl}/api/v1/auth/register`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      password: "PasswordStep4!2026",
+                      full_name: "Voyageur Mains Libres",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  const token = regData.access_token;
+                  localStorage.setItem("travelmate_jwt_token", token);
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+                  localStorage.setItem("tm_access_token", token);
+
+                  const destResp = await fetch(`${apiUrl}/api/v1/destinations`);
+                  const dests = await destResp.json();
+                  const marrakech = dests.find((d) => d.city_name === "Marrakech") || dests[0];
+
+                  const tripResp = await fetch(`${apiUrl}/api/v1/trips`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_id: marrakech.id,
+                      title: "Séjour Mains Libres Marrakech",
+                      travel_style: "STANDARD",
+                      total_budget: 1600
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+
+                  const bookResp = await fetch(`${apiUrl}/api/v1/flights/book`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      trip_id: trip.id,
+                      idempotency_key: "IDEM-PW-VOICE-HF-" + Date.now(),
+                      airline: "Royal Air Maroc",
+                      flight_number_outbound: "AT749",
+                      flight_number_inbound: "AT748",
+                      origin_iata: "ORY",
+                      destination_iata: "RAK",
+                      departure_outbound_at: "2026-11-11T05:00:00Z",
+                      arrival_outbound_at: "2026-11-11T07:00:00Z",
+                      departure_inbound_at: "2026-11-15T21:00:00Z",
+                      arrival_inbound_at: "2026-11-15T23:55:00Z",
+                      price_amount: "280.00",
+                      currency: "EUR",
+                      cabin_class: "ECONOMY"
+                    })
+                  });
+                  const bookData = await bookResp.json();
+                  localStorage.setItem("travelmate_last_flight_booking", JSON.stringify(bookData));
+
+                  const placesResp = await fetch(
+                    `${apiUrl}/api/v1/places/city/${encodeURIComponent(marrakech.city_name)}`,
+                    { headers: { Authorization: "Bearer " + token } }
+                  );
+                  const placesData = await placesResp.json();
+                  const places = placesData.places || [];
+                  const majorelle = places.find((pl) => pl.name.toLowerCase().includes("majorelle")) || places[0];
+
+                  await fetch(`${apiUrl}/api/v1/itinerary/items`, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      Authorization: "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      trip_id: trip.id,
+                      place_id: majorelle.id,
+                      visit_date: "2026-11-11",
+                      local_start_time: "10:00",
+                      duration_minutes: 90,
+                      transit_mode: "WALKING"
+                    })
+                  });
+
+                  return { tripId: trip.id, token, majorelleName: majorelle.name };
+                }""",
+                API_URL,
+            )
+
+            # 1. Démarrage automatique à l'ouverture de l'application
+            page.goto(f"{BASE_URL}/itinerary", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="voice-listening-pill"]', timeout=15000)
+            page.wait_for_selector('[data-testid="timeline-visit-card-0"]', timeout=15000)
+
+            auto_start_state = page.evaluate(
+                """() => {
+                  const inst = window.__TM_ACTIVE_SPEECH_RECOGNITION__ || window.__ACTIVE_FAKE_SR__;
+                  const statusEl = document.querySelector('[data-testid="screen-voice-listening-status"]');
+                  const spokenEl = document.querySelector('[data-testid="voice-spoken-reply-box"]');
+                  const autoStatusEl = document.querySelector('[data-testid="voice-autostart-status"]');
+                  const errEl = document.querySelector('[data-testid="voice-screen-error-banner"]');
+                  return {
+                    hasInstance: Boolean(inst),
+                    started: Boolean(inst && inst.started),
+                    instancesCount: (window.__FAKE_SR_INSTANCES__ || []).length,
+                    instancesStarted: (window.__FAKE_SR_INSTANCES__ || []).map((i) => ({
+                      started: i.started,
+                      stopReason: i._stopReason || null
+                    })),
+                    continuous: Boolean(inst && inst.continuous),
+                    interimResults: Boolean(inst && inst.interimResults),
+                    lang: inst ? inst.lang : "",
+                    pillText: statusEl ? statusEl.textContent.trim() : "",
+                    spokenText: spokenEl ? spokenEl.textContent.trim() : "",
+                    autoStatusText: autoStatusEl ? autoStatusEl.textContent.trim() : "",
+                    errText: errEl ? errEl.textContent.trim() : "",
+                    utterances: window.__TM_SPOKEN_UTTERANCES__ || []
+                  };
+                }"""
+            )
+            assert auto_start_state["hasInstance"] is True, f"auto_start_state={auto_start_state}"
+            assert auto_start_state["started"] is True, f"auto_start_state={auto_start_state}"
+            assert auto_start_state["continuous"] is True
+            assert auto_start_state["interimResults"] is True
+            assert auto_start_state["lang"] == "fr-FR"
+            assert auto_start_state["pillText"] == "J'écoute…"
+            assert "Assistant vocal actif, dites une commande" in auto_start_state["spokenText"]
+
+            # 2. Pause de 3 s au milieu d'une phrase + 3. Déplacement exécuté directement sans confirmation
+            page.evaluate(
+                """(placeName) => {
+                  // Conserve le délai réel de 3 s pour la première moitié de phrase et 30 s pour la veille
+                  window.__TM_VOICE_PHRASE_SCALE__ = 1;
+                  window.__TM_VOICE_STANDBY_SCALE__ = 1;
+                  window.__emitFakeSpeech(`déplace ${placeName}`, true, 0.96);
+                }""",
+                trip_info["majorelleName"],
+            )
+            # Pause réelle de 3 secondes au milieu de la phrase
+            page.wait_for_timeout(3100)
+            assert page.locator('[data-testid="voice-undo-banner"]').count() == 0, (
+                "La première moitié de phrase ne doit pas déclencher d'exécution avant la suite après la pause de 3 s"
+            )
+
+            # Suite de la phrase après la pause de 3 s
+            page.evaluate(
+                """() => {
+                  window.__TM_VOICE_PHRASE_SCALE__ = 0.05;
+                  window.__emitFakeSpeech("le 12 novembre à 14h", true, 0.96);
+                }"""
+            )
+
+            undo_banner = page.locator('[data-testid="voice-undo-banner"]')
+            try:
+                undo_banner.wait_for(state="visible", timeout=5000)
+            except Exception:
+                diag = page.evaluate(
+                    """() => ({
+                      spoken: document.querySelector('[data-testid="voice-spoken-reply-box"]')?.textContent,
+                      live: document.querySelector('[data-testid="voice-live-transcript-box"]')?.textContent,
+                      err: document.querySelector('[data-testid="voice-screen-error-banner"]')?.textContent,
+                      confirm: document.querySelector('[data-testid="voice-toolbar-confirmation-box"]')?.textContent,
+                      autoStatus: document.querySelector('[data-testid="voice-autostart-status"]')?.textContent,
+                      utterances: window.__TM_SPOKEN_UTTERANCES__ || []
+                    })"""
+                )
+                raise AssertionError(f"undo_banner not visible! diag={diag}")
+            history_text = page.locator('[data-testid="voice-last-modification-history"]').inner_text()
+            assert "2026-11-11" in history_text and "10:00" in history_text
+            assert "2026-11-12" in history_text and "14:00" in history_text
+
+            # Vérifie en base que la visite a bien été déplacée au 12 novembre à 14:00
+            moved_items = page.evaluate(
+                """async ({ apiUrl, tripId, token }) => {
+                  const r = await fetch(`${apiUrl}/api/v1/itinerary/trip/${tripId}`, {
+                    headers: { Authorization: "Bearer " + token }
+                  });
+                  return (await r.json()).items;
+                }""",
+                {"apiUrl": API_URL, "tripId": trip_info["tripId"], "token": trip_info["token"]},
+            )
+            assert moved_items[0]["local_visit_date"] == "2026-11-12"
+            assert moved_items[0]["local_start_time"] == "14:00"
+
+            # 3b. Dire "Annule" restaure l'état précédent (visite, horaire, synchronisation agenda)
+            page.evaluate("""() => window.__emitFakeSpeech("Annule", true, 0.96)""")
+            restored_banner = page.locator('[data-testid="voice-undo-restored-banner"]')
+            restored_banner.wait_for(state="visible", timeout=15000)
+            assert "10:00" in restored_banner.inner_text()
+
+            restored_items = page.evaluate(
+                """async ({ apiUrl, tripId, token }) => {
+                  const r = await fetch(`${apiUrl}/api/v1/itinerary/trip/${tripId}`, {
+                    headers: { Authorization: "Bearer " + token }
+                  });
+                  return (await r.json()).items;
+                }""",
+                {"apiUrl": API_URL, "tripId": trip_info["tripId"], "token": trip_info["token"]},
+            )
+            assert restored_items[0]["local_visit_date"] == "2026-11-11"
+            assert restored_items[0]["local_start_time"] == "10:00"
+            assert restored_items[0]["google_calendar_event_id"]
+
+            # 4. Suppression qui demande une confirmation obligatoire (aucune exécution directe)
+            page.evaluate(
+                """(placeName) => window.__emitFakeSpeech(`supprime la visite ${placeName}`, true, 0.96)""",
+                trip_info["majorelleName"],
+            )
+            confirm_box = page.locator('[data-testid="voice-toolbar-confirmation-box"]')
+            confirm_box.wait_for(state="visible", timeout=15000)
+            assert "Confirmation obligatoire" in confirm_box.inner_text()
+
+            items_during_delete_prompt = page.evaluate(
+                """async ({ apiUrl, tripId, token }) => {
+                  const r = await fetch(`${apiUrl}/api/v1/itinerary/trip/${tripId}`, {
+                    headers: { Authorization: "Bearer " + token }
+                  });
+                  return (await r.json()).items;
+                }""",
+                {"apiUrl": API_URL, "tripId": trip_info["tripId"], "token": trip_info["token"]},
+            )
+            assert len(items_during_delete_prompt) == 1, "La suppression ne doit jamais s'exécuter sans confirmation"
+
+            # Annule la proposition de suppression en disant "non"
+            page.evaluate("""() => window.__emitFakeSpeech("non", true, 0.96)""")
+            confirm_box.wait_for(state="hidden", timeout=10000)
+
+            # 5. Lieu ambigu qui pose une question à voix haute sans exécution
+            page.evaluate(
+                """() => window.__emitFakeSpeech("mets le Jardin le 12 novembre à 10h", true, 0.96)"""
+            )
+            page.wait_for_function(
+                """() => {
+                  const el = document.querySelector('[data-testid="voice-spoken-reply-box"]');
+                  return el && el.textContent && el.textContent.includes("?") && el.textContent.includes("Jardin");
+                }""",
+                timeout=15000,
+            )
+            spoken_ambig = page.locator('[data-testid="voice-spoken-reply-box"]').inner_text()
+            assert "?" in spoken_ambig and "Jardin" in spoken_ambig
+            assert page.locator('[data-testid="voice-undo-banner"]').count() == 0
+
+            # 6. Veille après 30 s sans parole (micro en pause avec message)
+            page.evaluate(
+                """() => {
+                  // Réduit l'échelle de temps pour déclencher le délai de veille de 30 s en 300 ms
+                  window.__TM_VOICE_STANDBY_SCALE__ = 0.01;
+                }"""
+            )
+            # Cliquez sur Écoute / Reprendre avec l'échelle accélérée pour tester la mise en veille après 30 s sans parole
+            page.locator('[data-testid="screen-voice-mic-btn"]').click()
+            page.locator('[data-testid="screen-voice-mic-btn"]').click()
+            page.wait_for_function(
+                """() => {
+                  const pill = document.querySelector('[data-testid="screen-voice-listening-status"]');
+                  const status = document.querySelector('[data-testid="voice-autostart-status"]');
+                  return (
+                    pill &&
+                    pill.textContent.trim() === "Micro en pause" &&
+                    status &&
+                    status.textContent.includes("Veille vocale activée")
+                  );
+                }""",
+                timeout=10000,
+            )
+
+            # 6b. Reprise par la voix ("Écoute") puis arrêt par la voix ("Arrête d'écouter")
+            page.evaluate(
+                """() => {
+                  window.__TM_VOICE_STANDBY_SCALE__ = 1;
+                  window.__emitFakeSpeech("Écoute", true, 0.96);
+                }"""
+            )
+            page.wait_for_function(
+                """() => {
+                  const pill = document.querySelector('[data-testid="screen-voice-listening-status"]');
+                  return pill && pill.textContent.trim() === "J'écoute…";
+                }""",
+                timeout=10000,
+            )
+
+            page.evaluate("""() => window.__emitFakeSpeech("Arrête d'écouter", true, 0.96)""")
+            page.wait_for_function(
+                """() => {
+                  const pill = document.querySelector('[data-testid="screen-voice-listening-status"]');
+                  return pill && pill.textContent.trim() === "Micro en pause";
+                }""",
+                timeout=10000,
+            )
+
+            # 7. Micro refusé : message clair et pas de démarrage automatique
+            page_denied = context.new_page()
+            page_denied.add_init_script(
+                """(() => {
+                  window.__TM_MIC_AUTHORIZED__ = false;
+                  window.__TM_MIC_DENIED__ = true;
+                })();"""
+            )
+            page_denied.goto(f"{BASE_URL}/itinerary", wait_until="domcontentloaded", timeout=20000)
+            page_denied.wait_for_selector('[data-testid="voice-listening-pill"]', timeout=15000)
+            denied_pill = page_denied.locator('[data-testid="screen-voice-listening-status"]').inner_text().strip()
+            assert denied_pill == "Micro en pause"
+            denied_error = page_denied.locator('[data-testid="voice-screen-error-banner"]').inner_text()
+            assert "microphone refusé" in denied_error.lower()
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
 if __name__ == "__main__":
     result = test_mon_programme_layout_5_widths_playwright()
     test_real_chat_marrakech_jardin_secret_medina_and_single_row_header()
+    test_hands_free_voice_fake_speech_recognition_playwright()
     print(json.dumps(result, indent=2, ensure_ascii=False))
+
 

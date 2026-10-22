@@ -201,6 +201,13 @@ class ChatProposedActionSchema(BaseModel):
     confirmation_steps_required: int = 1
     confirmation_step: int = 1
     spoken_summary_fr: str | None = None
+    place_similarity_score: float | None = None
+    explicit_date: bool = False
+    explicit_time: bool = False
+    executed_directly: bool = False
+    undo_available: bool = False
+    undo_window_seconds: int = 30
+    undo_snapshot: dict[str, Any] | None = None
 
 
 class ChatMessageResponse(BaseModel):
@@ -214,6 +221,8 @@ class ChatMessageResponse(BaseModel):
         "PENDING_CONFIRMATION",
         "AWAITING_SECOND_CONFIRMATION",
         "CONFIRMED",
+        "EXECUTED_DIRECTLY",
+        "UNDONE",
         "REJECTED",
     ] = "NONE"
     navigation_target: str | None = None
@@ -255,6 +264,7 @@ class VoiceCommandRequest(BaseModel):
     signal: VoiceSignalType = "SPEECH"
     provider: Literal["web_speech", "whisper_local"] | None = None
     hands_free: bool = False
+    execute_without_confirmation: bool = False
     confidence: float = Field(default=0.95, ge=0.0, le=1.0)
     audio_base64: str | None = None
 
@@ -270,6 +280,7 @@ class VoiceCommandResponse(BaseModel):
     transits_browser_service: bool
     privacy_notice_fr: str
     hands_free: bool = False
+    execute_without_confirmation: bool = False
     editable_before_send: bool = True
     auto_submitted: bool = False
     signal: str
@@ -290,6 +301,38 @@ class VoiceCommandResponse(BaseModel):
     message_id: str | None = None
     proposed_action: ChatProposedActionSchema | None = None
     applied_change: bool = False
+    executed_directly: bool = False
+    can_undo: bool = False
+    undo_window_seconds: int = 0
+    undo_message_id: str | None = None
+    place_similarity_score: float | None = None
+    has_explicit_date: bool = False
+    has_explicit_time: bool = False
+    updated_item: ItineraryItemResponse | None = None
+    restored_item: ItineraryItemResponse | None = None
+    deleted_item_id: str | None = None
+    last_modification_history: dict[str, Any] | None = None
+    message: ChatMessageResponse | None = None
+
+
+class VoiceUndoRequest(BaseModel):
+    message_id: str | None = None
+    source: Literal["VOICE", "BUTTON"] = "VOICE"
+
+
+class VoiceUndoResponse(BaseModel):
+    ok: bool
+    status: str = "UNDONE"
+    trip_id: str
+    message_id: str | None = None
+    restored: bool = False
+    operation_undone: str | None = None
+    spoken_reply_fr: str
+    detail_fr: str
+    restored_item: ItineraryItemResponse | None = None
+    deleted_item_id: str | None = None
+    calendar_sync_restored: bool = False
+    last_modification_history: dict[str, Any] | None = None
     message: ChatMessageResponse | None = None
 
 
@@ -319,6 +362,8 @@ class VoiceConfirmResponse(BaseModel):
         "PENDING_CONFIRMATION",
         "AWAITING_SECOND_CONFIRMATION",
         "CONFIRMED",
+        "EXECUTED_DIRECTLY",
+        "UNDONE",
         "REJECTED",
     ]
     applied_change: bool = False
@@ -344,5 +389,6 @@ class VoiceProvidersConfigResponse(BaseModel):
         "En mode mains libres avec Web Speech API, l'audio peut transiter par le service de reconnaissance "
         "vocale du navigateur. Vous pouvez sélectionner Whisper local pour un traitement hors navigateur."
     )
+
 
 
