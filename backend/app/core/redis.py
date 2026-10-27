@@ -60,6 +60,34 @@ class HybridCacheClient:
         except Exception:
             return None
 
+    async def get_counter(self, key: str) -> int:
+        raw = await self.get_value(key)
+        if not raw:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    async def incr_counter(self, key: str, ttl_seconds: int = 3600) -> int:
+        current = await self.get_counter(key)
+        next_val = current + 1
+        await self.set_value(key, str(next_val), ex=ttl_seconds)
+        return next_val
+
+    async def clear_prefix(self, prefix: str) -> None:
+        for k in list(_MEMORY_CACHE.keys()):
+            if k.startswith(prefix):
+                _MEMORY_CACHE.pop(k, None)
+        if self._redis_available is False:
+            return
+        try:
+            keys = await asyncio.wait_for(self._client.keys(f"{prefix}*"), timeout=0.35)
+            if keys:
+                await asyncio.wait_for(self._client.delete(*keys), timeout=0.35)
+        except Exception:
+            pass
+
     async def health_check(self) -> dict[str, Any]:
         if self._redis_available is False:
             return {
@@ -93,3 +121,7 @@ class HybridCacheClient:
 
 
 cache_client = HybridCacheClient()
+
+
+def get_redis_client() -> HybridCacheClient:
+    return cache_client

@@ -1296,19 +1296,34 @@ async def seed_initial_data(session: AsyncSession) -> dict[str, int]:
     else:
         demo_user = existing_user
 
+    seed_geonames_meta: dict[str, tuple[int, int]] = {
+        "Tokyo": (1850147, 8336599),
+        "Rome": (3169070, 2318895),
+        "New York": (5128581, 8804190),
+        "Marrakech": (2542997, 928850),
+        "Paris": (2988507, 2138551),
+    }
+
     for dest_data in SEED_DESTINATIONS:
+        city_name_str = str(dest_data["city_name"])
+        seed_gid, seed_pop = seed_geonames_meta.get(
+            city_name_str,
+            (dest_data.get("geoname_id"), dest_data.get("population")),
+        )
         dest = await session.scalar(
-            select(Destination).where(Destination.city_name == dest_data["city_name"])
+            select(Destination).where(Destination.city_name == city_name_str)
         )
         if not dest:
             dest = Destination(
-                city_name=dest_data["city_name"],
+                geoname_id=seed_gid,
+                city_name=city_name_str,
                 country_name=dest_data["country_name"],
                 country_code_iso2=dest_data["country_code_iso2"],
                 iata_code=dest_data["iata_code"],
                 timezone=dest_data["timezone"],
                 latitude=dest_data["latitude"],
                 longitude=dest_data["longitude"],
+                population=seed_pop,
                 hero_image_url=dest_data["hero_image_url"],
                 description=dest_data["description"],
                 practical_info=dest_data["practical_info"],
@@ -1318,6 +1333,10 @@ async def seed_initial_data(session: AsyncSession) -> dict[str, int]:
             await session.flush()
             created_destinations += 1
         else:
+            if dest.geoname_id is None and seed_gid is not None:
+                dest.geoname_id = seed_gid
+            if dest.population is None and seed_pop is not None:
+                dest.population = seed_pop
             dest.practical_info = dest_data["practical_info"]
             dest.useful_phrases = dest_data["useful_phrases"]
 

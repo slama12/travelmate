@@ -64,8 +64,9 @@ def test_alembic_revision_ids_do_not_exceed_32_characters() -> None:
         "0003_planning_calendar",
         "0004_weather_ai_chat",
         "0005_step5a_budget_docs_rbac",
+        "0006_world_cities_geonames",
     }.issubset(revision_ids)
-    assert script_dir.get_current_head() == "0005_step5a_budget_docs_rbac"
+    assert script_dir.get_current_head() == "0006_world_cities_geonames"
 
 
 def _resolve_postgres_admin_and_test_urls() -> tuple[str, str, str, str]:
@@ -115,7 +116,7 @@ async def test_postgres_alembic_upgrade_head_from_empty_db_and_idempotent_seed()
     """
     Test d'intégration sur un VRAI PostgreSQL (pas SQLite) :
     1. Crée une base PostgreSQL totalement vide.
-    2. Exécute 'alembic upgrade head' (0001 -> 0002 -> 0003 -> 0004 -> 0005) et vérifie alembic_version.
+    2. Exécute 'alembic upgrade head' (0001 -> 0002 -> 0003 -> 0004 -> 0005 -> 0006) et vérifie alembic_version.
     3. Exécute le seed initial une 1re fois et vérifie les données insérées.
     4. Exécute le seed une 2de fois et vérifie qu'il est strictement idempotent.
     """
@@ -163,13 +164,13 @@ async def test_postgres_alembic_upgrade_head_from_empty_db_and_idempotent_seed()
         alembic_cfg = _make_alembic_config(db_url=test_sync_url)
         command.upgrade(alembic_cfg, "head")
 
-        # Vérifie sur PostgreSQL que alembic_version contient bien '0005_step5a_budget_docs_rbac'
-        # dans une colonne VARCHAR(32) et que les nouvelles colonnes des étapes 4 et 5A existent
+        # Vérifie sur PostgreSQL que alembic_version contient bien '0006_world_cities_geonames'
+        # dans une colonne VARCHAR(32) et que les nouvelles colonnes des étapes 4, 5A et 0006 existent
         verify_engine = create_engine(test_sync_url)
         with verify_engine.connect() as conn:
             assert conn.dialect.name == "postgresql"
             version_num = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            assert version_num == "0005_step5a_budget_docs_rbac"
+            assert version_num == "0006_world_cities_geonames"
             assert len(version_num) <= MAX_ALEMBIC_VERSION_NUM_LEN
 
             col_max_len = conn.execute(
@@ -232,6 +233,17 @@ async def test_postgres_alembic_upgrade_head_from_empty_db_and_idempotent_seed()
                 ).fetchall()
             }
             assert {"owner_id", "is_shared", "expires_on"}.issubset(step5a_vault_cols)
+
+            dest_cols = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'destinations'"
+                    )
+                ).fetchall()
+            }
+            assert {"geoname_id", "population"}.issubset(dest_cols)
         verify_engine.dispose()
 
         # 2. Exécute le seed une 1re fois puis une 2de fois sur PostgreSQL et vérifie l'idempotence

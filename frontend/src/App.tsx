@@ -289,6 +289,33 @@ const queryClient = new QueryClient({
   },
 });
 
+const SEED_POPULAR_CITY_NAMES = new Set([
+  "paris",
+  "marrakech",
+  "tokyo",
+  "new york",
+  "rome",
+]);
+
+interface GeoNamesCitySearchItem {
+  geonameId: number;
+  geoname_id?: number;
+  nom: string;
+  name?: string;
+  city_name?: string;
+  pays: string;
+  country_name?: string;
+  code_pays: string;
+  country_code_iso2?: string;
+  coordonnees: { latitude: number; longitude: number };
+  fuseau_horaire: string;
+  timezone?: string;
+  population: number;
+  iata_code?: string;
+  is_seed?: boolean;
+  destination_id?: string | null;
+}
+
 /* ============================================================================
  * 1. ÉCRAN ACCUEIL (/)
  * ========================================================================== */
@@ -301,6 +328,7 @@ function HomeScreen({
   travelers,
   onChangeTravelers,
   onSelectDestinationAndSearch,
+  onRegisterCreatedDestination,
   initialUnavailableCity = null,
 }: {
   destinations: Destination[];
@@ -311,6 +339,7 @@ function HomeScreen({
   travelers: string;
   onChangeTravelers: (val: string) => void;
   onSelectDestinationAndSearch: (dest: Destination) => Promise<void>;
+  onRegisterCreatedDestination?: (dest: Destination) => void;
   initialUnavailableCity?: string | null;
 }) {
   const [cityQuery, setCityQuery] = useState<string>("");
@@ -319,8 +348,23 @@ function HomeScreen({
   const [unavailableCity, setUnavailableCity] = useState<string | null>(
     initialUnavailableCity
   );
+  const [geonamesResults, setGeonamesResults] = useState<GeoNamesCitySearchItem[]>([]);
+  const [selectedGeoCity, setSelectedGeoCity] = useState<GeoNamesCitySearchItem | null>(
+    null
+  );
+  const [isSearchingGeonames, setIsSearchingGeonames] = useState<boolean>(false);
+  const [geonamesUnavailableMessage, setGeonamesUnavailableMessage] = useState<
+    string | null
+  >(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
+
+  const popularDestinations = useMemo(() => {
+    const seedList = destinations.filter((d) =>
+      SEED_POPULAR_CITY_NAMES.has(d.city_name.trim().toLowerCase())
+    );
+    return seedList.length > 0 ? seedList : destinations.slice(0, 5);
+  }, [destinations]);
 
   const selectedRange: DateRange = useMemo(() => {
     return {
@@ -329,15 +373,100 @@ function HomeScreen({
     };
   }, [departureDate, returnDate]);
 
-  const filteredSuggestions = useMemo(() => {
+  // Anti-rebond (debounce) de 300 ms à partir de 3 lettres minimum vers /api/v1/destinations/search
+  useEffect(() => {
+    const trimmed = cityQuery.trim();
+    if (trimmed.length < 3) {
+      setGeonamesResults([]);
+      setIsSearchingGeonames(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsSearchingGeonames(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const resp = await fetch(
+          `${API_BASE}/api/v1/destinations/search?q=${encodeURIComponent(trimmed)}`
+        );
+        if (cancelled) return;
+        if (!resp.ok) {
+          setGeonamesUnavailableMessage(
+            "Recherche de villes indisponible — repli sur les 5 destinations populaires."
+          );
+          setGeonamesResults([]);
+          setIsSearchingGeonames(false);
+          return;
+        }
+        const data = await resp.json();
+        if (cancelled) return;
+        if (data && data.available === false) {
+          setGeonamesUnavailableMessage(
+            data.message ||
+              "Recherche de villes indisponible — repli sur les 5 destinations populaires."
+          );
+          setGeonamesResults(Array.isArray(data.results) ? data.results : []);
+        } else {
+          setGeonamesUnavailableMessage(null);
+          setGeonamesResults(Array.isArray(data?.results) ? data.results : []);
+        }
+      } catch {
+        if (!cancelled) {
+          setGeonamesUnavailableMessage(
+            "Recherche de villes indisponible — repli sur les 5 destinations populaires."
+          );
+          setGeonamesResults([]);
+        }
+      } finally {
+        if (!cancelled) {
+          setIsSearchingGeonames(false);
+        }
+      }
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [cityQuery]);
+
+  const displaySuggestions = useMemo((): GeoNamesCitySearchItem[] => {
     const q = cityQuery.trim().toLowerCase();
-    if (!q) return destinations;
-    return destinations.filter(
-      (d) =>
-        d.city_name.toLowerCase().includes(q) ||
-        d.country_name.toLowerCase().includes(q)
+    const seedAsGeoItems: GeoNamesCitySearchItem[] = popularDestinations.map(
+      (d, idx) => ({
+        geonameId: (d as any).geonameId || (d as any).geoname_id || 9000000 + idx,
+        nom: d.city_name,
+        pays: d.country_name,
+        code_pays: d.country_code_iso2,
+        coordonnees: { latitude: d.latitude, longitude: d.longitude },
+        fuseau_horaire: d.timezone,
+        population: (d as any).population || 0,
+        iata_code: d.iata_code,
+        is_seed: true,
+        destination_id: d.id,
+      })
     );
-  }, [cityQuery, destinations]);
+
+    if (q.length < 3) {
+      if (!q) return seedAsGeoItems;
+      return seedAsGeoItems.filter(
+        (item) =>
+          item.nom.toLowerCase().includes(q) ||
+          item.pays.toLowerCase().includes(q)
+      );
+    }
+
+    if (geonamesUnavailableMessage) {
+      const filteredSeed = seedAsGeoItems.filter(
+        (item) =>
+          item.nom.toLowerCase().includes(q) ||
+          item.pays.toLowerCase().includes(q)
+      );
+      return filteredSeed.length > 0 ? filteredSeed : seedAsGeoItems;
+    }
+
+    return geonamesResults;
+  }, [cityQuery, popularDestinations, geonamesResults, geonamesUnavailableMessage]);
 
   useEffect(() => {
     function handleOutsideClick(e: MouseEvent) {
@@ -349,6 +478,47 @@ function HomeScreen({
     return () => document.removeEventListener("mousedown", handleOutsideClick);
   }, []);
 
+  async function resolveGeoCityToDestination(
+    item: GeoNamesCitySearchItem
+  ): Promise<Destination | null> {
+    const existingSeed = destinations.find(
+      (d) =>
+        (item.destination_id && d.id === item.destination_id) ||
+        d.city_name.trim().toLowerCase() === item.nom.trim().toLowerCase()
+    );
+    if (
+      existingSeed &&
+      SEED_POPULAR_CITY_NAMES.has(existingSeed.city_name.trim().toLowerCase())
+    ) {
+      return existingSeed;
+    }
+
+    try {
+      const resp = await fetch(`${API_BASE}/api/v1/destinations/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          geonameId: item.geonameId,
+          nom: item.nom,
+          pays: item.pays,
+          code_pays: item.code_pays,
+          coordonnees: item.coordonnees,
+          fuseau_horaire: item.fuseau_horaire,
+          population: item.population,
+          iata_code: item.iata_code,
+        }),
+      });
+      if (resp.ok) {
+        const resolvedDest: Destination = await resp.json();
+        onRegisterCreatedDestination?.(resolvedDest);
+        return resolvedDest;
+      }
+    } catch {
+      // Fallback sur existingSeed si erreur réseau
+    }
+    return existingSeed || null;
+  }
+
   async function handleSubmitSearch(e: React.FormEvent) {
     e.preventDefault();
     setUnavailableCity(null);
@@ -356,7 +526,8 @@ function HomeScreen({
 
     if (!trimmed) {
       const defaultDest =
-        destinations.find((d) => d.city_name === "Marrakech") || destinations[0];
+        popularDestinations.find((d) => d.city_name === "Marrakech") ||
+        popularDestinations[0];
       if (defaultDest) {
         setIsSubmitting(true);
         await onSelectDestinationAndSearch(defaultDest);
@@ -365,25 +536,94 @@ function HomeScreen({
       return;
     }
 
-    const match = destinations.find(
-      (d) =>
-        d.city_name.toLowerCase() === trimmed.toLowerCase() ||
-        d.city_name.toLowerCase().includes(trimmed.toLowerCase())
-    );
+    setIsSubmitting(true);
+    try {
+      // 1. Si l'utilisateur a choisi une suggestion GeoNames explicite correspondant au champ
+      if (
+        selectedGeoCity &&
+        selectedGeoCity.nom.trim().toLowerCase() === trimmed.toLowerCase()
+      ) {
+        const resolved = await resolveGeoCityToDestination(selectedGeoCity);
+        if (resolved) {
+          await onSelectDestinationAndSearch(resolved);
+          return;
+        }
+      }
 
-    if (!match) {
+      // 2. Si la ville fait partie des destinations déjà chargées (ex: les 5 villes du seed)
+      const directSeedMatch = destinations.find(
+        (d) => d.city_name.trim().toLowerCase() === trimmed.toLowerCase()
+      );
+      if (directSeedMatch) {
+        await onSelectDestinationAndSearch(directSeedMatch);
+        return;
+      }
+
+      // 3. Si des résultats GeoNames sont déjà présents pour cette saisie
+      const geoMatch =
+        geonamesResults.find(
+          (g) => g.nom.trim().toLowerCase() === trimmed.toLowerCase()
+        ) || geonamesResults[0];
+      if (geoMatch) {
+        const resolved = await resolveGeoCityToDestination(geoMatch);
+        if (resolved) {
+          await onSelectDestinationAndSearch(resolved);
+          return;
+        }
+      }
+
+      // 4. Sinon, interroge immédiatement /api/v1/destinations/search?q=... (si l'utilisateur a validé avant les 300 ms)
+      if (trimmed.length >= 3) {
+        try {
+          const searchResp = await fetch(
+            `${API_BASE}/api/v1/destinations/search?q=${encodeURIComponent(trimmed)}`
+          );
+          if (searchResp.ok) {
+            const searchData = await searchResp.json();
+            if (searchData?.available === false) {
+              setGeonamesUnavailableMessage(
+                searchData.message ||
+                  "Recherche de villes indisponible — repli sur les 5 destinations populaires."
+              );
+            } else if (
+              Array.isArray(searchData?.results) &&
+              searchData.results.length > 0
+            ) {
+              const resolved = await resolveGeoCityToDestination(
+                searchData.results[0]
+              );
+              if (resolved) {
+                await onSelectDestinationAndSearch(resolved);
+                return;
+              }
+            }
+          }
+        } catch {
+          setGeonamesUnavailableMessage(
+            "Recherche de villes indisponible — repli sur les 5 destinations populaires."
+          );
+        }
+      }
+
+      // 5. Dernier repli partiel sur les villes populaires ou affichage "ville introuvable"
+      const partialSeedMatch = popularDestinations.find((d) =>
+        d.city_name.toLowerCase().includes(trimmed.toLowerCase())
+      );
+      if (partialSeedMatch) {
+        await onSelectDestinationAndSearch(partialSeedMatch);
+        return;
+      }
+
       setUnavailableCity(trimmed);
       setAutocompleteOpen(false);
-      return;
+    } finally {
+      setIsSubmitting(false);
     }
-
-    setIsSubmitting(true);
-    await onSelectDestinationAndSearch(match);
-    setIsSubmitting(false);
   }
 
   async function handlePickAvailableDestination(dest: Destination) {
     setUnavailableCity(null);
+    setSelectedGeoCity(null);
     setCityQuery(dest.city_name);
     setAutocompleteOpen(false);
     setIsSubmitting(true);
@@ -408,7 +648,7 @@ function HomeScreen({
         <div className="relative overflow-hidden rounded-card bg-slate-900 shadow-card min-h-[420px] sm:min-h-[460px] flex flex-col justify-end">
           <img
             src={
-              destinations[0]?.hero_image_url ||
+              popularDestinations[0]?.hero_image_url ||
               "https://images.unsplash.com/photo-1597212618440-806262de4f6b?auto=format&fit=crop&w=1400&q=80"
             }
             alt="Destination de voyage ensoleillée"
@@ -436,7 +676,7 @@ function HomeScreen({
               data-testid="home-search-form"
               className="mt-6 grid grid-cols-1 md:grid-cols-12 gap-3 rounded-card bg-canvas-card p-3.5 shadow-popover border border-border"
             >
-              {/* Champ 1 : Où allez-vous ? avec autocomplétion par nom de ville */}
+              {/* Champ 1 : Où allez-vous ? avec autocomplétion GeoNames (3 lettres min, 300 ms) */}
               <div ref={searchBoxRef} className="relative md:col-span-4">
                 <label
                   htmlFor="home-destination-input"
@@ -453,52 +693,84 @@ function HomeScreen({
                     onFocus={() => setAutocompleteOpen(true)}
                     onChange={(e) => {
                       setCityQuery(e.target.value);
+                      setSelectedGeoCity(null);
                       setUnavailableCity(null);
                       setAutocompleteOpen(true);
                     }}
-                    placeholder="Marrakech, Tokyo, Rome..."
+                    placeholder="Lisbonne, Séoul, Marrakech, Tokyo..."
                     autoComplete="off"
                     className="pl-9"
                   />
                 </div>
 
-                {/* Menu d'autocomplétion par nom de ville */}
-                {autocompleteOpen && filteredSuggestions.length > 0 && (
-                  <div
-                    role="listbox"
-                    aria-label="Suggestions de villes"
-                    data-testid="home-autocomplete-list"
-                    className="absolute left-0 right-0 top-full z-40 mt-1.5 max-h-64 overflow-auto rounded-card border border-border bg-canvas-card p-1.5 shadow-popover"
-                  >
-                    {filteredSuggestions.map((dest) => (
-                      <button
-                        key={dest.id}
-                        type="button"
-                        role="option"
-                        aria-selected={cityQuery === dest.city_name}
-                        data-testid={`autocomplete-city-${dest.city_name.toLowerCase()}`}
-                        onClick={() => {
-                          setCityQuery(dest.city_name);
-                          setUnavailableCity(null);
-                          setAutocompleteOpen(false);
-                        }}
-                        className="flex w-full items-center justify-between rounded-md px-3 py-2 text-left hover:bg-brand-50 focus:bg-brand-50 focus:outline-none"
-                      >
-                        <div>
-                          <div className="text-body font-medium text-ink">
-                            {dest.city_name}
-                          </div>
-                          <div className="text-caption text-ink-muted">
-                            {dest.country_name}
-                          </div>
+                {/* Menu d'autocomplétion par nom de ville (GeoNames + repli 5 villes) */}
+                {autocompleteOpen &&
+                  (displaySuggestions.length > 0 ||
+                    isSearchingGeonames ||
+                    cityQuery.trim().length >= 3) && (
+                    <div
+                      role="listbox"
+                      aria-label="Suggestions de villes"
+                      data-testid="home-autocomplete-list"
+                      className="absolute left-0 right-0 top-full z-40 mt-1.5 max-h-64 overflow-auto rounded-card border border-border bg-canvas-card p-1.5 shadow-popover"
+                    >
+                      {geonamesUnavailableMessage && (
+                        <div
+                          data-testid="autocomplete-unavailable-notice"
+                          className="mb-1.5 rounded-md bg-feedback-warningBg px-2.5 py-1.5 text-[12px] font-medium text-amber-900"
+                        >
+                          {geonamesUnavailableMessage}
                         </div>
-                        <span className="text-caption text-brand-700 font-medium">
-                          Choisir
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                )}
+                      )}
+                      {isSearchingGeonames && displaySuggestions.length === 0 ? (
+                        <div
+                          data-testid="autocomplete-loading"
+                          className="px-3 py-2 text-caption text-ink-muted"
+                        >
+                          Recherche des villes du monde...
+                        </div>
+                      ) : displaySuggestions.length === 0 ? (
+                        <div
+                          data-testid="autocomplete-empty"
+                          className="px-3 py-2 text-caption text-ink-muted"
+                        >
+                          Aucune ville trouvée pour « {cityQuery.trim()} ».
+                        </div>
+                      ) : (
+                        displaySuggestions.map((item) => (
+                          <button
+                            key={`${item.geonameId}-${item.nom}`}
+                            type="button"
+                            role="option"
+                            aria-selected={cityQuery === item.nom}
+                            data-testid={`autocomplete-city-${item.nom.toLowerCase()}`}
+                            onClick={() => {
+                              setSelectedGeoCity(item);
+                              setCityQuery(item.nom);
+                              setUnavailableCity(null);
+                              setAutocompleteOpen(false);
+                            }}
+                            className="flex w-full items-center justify-between rounded-md px-3 py-2 text-left hover:bg-brand-50 focus:bg-brand-50 focus:outline-none"
+                          >
+                            <div>
+                              <div className="text-body font-medium text-ink">
+                                {item.nom}
+                              </div>
+                              <div className="text-caption text-ink-muted">
+                                {item.pays}
+                                {item.fuseau_horaire
+                                  ? ` • ${item.fuseau_horaire}`
+                                  : ""}
+                              </div>
+                            </div>
+                            <span className="text-caption text-brand-700 font-medium">
+                              Choisir
+                            </span>
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
               </div>
 
               {/* Champ 2 : Dates (Calendrier react-day-picker) */}
@@ -590,7 +862,36 @@ function HomeScreen({
           </div>
         </div>
 
-        {/* Message contextuel sobre si la ville saisie est hors démonstration */}
+        {/* Bandeau de repli si GeoNames est injoignable, quota atteint ou clé absente */}
+        {geonamesUnavailableMessage && (
+          <Card
+            data-testid="geonames-unavailable-banner"
+            className="mt-4 border-amber-200 bg-feedback-warningBg p-4"
+          >
+            <p className="text-body font-semibold text-ink">
+              {geonamesUnavailableMessage}
+            </p>
+            <div className="mt-2.5 flex flex-wrap gap-2">
+              {popularDestinations.map((dest) => (
+                <Button
+                  key={dest.id}
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  data-testid={`geonames-fallback-dest-${dest.city_name.toLowerCase()}`}
+                  onClick={() => handlePickAvailableDestination(dest)}
+                >
+                  <MapPin className="h-3.5 w-3.5 text-brand-700" />
+                  <span>
+                    {dest.city_name} ({dest.country_name})
+                  </span>
+                </Button>
+              ))}
+            </div>
+          </Card>
+        )}
+
+        {/* Message contextuel sobre si la ville saisie est introuvable */}
         {unavailableCity && (
           <Card
             data-testid="unavailable-demo-city-card"
@@ -600,10 +901,10 @@ function HomeScreen({
               Cette destination n'est pas encore disponible en démonstration
             </p>
             <p className="mt-1 text-caption text-ink-secondary">
-              Vous avez recherché « {unavailableCity} ». Choisissez l'une des destinations disponibles ci-dessous pour découvrir les vols et activités :
+              Vous avez recherché « {unavailableCity} ». Choisissez l'une des 5 destinations populaires ci-dessous :
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
-              {destinations.map((dest) => (
+              {popularDestinations.map((dest) => (
                 <Button
                   key={dest.id}
                   type="button"
@@ -623,7 +924,7 @@ function HomeScreen({
         )}
       </section>
 
-      {/* Dessous : Destinations populaires en grandes cartes photo */}
+      {/* Dessous : Les 5 villes du seed restent proposées en destinations populaires */}
       <section className="mx-auto max-w-6xl px-4 mt-12">
         <div className="flex flex-wrap items-end justify-between gap-4 mb-6">
           <div>
@@ -652,7 +953,7 @@ function HomeScreen({
             className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
             data-testid="popular-destinations-grid"
           >
-            {destinations.map((dest) => (
+            {popularDestinations.map((dest) => (
               <Card
                 key={dest.id}
                 data-testid={`destination-card-${dest.city_name.toLowerCase()}`}
@@ -1009,15 +1310,34 @@ function FlightsScreen({
           </div>
         </Card>
       ) : sortedOffers.length === 0 ? (
-        /* État 3 : Liste vide avec message utile et action */
+        /* État 3 : Liste vide ou ville non couverte par la simulation de vols */
         <Card className="p-8 text-center" data-testid="flights-empty-state">
           <h2 className="text-h2 text-ink">
-            Aucun vol trouvé pour ces critères
+            {!SEED_POPULAR_CITY_NAMES.has(destinationCity.trim().toLowerCase())
+              ? `Vols simulés : ${destinationCity} n'est pas couverte en simulation`
+              : "Aucun vol trouvé pour ces critères"}
           </h2>
-          <p className="mt-2 text-body text-ink-muted max-w-md mx-auto">
-            Essayez un autre aéroport de départ ou modifiez vos dates de voyage sur l'accueil.
+          <p className="mt-2 text-body text-ink-muted max-w-xl mx-auto">
+            {!SEED_POPULAR_CITY_NAMES.has(destinationCity.trim().toLowerCase())
+              ? `Les vols restent simulés pour le moment et la ville de ${destinationCity} (${destinationIata}) n'est pas couverte en démonstration (seules Paris, Marrakech, Tokyo, New York et Rome disposent de vols simulés).`
+              : "Essayez un autre aéroport de départ ou modifiez vos dates de voyage sur l'accueil."}
           </p>
-          <div className="mt-5">
+          <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+            <Button
+              type="button"
+              data-testid="flights-continue-accommodations-btn"
+              onClick={() => navigate("/accommodations")}
+            >
+              Continuer vers l'hébergement
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              data-testid="flights-continue-activities-btn"
+              onClick={() => navigate("/activities")}
+            >
+              Voir les lieux de la ville
+            </Button>
             <Button type="button" variant="secondary" onClick={() => navigate("/")}>
               Modifier ma recherche
             </Button>
@@ -1773,7 +2093,17 @@ export function TravelMateShell({
    * Sélectionne automatiquement ou crée le voyage en cours pour la destination choisie
    * (sans menu déroulant "Séjour actif").
    */
+  function registerCreatedDestination(dest: Destination) {
+    setDestinations((prev) => {
+      if (prev.some((d) => d.id === dest.id)) {
+        return prev.map((d) => (d.id === dest.id ? dest : d));
+      }
+      return [...prev, dest];
+    });
+  }
+
   async function ensureTripForDestination(dest: Destination): Promise<Trip | null> {
+    registerCreatedDestination(dest);
     const existing = trips.find((t) => t.destination_id === dest.id);
     if (existing) {
       setActiveTripId(existing.id);
@@ -1806,6 +2136,7 @@ export function TravelMateShell({
   }
 
   async function handleSelectDestinationAndGoToFlights(dest: Destination) {
+    registerCreatedDestination(dest);
     if (dest.iata_code.toUpperCase() === originIata.toUpperCase()) {
       setOriginIata("LHR");
     }
@@ -2031,6 +2362,7 @@ export function TravelMateShell({
                 travelers={travelers}
                 onChangeTravelers={setTravelers}
                 onSelectDestinationAndSearch={handleSelectDestinationAndGoToFlights}
+                onRegisterCreatedDestination={registerCreatedDestination}
                 initialUnavailableCity={ssrState?.initialUnavailableCity ?? null}
               />
             }

@@ -3,7 +3,7 @@ from decimal import Decimal
 import json
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 
 from app.core.database import AsyncSession, get_db
@@ -131,6 +131,7 @@ async def _dispatch_confirmation_email_post_commit(
 
 @router.get("/search", response_model=list[FlightOfferResponse])
 async def search_flights(
+    response: Response,
     origin_iata: str = Query(default="CDG", min_length=3, max_length=3),
     destination_iata: str | None = Query(
         default=None,
@@ -265,6 +266,17 @@ async def search_flights(
                 mode=offer.get("mode", registry.flights.mode),
             )
         )
+
+    if not results and registry.flights.mode == "simulated":
+        city_label_msg = resolved_dest.city_name if resolved_dest else effective_dest_iata
+        response.headers["X-Simulation-Covered"] = "false"
+        response.headers["X-Simulation-Message"] = (
+            f"Les vols restent simulés : la ville de {city_label_msg} ({effective_dest_iata}) "
+            "n'est pas couverte en simulation. Seules les 5 villes du seed (Paris, Tokyo, Rome, "
+            "New York, Marrakech) disposent de vols simulés."
+        )
+    else:
+        response.headers["X-Simulation-Covered"] = "true"
     return results
 
 

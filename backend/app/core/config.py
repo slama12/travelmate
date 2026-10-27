@@ -93,13 +93,23 @@ class Settings(BaseSettings):
     OPENROUTESERVICE_BASE_URL: str = Field(default="https://api.openrouteservice.org")
     GOOGLE_DIRECTIONS_API_KEY: str = Field(default="")
 
+    # --- Villes du monde (GeoNames searchJSON : featureClass=P, style=FULL, quotas gratuits) ---
+    GEONAMES_USERNAME: str = Field(default="slama12")
+    GEONAMES_BASE_URL: str = Field(default="http://api.geonames.org")
+    GEONAMES_HOURLY_QUOTA: int = Field(default=1000, ge=1)
+    GEONAMES_DAILY_QUOTA: int = Field(default=20000, ge=1)
+    GEONAMES_USER_HOURLY_QUOTA: int = Field(default=60, ge=1)
+
     # --- Fenêtre de visite du séjour (tampons configurables après arrivée et avant départ) ---
     TRIP_ARRIVAL_BUFFER_HOURS: float = Field(default=2.0, ge=0.0)
     TRIP_DEPARTURE_BUFFER_HOURS: float = Field(default=3.0, ge=0.0)
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        origins = [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        if "http://frontend:5173" not in origins:
+            origins.append("http://frontend:5173")
+        return origins
 
 
 @lru_cache

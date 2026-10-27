@@ -14,12 +14,16 @@ WIDTHS = (390, 768, 1024, 1280, 1440)
 ARTIFACT_DIR = Path(
     os.getenv(
         "ARTIFACT_DIR",
-        r"C:\Users\mohamed.slama\.gemini\antigravity\brain\5cabc6ba-ac77-4aa2-b151-2378a164db64",
+        r"C:\Users\mohamed.slama\.gemini\antigravity\brain\5cabc6ba-ac77-4aa2-b151-2378a164db64"
+        if os.name == "nt"
+        else "/tmp/travelmate_artifacts",
     )
 )
 CHROME_EXE = os.getenv(
     "PLAYWRIGHT_CHROME_PATH",
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if os.name == "nt"
+    else "/usr/bin/chromium",
 )
 BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
 API_URL = os.getenv("VITE_API_BASE_URL", "http://localhost:8000")
@@ -32,7 +36,41 @@ def _boxes_overlap(a: dict[str, Any], b: dict[str, Any], tolerance_px: float = 1
 
 
 def _ensure_wsl_bridge() -> subprocess.Popen[Any] | None:
-    """Démarre le pont TCP localhost -> WSL2 si nécessaire sous Windows."""
+    """
+    Sous Docker (Linux), redirige 127.0.0.1:5173 vers frontend:5173 pour que Chromium
+    accède au frontend et au backend sur la même origine localhost.
+    """
+    if os.name != "nt":
+        forwarder_code = (
+            "import asyncio\n"
+            "async def pipe(r, w):\n"
+            "    try:\n"
+            "        while d := await r.read(65536):\n"
+            "            w.write(d); await w.drain()\n"
+            "    except Exception: pass\n"
+            "    finally:\n"
+            "        try: w.close()\n"
+            "        except Exception: pass\n"
+            "async def handle(cr, cw):\n"
+            "    try:\n"
+            "        sr, sw = await asyncio.open_connection('frontend', 5173)\n"
+            "        await asyncio.gather(pipe(cr, sw), pipe(sr, cw))\n"
+            "    except Exception:\n"
+            "        try: cw.close()\n"
+            "        except Exception: pass\n"
+            "async def main():\n"
+            "    srv = await asyncio.start_server(handle, '127.0.0.1', 5173)\n"
+            "    async with srv: await srv.serve_forever()\n"
+            "asyncio.run(main())\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", forwarder_code],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.5)
+        return proc
+
     bridge_script = ARTIFACT_DIR / "scratch" / "wsl_port_bridge.py"
     if not bridge_script.exists():
         return None
@@ -1078,10 +1116,187 @@ def test_hands_free_voice_fake_speech_recognition_playwright():
             bridge_proc.terminate()
 
 
+def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> None:
+    """
+    Vérifie dans Chromium (Docker) l'étape 1 des villes du monde :
+    1. Le champ "Où allez-vous ?" de l'accueil utilise la recherche GeoNames après 300 ms et >= 3 lettres.
+    2. Les 5 villes du seed restent proposées en destinations populaires.
+    3. Une ville hors seed (ex: Lisbonne, geonameId=2267057, Europe/Lisbon) est créable sans doublon.
+    4. Vols et hébergements restent simulés avec un message clair indiquant que la ville n'est pas couverte.
+    5. La galerie de lieux affiche "Les lieux de cette ville arrivent bientôt" (aucune donnée inventée).
+    6. Si GeoNames est injoignable / quota atteint / clé absente : message "Recherche de villes indisponible" et repli sur les 5 villes.
+    """
+    bridge_proc = _ensure_wsl_bridge()
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+
+            search_requests: list[str] = []
+            simulate_unavailable = {"active": False}
+
+            def handle_destinations_search(route: Any, request: Any) -> None:
+                url = request.url
+                search_requests.append(url)
+                if simulate_unavailable["active"]:
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(
+                            {
+                                "query": "madrid",
+                                "normalized_query": "madrid",
+                                "available": False,
+                                "fallback": True,
+                                "quota_exceeded": True,
+                                "reason": "hourly_quota_exceeded",
+                                "message": "Recherche de villes indisponible : quota horaire GeoNames atteint (1000 requêtes/heure).",
+                                "results": [],
+                                "fallback_cities": [],
+                            }
+                        ),
+                    )
+                    return
+
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "query": "lisbonne",
+                            "normalized_query": "lisbonne",
+                            "available": True,
+                            "fallback": False,
+                            "cached": False,
+                            "quota_exceeded": False,
+                            "message": None,
+                            "results": [
+                                {
+                                    "geonameId": 2267057,
+                                    "geoname_id": 2267057,
+                                    "nom": "Lisbonne",
+                                    "name": "Lisbonne",
+                                    "city_name": "Lisbonne",
+                                    "pays": "Portugal",
+                                    "country_name": "Portugal",
+                                    "code_pays": "PT",
+                                    "country_code_iso2": "PT",
+                                    "coordonnees": {"latitude": 38.71667, "longitude": -9.13333},
+                                    "fuseau_horaire": "Europe/Lisbon",
+                                    "timezone": "Europe/Lisbon",
+                                    "population": 517802,
+                                    "iata_code": "LIS",
+                                    "is_seed": False,
+                                }
+                            ],
+                            "fallback_cities": [],
+                        }
+                    ),
+                )
+
+            page.route("**/api/v1/destinations/search*", handle_destinations_search)
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="home-destination-input"]', timeout=15000)
+
+            # Authentification pour permettre la création du séjour sur la ville hors seed
+            page.evaluate(
+                """async (apiUrl) => {
+                  const email = "playwright.geonames." + Date.now() + "@travelmate.app";
+                  const regResp = await fetch(apiUrl + "/api/v1/auth/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      full_name: "Voyageur Monde",
+                      password: "PasswordStep4!2026",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  localStorage.setItem("travelmate_jwt_token", regData.access_token);
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+                }""",
+                API_URL,
+            )
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
+
+            # 1. Vérifie que les 5 villes du seed sont proposées en destinations populaires
+            popular_cards = page.locator('[data-testid="popular-destinations-grid"] > div').count()
+            assert popular_cards == 5, f"Attendu 5 villes populaires du seed, obtenu {popular_cards}"
+
+            # 2. Moins de 3 lettres ('li') -> pas d'appel GeoNames
+            dest_input = page.locator('[data-testid="home-destination-input"]')
+            dest_input.fill("li")
+            page.wait_for_timeout(400)
+            assert len(search_requests) == 0
+
+            # 3. Saisie >= 3 lettres ('lisbonne') -> appel après l'anti-rebond de 300 ms
+            dest_input.fill("lisbonne")
+            page.wait_for_selector('[data-testid="autocomplete-city-lisbonne"]', timeout=10000)
+            assert len(search_requests) >= 1
+            option_text = page.locator('[data-testid="autocomplete-city-lisbonne"]').inner_text()
+            assert "Lisbonne" in option_text
+            assert "Portugal" in option_text
+            assert "Europe/Lisbon" in option_text
+
+            # 4. Sélection de Lisbonne et validation -> création de la destination et navigation vers /flights
+            page.locator('[data-testid="autocomplete-city-lisbonne"]').click()
+            page.locator('[data-testid="home-search-btn"]').click()
+
+            # 5. Sur /flights : message clair indiquant que Lisbonne n'est pas couverte par les vols simulés
+            page.wait_for_selector('[data-testid="flights-empty-state"]', timeout=15000)
+            flights_empty_text = page.locator('[data-testid="flights-empty-state"]').inner_text()
+            assert "Lisbonne" in flights_empty_text
+            assert "simul" in flights_empty_text.lower()
+
+            # 6. Navigation vers /accommodations : message clair pour les hébergements simulés
+            page.locator('[data-testid="flights-continue-accommodations-btn"]').click()
+            page.wait_for_selector('[data-testid="accommodations-empty-state"]', timeout=15000)
+            acc_empty_text = page.locator('[data-testid="accommodations-empty-state"]').inner_text()
+            assert "Lisbonne" in acc_empty_text
+            assert "simul" in acc_empty_text.lower()
+
+            # 7. Navigation vers /activities : "Les lieux de cette ville arrivent bientôt" (aucun lieu inventé)
+            page.locator('[data-testid="accommodations-continue-activities-btn"]').click()
+            page.wait_for_selector('[data-testid="places-coming-soon-card"]', timeout=15000)
+            coming_soon_title = page.locator('[data-testid="places-coming-soon-title"]').inner_text().strip()
+            assert coming_soon_title == "Les lieux de cette ville arrivent bientôt"
+            assert page.locator('[data-testid^="activity-card-"]').count() == 0
+
+            # 8. Retour à l'accueil : les 5 villes du seed restent seules dans les destinations populaires,
+            #    et si GeoNames est indisponible / quota atteint, message "Recherche de villes indisponible" + repli
+            simulate_unavailable["active"] = True
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
+            assert page.locator('[data-testid="popular-destinations-grid"] > div').count() == 5
+
+            page.locator('[data-testid="home-destination-input"]').fill("madrid")
+            page.wait_for_selector('[data-testid="geonames-unavailable-banner"]', timeout=10000)
+            banner_text = page.locator('[data-testid="geonames-unavailable-banner"]').inner_text()
+            assert "Recherche de villes indisponible" in banner_text
+            assert page.locator('[data-testid^="geonames-fallback-dest-"]').count() == 5
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
 if __name__ == "__main__":
     result = test_mon_programme_layout_5_widths_playwright()
     test_real_chat_marrakech_jardin_secret_medina_and_single_row_header()
     test_hands_free_voice_fake_speech_recognition_playwright()
+    test_world_cities_step1_geonames_search_create_and_fallback_playwright()
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

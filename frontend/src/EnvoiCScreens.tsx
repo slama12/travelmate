@@ -1504,24 +1504,46 @@ export function AccommodationsScreen({
               ))}
             </div>
           ) : accommodations.length === 0 ? (
-            <Card className="p-8 text-center space-y-3">
+            <Card
+              className="p-8 text-center space-y-3"
+              data-testid="accommodations-empty-state"
+            >
               <Building2 className="h-8 w-8 text-brand-700 mx-auto" />
               <h2 className="text-h2 text-ink">
-                Aucun hébergement pour ces critères
+                {destination &&
+                !["paris", "marrakech", "tokyo", "new york", "rome"].includes(
+                  destination.city_name.trim().toLowerCase()
+                )
+                  ? `Hébergements simulés : ${destination.city_name} n'est pas couverte en simulation`
+                  : "Aucun hébergement pour ces critères"}
               </h2>
-              <p className="text-body text-ink-secondary max-w-md mx-auto">
-                Essayez d'élargir votre budget ou d'afficher à la fois les hôtels et les logements Airbnb.
+              <p className="text-body text-ink-secondary max-w-lg mx-auto">
+                {destination &&
+                !["paris", "marrakech", "tokyo", "new york", "rome"].includes(
+                  destination.city_name.trim().toLowerCase()
+                )
+                  ? `Les hébergements restent simulés pour l'instant et la ville de ${destination.city_name} n'est pas couverte en simulation (seules Paris, Marrakech, Tokyo, New York et Rome disposent d'hébergements simulés).`
+                  : "Essayez d'élargir votre budget ou d'afficher à la fois les hôtels et les logements Airbnb."}
               </p>
-              <Button
-                type="button"
-                variant="secondary"
-                onClick={() => {
-                  setAccTypeFilter("ALL");
-                  setMaxBudget("2000");
-                }}
-              >
-                Afficher tous les hébergements
-              </Button>
+              <div className="flex flex-wrap items-center justify-center gap-3 pt-1">
+                <Button
+                  type="button"
+                  data-testid="accommodations-continue-activities-btn"
+                  onClick={() => navigate("/activities")}
+                >
+                  Voir la galerie de lieux
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  onClick={() => {
+                    setAccTypeFilter("ALL");
+                    setMaxBudget("2000");
+                  }}
+                >
+                  Afficher tous les hébergements
+                </Button>
+              </div>
             </Card>
           ) : (
             accommodations.map((acc, idx) => {
@@ -2034,7 +2056,7 @@ export function ActivitiesScreen({
         ))}
       </div>
 
-      {/* Grille de grandes photos */}
+      {/* Grille de grandes photos ou message 'Les lieux de cette ville arrivent bientôt' */}
       {!gallery ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
           {[1, 2, 3, 4, 5, 6].map((n) => (
@@ -2048,6 +2070,19 @@ export function ActivitiesScreen({
             </Card>
           ))}
         </div>
+      ) : (gallery.places || []).length === 0 ? (
+        <Card
+          className="p-8 text-center space-y-3"
+          data-testid="places-coming-soon-card"
+        >
+          <Compass className="h-8 w-8 text-brand-700 mx-auto" />
+          <h2 className="text-h2 text-ink" data-testid="places-coming-soon-title">
+            Les lieux de cette ville arrivent bientôt
+          </h2>
+          <p className="text-body text-ink-secondary max-w-lg mx-auto">
+            La destination {cityLabel} a bien été créée. Aucune donnée de lieu n'est inventée : le catalogue de lieux réels sera enrichi à l'étape suivante.
+          </p>
+        </Card>
       ) : (
         <div
           className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6"

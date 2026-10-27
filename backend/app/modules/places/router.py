@@ -228,6 +228,30 @@ async def get_trip_places_gallery(
     city_name = dest.city_name if dest else "Destination"
     registry = get_provider_registry()
 
+    seed_cities_lower = {"tokyo", "rome", "new york", "marrakech", "paris"}
+    existing_dest_places: list[Place] = []
+    if dest:
+        existing_dest_places = list(
+            (await db.scalars(select(Place).where(Place.destination_id == dest.id))).all()
+        )
+
+    is_non_seed_without_places = (
+        city_name.strip().lower() not in seed_cities_lower
+        and not existing_dest_places
+        and registry.places.mode == "simulated"
+    )
+    if is_non_seed_without_places:
+        return TripGalleryResponse(
+            trip_id=trip.id,
+            city_name=city_name,
+            unlocked=True,
+            unlock_message="Les lieux de cette ville arrivent bientôt",
+            provider_mode=registry.places.mode,
+            cached_in_redis=False,
+            selected_place_ids=[],
+            places=[],
+        )
+
     bookings = list(
         (
             await db.scalars(
@@ -266,16 +290,17 @@ async def get_trip_places_gallery(
             category=category,
             db=db,
         )
-    except CityNotSimulatedError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "code": "CITY_NOT_AVAILABLE_IN_SIMULATION",
-                "city_name": city_name,
-                "provider_mode": "simulated",
-                "message": str(exc),
-            },
-        ) from exc
+    except CityNotSimulatedError:
+        return TripGalleryResponse(
+            trip_id=trip.id,
+            city_name=city_name,
+            unlocked=True,
+            unlock_message="Les lieux de cette ville arrivent bientôt",
+            provider_mode=registry.places.mode,
+            cached_in_redis=False,
+            selected_place_ids=[],
+            places=[],
+        )
 
     return TripGalleryResponse(
         trip_id=trip.id,

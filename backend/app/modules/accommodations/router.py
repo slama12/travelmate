@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 
 from app.core.database import AsyncSession, get_db
@@ -79,6 +79,7 @@ def _compute_nearby_restaurants(
 
 @router.get("/search", response_model=list[AccommodationSearchResponse])
 async def search_accommodations_by_zone(
+    response: Response,
     lat: float | None = Query(
         default=None,
         ge=-90.0,
@@ -128,6 +129,7 @@ async def search_accommodations_by_zone(
 
     effective_lat: float | None = None
     effective_lng: float | None = None
+    resolved_dest: Destination | None = None
 
     if lat is not None and lng is not None and trip_id is None and destination_id is None:
         effective_lat, effective_lng = lat, lng
@@ -144,6 +146,7 @@ async def search_accommodations_by_zone(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Destination du séjour introuvable.",
             )
+        resolved_dest = dest
         effective_lat, effective_lng = (
             (lat, lng) if (lat is not None and lng is not None) else (dest.latitude, dest.longitude)
         )
@@ -154,6 +157,7 @@ async def search_accommodations_by_zone(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Destination introuvable.",
             )
+        resolved_dest = dest
         effective_lat, effective_lng = (
             (lat, lng) if (lat is not None and lng is not None) else (dest.latitude, dest.longitude)
         )
@@ -173,6 +177,7 @@ async def search_accommodations_by_zone(
                 select(Destination).where(Destination.id == active_trip.destination_id)
             )
             if dest is not None:
+                resolved_dest = dest
                 effective_lat, effective_lng = dest.latitude, dest.longitude
 
         if effective_lat is None or effective_lng is None:
@@ -293,6 +298,16 @@ async def search_accommodations_by_zone(
             )
 
     results.sort(key=lambda r: (r.distance_from_center_km, float(r.price_per_night)))
+    if not results and provider_mode == "simulated":
+        city_label_msg = resolved_dest.city_name if resolved_dest else "cette ville"
+        response.headers["X-Simulation-Covered"] = "false"
+        response.headers["X-Simulation-Message"] = (
+            f"Les hébergements restent simulés : la ville de {city_label_msg} "
+            "n'est pas couverte en simulation. Seules les 5 villes du seed (Paris, Tokyo, Rome, "
+            "New York, Marrakech) disposent d'hébergements simulés."
+        )
+    else:
+        response.headers["X-Simulation-Covered"] = "true"
     return results
 
 

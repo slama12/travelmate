@@ -209,15 +209,9 @@ class SimulatedFlightsProvider(BaseFlightsProvider):
             raise ValueError("La date de retour doit être strictement postérieure à la date de départ.")
 
         dest_key = destination_iata.upper()
-        meta = REALISTIC_FLIGHTS_CATALOG.get(
-            dest_key,
-            {
-                "city": dest_key,
-                "airlines": [("AF", "Air France"), ("BA", "British Airways")],
-                "base_price_eur": Decimal("320.00"),
-                "duration_hours": 4,
-            },
-        )
+        meta = REALISTIC_FLIGHTS_CATALOG.get(dest_key)
+        if meta is None:
+            return []
         multiplier = {
             "ECONOMIC": Decimal("0.78"),
             "STANDARD": Decimal("1.00"),

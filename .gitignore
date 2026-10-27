@@ -9,9 +9,11 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Node / Frontend dependencies
+# Node / Frontend dependencies & build artifacts
 node_modules/
 frontend/node_modules/
+dist/
+frontend/dist/
 
 # Environment variables & secrets
 .env

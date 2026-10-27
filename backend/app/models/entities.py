@@ -74,6 +74,7 @@ class Destination(Base):
     __tablename__ = "destinations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    geoname_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True, nullable=True)
     city_name: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
     country_name: Mapped[str] = mapped_column(String(120), nullable=False)
     country_code_iso2: Mapped[str] = mapped_column(String(2), nullable=False)
@@ -81,6 +82,7 @@ class Destination(Base):
     timezone: Mapped[str] = mapped_column(String(64), nullable=False)
     latitude: Mapped[float] = mapped_column(Float, nullable=False)
     longitude: Mapped[float] = mapped_column(Float, nullable=False)
+    population: Mapped[int | None] = mapped_column(Integer, nullable=True)
     hero_image_url: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     practical_info: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
