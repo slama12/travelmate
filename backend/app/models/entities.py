@@ -259,7 +259,10 @@ class AccommodationBooking(Base):
 
 class Place(Base):
     __tablename__ = "places"
-    __table_args__ = (Index("ix_places_geo", "latitude", "longitude"),)
+    __table_args__ = (
+        Index("ix_places_geo", "latitude", "longitude"),
+        Index("ix_places_dest_source_ext", "destination_id", "source_provider", "external_place_id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
     destination_id: Mapped[str] = mapped_column(
@@ -279,6 +282,19 @@ class Place(Base):
     hero_photos: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     source_provider: Mapped[str] = mapped_column(String(50), default="simulated", nullable=False)
     external_place_id: Mapped[str | None] = mapped_column(String(120), index=True, nullable=True)
+    address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    website_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    price_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    hours_status: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    source_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    source_attribution: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    notoriety_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    photo_file_title: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    photo_author: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    photo_license: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    photo_commons_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    photo_source: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    photo_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     destination: Mapped["Destination"] = relationship("Destination", back_populates="places")
     itinerary_items: Mapped[list["ItineraryItem"]] = relationship(

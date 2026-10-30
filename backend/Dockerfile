@@ -12,9 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir --default-timeout=120 --retries 5 -r requirements.lock
 
 COPY . .
 

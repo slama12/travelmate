@@ -1,0 +1,15 @@
+OurAirports Data License — Public Domain Dedication (CC0 1.0 Universal / Unlicense)
+===================================================================================
+
+Source: https://ourairports.com/data/
+Maintainer: David Megginson and the OurAirports contributors
+
+All data is released to the Public Domain (CC0 1.0 Universal / Unlicense).
+You are free to copy, modify, publish, use, compile, sell, or distribute
+the OurAirports dataset, either in source data form or as a compiled database,
+for any purpose, commercial or non-commercial, and by any means, with no
+warranty and no attribution required.
+
+Included locally in TravelMate at:
+  backend/data/ourairports_iata.csv
+  backend/data/OURAIRPORTS_LICENSE.txt

@@ -11,6 +11,13 @@ from app.core.seed import seed_initial_data
 from app.main import app
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "integration: test d'intégration contre les vraies API externes (non bloquant).",
+    )
+
+
 @pytest.fixture(autouse=True)
 def default_simulated_ai_provider_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     """

@@ -1,0 +1,210 @@
+ident,type,name,latitude_deg,longitude_deg,iso_country,municipality,scheduled_service,iata_code
+DTMB,large_airport,Aéroport international de Monastir Habib-Bourguiba,35.7581,10.7547,TN,Monastir,yes,MIR
+DTTA,large_airport,Aéroport international de Tunis-Carthage,36.8510,10.2272,TN,Tunis,yes,TUN
+DTNH,medium_airport,Aéroport international d'Enfidha-Hammamet,36.0758,10.4386,TN,Enfidha,yes,NBE
+DTTJ,large_airport,Aéroport international de Djerba-Zarzis,33.8750,10.7755,TN,Djerba,yes,DJE
+DTTX,medium_airport,Aéroport international de Sfax-Thyna,34.7180,10.6910,TN,Sfax,yes,SFA
+DTTZ,medium_airport,Aéroport international de Tozeur-Nefta,33.9397,8.1106,TN,Tozeur,yes,TOE
+DTTF,medium_airport,Aéroport international de Gafsa-Ksar,34.4220,8.8225,TN,Gafsa,yes,GAF
+DTKA,medium_airport,Aéroport international de Tabarka-Aïn Draham,36.9800,8.8769,TN,Tabarka,yes,TBJ
+LFPG,large_airport,Aéroport de Paris-Charles de Gaulle,49.0097,2.5479,FR,Paris,yes,CDG
+LFPO,medium_airport,Aéroport de Paris-Orly,48.7233,2.3794,FR,Paris,yes,ORY
+LFMN,large_airport,Aéroport de Nice-Côte d'Azur,43.6584,7.2159,FR,Nice,yes,NCE
+LFLL,large_airport,Aéroport de Lyon-Saint-Exupéry,45.7256,5.0811,FR,Lyon,yes,LYS
+LFML,large_airport,Aéroport de Marseille-Provence,43.4393,5.2214,FR,Marseille,yes,MRS
+LFBO,large_airport,Aéroport de Toulouse-Blagnac,43.6293,1.3638,FR,Toulouse,yes,TLS
+LFBD,large_airport,Aéroport de Bordeaux-Mérignac,44.8283,-0.7156,FR,Bordeaux,yes,BOD
+LFRS,large_airport,Aéroport de Nantes-Atlantique,47.1532,-1.6107,FR,Nantes,yes,NTE
+LFQQ,medium_airport,Aéroport de Lille-Lesquin,50.5633,3.0869,FR,Lille,yes,LIL
+LFST,medium_airport,Aéroport de Strasbourg-Entzheim,48.5383,7.6282,FR,Strasbourg,yes,SXB
+LFMT,medium_airport,Aéroport de Montpellier-Méditerranée,43.5762,3.9630,FR,Montpellier,yes,MPL
+LFKJ,medium_airport,Aéroport d'Ajaccio-Napoléon-Bonaparte,41.9236,8.8029,FR,Ajaccio,yes,AJA
+LFKB,medium_airport,Aéroport de Bastia-Poretta,42.5527,9.4837,FR,Bastia,yes,BIA
+LFKF,medium_airport,Aéroport de Figari-Sud-Corse,41.5006,9.0978,FR,Figari,yes,FSC
+LFBZ,medium_airport,Aéroport de Biarritz-Pays Basque,43.4684,-1.5233,FR,Biarritz,yes,BIQ
+LFRN,medium_airport,Aéroport de Rennes-Bretagne,48.0695,-1.7348,FR,Rennes,yes,RNS
+LFRB,medium_airport,Aéroport de Brest-Bretagne,48.4479,-4.4185,FR,Brest,yes,BES
+LFTH,medium_airport,Aéroport de Toulon-Hyères,43.0973,6.1460,FR,Toulon,yes,TLN
+GMMX,large_airport,Aéroport de Marrakech-Ménara,31.6069,-8.0363,MA,Marrakech,yes,RAK
+GMMN,large_airport,Aéroport Mohammed-V de Casablanca,33.3675,-7.5899,MA,Casablanca,yes,CMN
+GMME,medium_airport,Aéroport de Rabat-Salé,34.0515,-6.7515,MA,Rabat,yes,RBA
+GMFF,medium_airport,Aéroport de Fès-Saïss,33.9273,-4.9780,MA,Fès,yes,FEZ
+GMTT,medium_airport,Aéroport de Tanger-Ibn Battouta,35.7269,-5.9169,MA,Tanger,yes,TNG
+GMAD,medium_airport,Aéroport d'Agadir-Al Massira,30.3250,-9.4131,MA,Agadir,yes,AGA
+GMFO,medium_airport,Aéroport d'Oujda-Angads,34.7872,-1.9240,MA,Oujda,yes,OUD
+GMMI,medium_airport,Aéroport d'Essaouira-Mogador,31.3975,-9.6817,MA,Essaouira,yes,ESU
+GMMZ,medium_airport,Aéroport de Ouarzazate,30.9391,-6.9094,MA,Ouarzazate,yes,OZZ
+DAAG,large_airport,Aéroport d'Alger-Houari-Boumédiène,36.6910,3.2154,DZ,Alger,yes,ALG
+DAOO,medium_airport,Aéroport d'Oran-Ahmed Ben Bella,35.6239,-0.6212,DZ,Oran,yes,ORN
+HECA,large_airport,Aéroport international du Caire,30.1219,31.4056,EG,Le Caire,yes,CAI
+HEGN,medium_airport,Aéroport international d'Hurghada,27.1783,33.7994,EG,Hurghada,yes,HRG
+HELX,medium_airport,Aéroport international de Louxor,25.6710,32.7066,EG,Louxor,yes,LXR
+HESH,medium_airport,Aéroport international de Charm el-Cheikh,27.9773,34.3950,EG,Charm el-Cheikh,yes,SSH
+HEBA,medium_airport,Aéroport international de Borg El Arab,30.9177,29.6964,EG,Alexandrie,yes,HBE
+HESN,medium_airport,Aéroport international d'Assouan,23.9644,32.8200,EG,Assouan,yes,ASW
+GOBD,large_airport,Aéroport international Blaise-Diagne,14.6700,-17.0733,SN,Dakar,yes,DSS
+DIAP,large_airport,Aéroport international Félix-Houphouët-Boigny,5.2614,-3.9263,CI,Abidjan,yes,ABJ
+FACT,large_airport,Aéroport international du Cap,-33.9648,18.6017,ZA,Le Cap,yes,CPT
+FAOR,large_airport,Aéroport international O.R. Tambo,-26.1392,28.2460,ZA,Johannesbourg,yes,JNB
+HKJK,large_airport,Aéroport international Jomo-Kenyatta,-1.3192,36.9278,KE,Nairobi,yes,NBO
+FIMP,large_airport,Aéroport international Sir Seewoosagur Ramgoolam,-20.4302,57.6836,MU,Port-Louis,yes,MRU
+LIRF,large_airport,Aéroport de Rome-Fiumicino,41.8003,12.2389,IT,Rome,yes,FCO
+LIRA,medium_airport,Aéroport de Rome-Ciampino,41.7994,12.5949,IT,Rome,yes,CIA
+LIRQ,large_airport,Aéroport de Florence-Peretola,43.8100,11.2051,IT,Florence,yes,FLR
+LIRP,large_airport,Aéroport international de Pise,43.6839,10.3927,IT,Pise,yes,PSA
+LIMC,large_airport,Aéroport de Milan-Malpensa,45.6306,8.7281,IT,Milan,yes,MXP
+LIML,medium_airport,Aéroport de Milan-Linate,45.4451,9.2767,IT,Milan,yes,LIN
+LIME,medium_airport,Aéroport de Bergame-Orio al Serio,45.6739,9.7042,IT,Bergame,yes,BGY
+LIPZ,large_airport,Aéroport de Venise-Marco-Polo,45.5053,12.3519,IT,Venise,yes,VCE
+LIRN,large_airport,Aéroport de Naples-Capodichino,40.8860,14.2908,IT,Naples,yes,NAP
+LIPE,large_airport,Aéroport de Bologne-Borgo Panigale,44.5354,11.2887,IT,Bologne,yes,BLQ
+LIMF,medium_airport,Aéroport de Turin-Caselle,45.2008,7.6496,IT,Turin,yes,TRN
+LICC,large_airport,Aéroport de Catane-Fontanarossa,37.4668,15.0664,IT,Catane,yes,CTA
+LICJ,large_airport,Aéroport de Palerme-Punta Raisi,38.1760,13.0910,IT,Palerme,yes,PMO
+LIEE,medium_airport,Aéroport de Cagliari-Elmas,39.2515,9.0543,IT,Cagliari,yes,CAG
+LIEO,medium_airport,Aéroport d'Olbia-Costa Smeralda,40.8987,9.5176,IT,Olbia,yes,OLB
+LIBD,medium_airport,Aéroport de Bari-Karol Wojtyła,41.1389,16.7606,IT,Bari,yes,BRI
+LIPX,medium_airport,Aéroport de Vérone-Villafranca,45.3957,10.8885,IT,Vérone,yes,VRN
+LIMJ,medium_airport,Aéroport de Gênes-Christophe-Colomb,44.4133,8.8375,IT,Gênes,yes,GOA
+LPPT,large_airport,Aéroport Humberto-Delgado de Lisbonne,38.7813,-9.1359,PT,Lisbonne,yes,LIS
+LPPR,large_airport,Aéroport Francisco Sá-Carneiro de Porto,41.2481,-8.6814,PT,Porto,yes,OPO
+LPFR,large_airport,Aéroport de Faro,37.0144,-7.9659,PT,Faro,yes,FAO
+LPMA,medium_airport,Aéroport de Madère Cristiano-Ronaldo,32.6979,-16.7745,PT,Funchal,yes,FNC
+LPPD,medium_airport,Aéroport João Paulo II de Ponta Delgada,37.7412,-25.6979,PT,Ponta Delgada,yes,PDL
+LEMD,large_airport,Aéroport Adolfo-Suárez de Madrid-Barajas,40.4719,-3.5626,ES,Madrid,yes,MAD
+LEBL,large_airport,Aéroport Josep Tarradellas Barcelone-El Prat,41.2971,2.0785,ES,Barcelone,yes,BCN
+LEMG,large_airport,Aéroport de Malaga-Costa del Sol,36.6749,-4.4991,ES,Malaga,yes,AGP
+LEPA,large_airport,Aéroport de Palma de Majorque,39.5517,2.7388,ES,Palma,yes,PMI
+LEZL,large_airport,Aéroport de Séville,37.4180,-5.8931,ES,Séville,yes,SVQ
+LEGR,medium_airport,Aéroport Federico García Lorca de Grenade-Jaén,37.1887,-3.7774,ES,Grenade,yes,GRX
+LEJR,medium_airport,Aéroport de Jerez,36.7446,-6.0601,ES,Jerez de la Frontera,yes,XRY
+LEVC,medium_airport,Aéroport de Valence,39.4893,-0.4816,ES,Valence,yes,VLC
+LEBB,medium_airport,Aéroport de Bilbao,43.3011,-2.9106,ES,Bilbao,yes,BIO
+LEAL,medium_airport,Aéroport d'Alicante-Elche,38.2822,-0.5582,ES,Alicante,yes,ALC
+LEIB,medium_airport,Aéroport d'Ibiza,38.8729,1.3731,ES,Ibiza,yes,IBZ
+GCTS,medium_airport,Aéroport de Tenerife-Sud,28.0445,-16.5725,ES,Tenerife,yes,TFS
+GCLP,medium_airport,Aéroport de Gran Canaria,27.9319,-15.3866,ES,Las Palmas,yes,LPA
+EGLL,large_airport,Aéroport de Londres-Heathrow,51.4700,-0.4543,GB,Londres,yes,LHR
+EGKK,medium_airport,Aéroport de Londres-Gatwick,51.1537,-0.1821,GB,Londres,yes,LGW
+EGCC,large_airport,Aéroport de Manchester,53.3537,-2.2750,GB,Manchester,yes,MAN
+EGPH,large_airport,Aéroport d'Édimbourg,55.9500,-3.3725,GB,Édimbourg,yes,EDI
+EGBB,medium_airport,Aéroport de Birmingham,52.4539,-1.7480,GB,Birmingham,yes,BHX
+EIDW,large_airport,Aéroport de Dublin,53.4213,-6.2701,IE,Dublin,yes,DUB
+EHAM,large_airport,Aéroport d'Amsterdam-Schiphol,52.3086,4.7639,NL,Amsterdam,yes,AMS
+EBBR,large_airport,Aéroport de Bruxelles-National,50.9014,4.4844,BE,Bruxelles,yes,BRU
+LSZH,large_airport,Aéroport international de Zurich,47.4582,8.5555,CH,Zürich,yes,ZRH
+LSGG,large_airport,Aéroport international de Genève,46.2381,6.1089,CH,Genève,yes,GVA
+LFSB,medium_airport,Aéroport de Bâle-Mulhouse,47.5900,7.5299,CH,Bâle,yes,BSL
+EDDF,large_airport,Aéroport de Francfort-sur-le-Main,50.0379,8.5622,DE,Francfort,yes,FRA
+EDDM,large_airport,Aéroport Franz-Josef-Strauß de Munich,48.3538,11.7861,DE,Munich,yes,MUC
+EDDB,large_airport,Aéroport Willy-Brandt de Berlin-Brandebourg,52.3667,13.5033,DE,Berlin,yes,BER
+EDDH,medium_airport,Aéroport de Hambourg,53.6304,9.9882,DE,Hambourg,yes,HAM
+EDDL,medium_airport,Aéroport international de Düsseldorf,51.2895,6.7668,DE,Düsseldorf,yes,DUS
+LOWW,large_airport,Aéroport de Vienne-Schwechat,48.1103,16.5697,AT,Vienne,yes,VIE
+LOWS,medium_airport,Aéroport de Salzbourg-W.-A.-Mozart,47.7933,13.0043,AT,Salzbourg,yes,SZG
+LOWI,medium_airport,Aéroport d'Innsbruck,47.2602,11.3440,AT,Innsbruck,yes,INN
+LKPR,large_airport,Aéroport Václav-Havel de Prague,50.1008,14.2600,CZ,Prague,yes,PRG
+EPWA,large_airport,Aéroport Frédéric-Chopin de Varsovie,52.1657,20.9671,PL,Varsovie,yes,WAW
+EPKK,medium_airport,Aéroport Jean-Paul II de Cracovie,50.0777,19.7848,PL,Cracovie,yes,KRK
+LHBP,large_airport,Aéroport international Ferenc-Liszt de Budapest,47.4369,19.2556,HU,Budapest,yes,BUD
+LROP,large_airport,Aéroport international Henri-Coandă de Bucarest,44.5711,26.0850,RO,Bucarest,yes,OTP
+LGAV,large_airport,Aéroport international d'Athènes Elefthérios-Venizélos,37.9364,23.9445,GR,Athènes,yes,ATH
+LGTS,medium_airport,Aéroport de Thessalonique-Makedonía,40.5197,22.9709,GR,Thessalonique,yes,SKG
+LGIR,large_airport,Aéroport international d'Héraklion Níkos-Kazantzákis,35.3397,25.1803,GR,Héraklion,yes,HER
+LGSA,medium_airport,Aéroport international de La Canée,35.5317,24.1497,GR,La Canée,yes,CHQ
+LGSR,medium_airport,Aéroport national de Santorin,36.3992,25.4793,GR,Santorin,yes,JTR
+LGMK,medium_airport,Aéroport de Mykonos,37.4351,25.3481,GR,Mykonos,yes,JMK
+LGRP,medium_airport,Aéroport de Rhodes-Diagoras,36.4054,28.0862,GR,Rhodes,yes,RHO
+LGKR,medium_airport,Aéroport de Corfou-Ioánnis-Kapodístrias,39.6019,19.9117,GR,Corfou,yes,CFU
+LTFM,large_airport,Aéroport d'Istanbul,41.2753,28.7519,TR,Istanbul,yes,IST
+LTFJ,medium_airport,Aéroport international Sabiha-Gökçen,40.8986,29.3092,TR,Istanbul,yes,SAW
+LTAI,large_airport,Aéroport d'Antalya,36.8987,30.8005,TR,Antalya,yes,AYT
+LTBJ,medium_airport,Aéroport d'Izmir-Adnan Menderes,38.2924,27.1570,TR,Izmir,yes,ADB
+LTAC,medium_airport,Aéroport d'Ankara-Esenboğa,40.1281,32.9951,TR,Ankara,yes,ESB
+EKCH,large_airport,Aéroport de Copenhague,55.6180,12.6508,DK,Copenhague,yes,CPH
+ESSA,large_airport,Aéroport de Stockholm-Arlanda,59.6498,17.9238,SE,Stockholm,yes,ARN
+ESGG,medium_airport,Aéroport de Göteborg-Landvetter,57.6628,12.2798,SE,Göteborg,yes,GOT
+ENGM,large_airport,Aéroport d'Oslo-Gardermoen,60.1976,11.1004,NO,Oslo,yes,OSL
+ENBR,medium_airport,Aéroport de Bergen,60.2934,5.2181,NO,Bergen,yes,BGO
+ENTC,medium_airport,Aéroport de Tromsø,69.6833,18.9189,NO,Tromsø,yes,TOS
+EFHK,large_airport,Aéroport d'Helsinki-Vantaa,60.3172,24.9633,FI,Helsinki,yes,HEL
+EFRO,medium_airport,Aéroport de Rovaniemi,66.5648,25.8304,FI,Rovaniemi,yes,RVN
+BIKF,large_airport,Aéroport international de Keflavík,63.9850,-22.6056,IS,Reykjavik,yes,KEF
+LDZA,medium_airport,Aéroport Franjo-Tuđman de Zagreb,45.7429,16.0688,HR,Zagreb,yes,ZAG
+LDSP,medium_airport,Aéroport de Split,43.5389,16.2980,HR,Split,yes,SPU
+LDDU,medium_airport,Aéroport de Dubrovnik,42.5614,18.2682,HR,Dubrovnik,yes,DBV
+RJTT,large_airport,Aéroport international de Tokyo-Haneda,35.5494,139.7798,JP,Tokyo,yes,HND
+RJAA,medium_airport,Aéroport international de Narita,35.7647,140.3864,JP,Tokyo,yes,NRT
+RJBB,large_airport,Aéroport international du Kansai,34.4347,135.2440,JP,Osaka,yes,KIX
+RJOO,medium_airport,Aéroport international d'Osaka-Itami,34.7855,135.4380,JP,Osaka,yes,ITM
+RJGG,medium_airport,Aéroport international du Chūbu,34.8584,136.8050,JP,Nagoya,yes,NGO
+RJFF,medium_airport,Aéroport de Fukuoka,33.5859,130.4510,JP,Fukuoka,yes,FUK
+RJCC,medium_airport,Nouvel aéroport de Chitose,42.7752,141.6920,JP,Sapporo,yes,CTS
+RKSI,large_airport,Aéroport international d'Incheon,37.4602,126.4407,KR,Séoul,yes,ICN
+RKSS,medium_airport,Aéroport international de Gimpo,37.5583,126.7906,KR,Séoul,yes,GMP
+RKPK,medium_airport,Aéroport international de Gimhae,35.1795,128.9382,KR,Busan,yes,PUS
+RKPC,medium_airport,Aéroport international de Jeju,33.5113,126.4930,KR,Jeju,yes,CJU
+WADD,large_airport,Aéroport international Ngurah-Rai de Bali,-8.7482,115.1672,ID,Denpasar,yes,DPS
+WIII,large_airport,Aéroport international Soekarno-Hatta,-6.1256,106.6559,ID,Jakarta,yes,CGK
+WAHI,medium_airport,Aéroport international de Yogyakarta,-7.9000,110.0544,ID,Yogyakarta,yes,YIA
+WARR,medium_airport,Aéroport international Juanda,-7.3798,112.7870,ID,Surabaya,yes,SUB
+WADL,medium_airport,Aéroport international de Lombok,-8.7573,116.2767,ID,Mataram,yes,LOP
+WSSS,large_airport,Aéroport de Singapour-Changi,1.3502,103.9940,SG,Singapour,yes,SIN
+VTBS,large_airport,Aéroport de Bangkok-Suvarnabhumi,13.6811,100.7470,TH,Bangkok,yes,BKK
+VTSP,large_airport,Aéroport international de Phuket,8.1132,98.3169,TH,Phuket,yes,HKT
+VTCC,medium_airport,Aéroport international de Chiang Mai,18.7668,98.9626,TH,Chiang Mai,yes,CNX
+WMKK,large_airport,Aéroport international de Kuala Lumpur,2.7456,101.7099,MY,Kuala Lumpur,yes,KUL
+VVTS,large_airport,Aéroport international de Tân Sơn Nhất,10.8188,106.6520,VN,Hô Chi Minh-Ville,yes,SGN
+VVNB,large_airport,Aéroport international de Nội Bài,21.2212,105.8070,VN,Hanoï,yes,HAN
+RPLL,large_airport,Aéroport international Ninoy-Aquino,14.5086,121.0198,PH,Manille,yes,MNL
+VHHH,large_airport,Aéroport international de Hong Kong,22.3080,113.9185,HK,Hong Kong,yes,HKG
+RCTP,large_airport,Aéroport international de Taïwan-Taoyuan,25.0777,121.2330,TW,Taipei,yes,TPE
+ZBAA,large_airport,Aéroport international de Pékin-Capitale,40.0799,116.6031,CN,Pékin,yes,PEK
+ZSPD,large_airport,Aéroport international de Shanghai-Pudong,31.1443,121.8083,CN,Shanghai,yes,PVG
+VIDP,large_airport,Aéroport international Indira-Gandhi,28.5562,77.1000,IN,New Delhi,yes,DEL
+VABB,large_airport,Aéroport international Chhatrapati-Shivaji,19.0896,72.8656,IN,Mumbai,yes,BOM
+OMDB,large_airport,Aéroport international de Dubaï,25.2532,55.3657,AE,Dubaï,yes,DXB
+OMAA,large_airport,Aéroport international d'Abou Dabi,24.4330,54.6511,AE,Abou Dabi,yes,AUH
+OTHH,large_airport,Aéroport international Hamad,25.2731,51.6081,QA,Doha,yes,DOH
+OJAI,large_airport,Aéroport international Reine-Alia,31.7226,35.9932,JO,Amman,yes,AMM
+KJFK,large_airport,Aéroport international John-F.-Kennedy,40.6413,-73.7781,US,New York,yes,JFK
+KEWR,medium_airport,Aéroport international de Newark-Liberty,40.6895,-74.1745,US,Newark,yes,EWR
+KLGA,medium_airport,Aéroport de LaGuardia,40.7769,-73.8740,US,New York,yes,LGA
+KSGF,large_airport,Aéroport national de Springfield-Branson,37.2457,-93.3886,US,Springfield,yes,SGF
+KSPI,large_airport,Aéroport Abraham-Lincoln Capital de Springfield,39.8441,-89.6779,US,Springfield,yes,SPI
+KBDL,large_airport,Aéroport international Bradley (Hartford-Springfield),41.9389,-72.6832,US,Springfield,yes,BDL
+KDAY,medium_airport,Aéroport international de Dayton,39.9024,-84.2194,US,Dayton,yes,DAY
+KCMH,medium_airport,Aéroport international John-Glenn de Columbus,39.9980,-82.8919,US,Columbus,yes,CMH
+KEUG,medium_airport,Aéroport d'Eugene,44.1246,-123.2120,US,Eugene,yes,EUG
+KBOS,large_airport,Aéroport international Logan de Boston,42.3656,-71.0096,US,Boston,yes,BOS
+KIAD,large_airport,Aéroport international de Washington-Dulles,38.9531,-77.4565,US,Washington,yes,IAD
+KDCA,medium_airport,Aéroport national Ronald-Reagan,38.8512,-77.0402,US,Washington,yes,DCA
+KMIA,large_airport,Aéroport international de Miami,25.7959,-80.2870,US,Miami,yes,MIA
+KMCO,large_airport,Aéroport international d'Orlando,28.4312,-81.3081,US,Orlando,yes,MCO
+KATL,large_airport,Aéroport international Hartsfield-Jackson d'Atlanta,33.6407,-84.4277,US,Atlanta,yes,ATL
+KORD,large_airport,Aéroport international O'Hare de Chicago,41.9742,-87.9073,US,Chicago,yes,ORD
+KLAX,large_airport,Aéroport international de Los Angeles,33.9416,-118.4085,US,Los Angeles,yes,LAX
+KSFO,large_airport,Aéroport international de San Francisco,37.6213,-122.3790,US,San Francisco,yes,SFO
+KSEA,large_airport,Aéroport international de Seattle-Tacoma,47.4502,-122.3088,US,Seattle,yes,SEA
+KLAS,large_airport,Aéroport international Harry-Reid de Las Vegas,36.0840,-115.1537,US,Las Vegas,yes,LAS
+KDFW,large_airport,Aéroport international de Dallas-Fort Worth,32.8998,-97.0403,US,Dallas,yes,DFW
+KDEN,large_airport,Aéroport international de Denver,39.8561,-104.6737,US,Denver,yes,DEN
+CYUL,large_airport,Aéroport international Pierre-Elliott-Trudeau de Montréal,45.4706,-73.7408,CA,Montréal,yes,YUL
+CYYZ,large_airport,Aéroport international Pearson de Toronto,43.6777,-79.6248,CA,Toronto,yes,YYZ
+CYVR,large_airport,Aéroport international de Vancouver,49.1967,-123.1815,CA,Vancouver,yes,YVR
+CYQB,medium_airport,Aéroport international Jean-Lesage de Québec,46.7911,-71.3933,CA,Québec,yes,YQB
+CYXU,medium_airport,Aéroport international de London (Ontario),43.0356,-81.1539,CA,London,yes,YXU
+SBGR,large_airport,Aéroport international de São Paulo-Guarulhos,-23.4356,-46.4731,BR,São Paulo,yes,GRU
+SBSP,medium_airport,Aéroport de São Paulo-Congonhas,-23.6261,-46.6564,BR,São Paulo,yes,CGH
+SBGL,large_airport,Aéroport international de Rio de Janeiro-Galeão,-22.8099,-43.2506,BR,Rio de Janeiro,yes,GIG
+SAEZ,large_airport,Aéroport international Ministro-Pistarini d'Ezeiza,-34.8222,-58.5358,AR,Buenos Aires,yes,EZE
+SCEL,large_airport,Aéroport international Arturo-Merino-Benítez,-33.3930,-70.7858,CL,Santiago,yes,SCL
+SPJC,large_airport,Aéroport international Jorge-Chávez,-12.0219,-77.1143,PE,Lima,yes,LIM
+SKBO,large_airport,Aéroport international El Dorado,4.7016,-74.1469,CO,Bogota,yes,BOG
+MMMX,large_airport,Aéroport international de Mexico,19.4363,-99.0721,MX,Mexico,yes,MEX
+MMUN,large_airport,Aéroport international de Cancún,21.0365,-86.8771,MX,Cancún,yes,CUN
+YSSY,large_airport,Aéroport Kingsford-Smith de Sydney,-33.9399,151.1753,AU,Sydney,yes,SYD
+YMML,large_airport,Aéroport de Melbourne-Tullamarine,-37.6690,144.8410,AU,Melbourne,yes,MEL
+YBBN,large_airport,Aéroport de Brisbane,-27.3842,153.1175,AU,Brisbane,yes,BNE
+YPPH,medium_airport,Aéroport de Perth,-31.9403,115.9670,AU,Perth,yes,PER
+NZAA,large_airport,Aéroport d'Auckland,-37.0082,174.7850,NZ,Auckland,yes,AKL

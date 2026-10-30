@@ -7,9 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 import httpx
 from sqlalchemy import func, select
 
+from app.core.airports import find_nearest_airport, haversine_distance_km
 from app.core.config import Settings, get_settings
 from app.core.database import AsyncSession, get_db
-from app.core.geo import haversine_distance_km
 from app.core.redis import cache_client
 from app.models.entities import Destination
 from app.modules.destinations.schemas import (
@@ -31,6 +31,7 @@ SEED_CITIES_FALLBACK_CATALOG: list[dict[str, Any]] = [
     {
         "geonameId": 2988507,
         "nom": "Paris",
+        "region": "Île-de-France",
         "pays": "France",
         "code_pays": "FR",
         "latitude": 48.8566,
@@ -42,6 +43,7 @@ SEED_CITIES_FALLBACK_CATALOG: list[dict[str, Any]] = [
     {
         "geonameId": 2542997,
         "nom": "Marrakech",
+        "region": "Marrakech-Safi",
         "pays": "Maroc",
         "code_pays": "MA",
         "latitude": 31.6295,
@@ -53,6 +55,7 @@ SEED_CITIES_FALLBACK_CATALOG: list[dict[str, Any]] = [
     {
         "geonameId": 1850147,
         "nom": "Tokyo",
+        "region": "Kantō",
         "pays": "Japon",
         "code_pays": "JP",
         "latitude": 35.6762,
@@ -64,6 +67,7 @@ SEED_CITIES_FALLBACK_CATALOG: list[dict[str, Any]] = [
     {
         "geonameId": 5128581,
         "nom": "New York",
+        "region": "New York",
         "pays": "États-Unis",
         "code_pays": "US",
         "latitude": 40.7128,
@@ -75,6 +79,7 @@ SEED_CITIES_FALLBACK_CATALOG: list[dict[str, Any]] = [
     {
         "geonameId": 3169070,
         "nom": "Rome",
+        "region": "Latium",
         "pays": "Italie",
         "code_pays": "IT",
         "latitude": 41.9028,
@@ -89,48 +94,10 @@ SEED_GEONAME_ID_TO_CITY: dict[int, str] = {
     int(item["geonameId"]): str(item["nom"]).lower() for item in SEED_CITIES_FALLBACK_CATALOG
 }
 
-KNOWN_WORLD_IATA_CODES: dict[str, str] = {
-    "paris": "CDG",
-    "marrakech": "RAK",
-    "tokyo": "HND",
-    "new york": "JFK",
-    "rome": "FCO",
-    "lisbonne": "LIS",
-    "lisboa": "LIS",
-    "lisbon": "LIS",
-    "seoul": "ICN",
-    "le caire": "CAI",
-    "cairo": "CAI",
-    "barcelone": "BCN",
-    "barcelona": "BCN",
-    "londres": "LHR",
-    "london": "LHR",
-    "kyoto": "KIX",
-    "reykjavik": "KEF",
-    "madrid": "MAD",
-    "berlin": "BER",
-    "amsterdam": "AMS",
-    "montreal": "YUL",
-    "dubai": "DXB",
-    "bangkok": "BKK",
-    "sydney": "SYD",
-}
-
+# Règle A.1 : Le filtre des banlieues est strictement limité aux quartiers (PPLX) et lieux abandonnés (PPLQ).
 SUBURB_OR_NON_CITY_FCODES: set[str] = {
-    "PPLX",  # Section of populated place (banlieue / quartier)
-    "PPLQ",  # Abandoned populated place
-    "PPLW",  # Destroyed populated place
-    "PPLH",  # Historical populated place
-    "PPLCH",  # Historical capital
-    "PPLF",  # Farm village
-    "PPLL",  # Populated locality
-    "PPLS",  # Populated places
-    "RGN",
-    "AREA",
-    "ADM1",
-    "ADM2",
-    "ADM3",
-    "ADM4",
+    "PPLX",  # Quartier / section de ville (ex: Benfica)
+    "PPLQ",  # Lieu habité abandonné
 }
 
 REGION_OR_SUBURB_KEYWORDS: tuple[str, ...] = (
@@ -139,30 +106,98 @@ REGION_OR_SUBURB_KEYWORDS: tuple[str, ...] = (
     "region metropolitaine",
     "banlieue",
     "suburb",
-    "arrondissement",
     "agglomeration",
-    "greater ",
-    "grand ",
 )
+
+# Alias de régions et d'îles conservés en secours de la détection généralisée GeoNames (Règle A.5 & Finition 4)
+REGION_QUERY_ALIASES: dict[str, tuple[str, set[str]]] = {
+    "bali": ("Bali", {"bali", "provinsi bali", "bali island", "ile de bali"}),
+    "toscane": ("Toscane", {"toscane", "toscana", "tuscany", "regione toscana"}),
+    "toscana": ("Toscane", {"toscane", "toscana", "tuscany", "regione toscana"}),
+    "tuscany": ("Toscane", {"toscane", "toscana", "tuscany", "regione toscana"}),
+    "santorin": ("Santorin", {"santorin", "santorini", "thira", "thera", "south aegean", "egee meridionale"}),
+    "santorini": ("Santorin", {"santorin", "santorini", "thira", "thera", "south aegean", "egee meridionale"}),
+    "cote d azur": ("Côte d'Azur", {"cote d azur", "provence alpes cote d azur", "paca", "french riviera"}),
+    "corse": ("Corse", {"corse", "corsica", "collectivite de corse"}),
+    "sicile": ("Sicile", {"sicile", "sicilia", "sicily", "regione siciliana"}),
+    "sardaigne": ("Sardaigne", {"sardaigne", "sardegna", "sardinia"}),
+    "andalousie": ("Andalousie", {"andalousie", "andalucia", "andalusia"}),
+    "catalogne": ("Catalogne", {"catalogne", "catalunya", "catalonia", "cataluna"}),
+    "algarve": ("Algarve", {"algarve", "faro"}),
+    "crete": ("Crète", {"crete", "kriti"}),
+    "bretagne": ("Bretagne", {"bretagne", "brittany"}),
+    "normandie": ("Normandie", {"normandie", "normandy"}),
+    "provence": ("Provence", {"provence", "provence alpes cote d azur", "paca"}),
+    "baviere": ("Bavière", {"baviere", "bayern", "bavaria"}),
+    "tyrol": ("Tyrol", {"tyrol", "tirol"}),
+}
 
 
 def normalize_geonames_query(raw: str) -> str:
-    """Normalise une requête de ville : minuscules, sans accents, espaces réduits."""
+    """Normalise une requête de ville : minuscules, sans accents, ligatures et espaces réduits."""
     text = (raw or "").strip().lower()
+    text = text.replace("œ", "oe").replace("æ", "ae").replace("ß", "ss")
     decomposed = unicodedata.normalize("NFKD", text)
     without_accents = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     cleaned = re.sub(r"[^a-z0-9\s\-']", " ", without_accents)
+    cleaned = cleaned.replace("-", " ").replace("'", " ")
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def derive_iata_code(city_name: str, explicit_iata: str | None = None) -> str:
+def _strip_leading_article(norm_text: str) -> str:
+    for prefix in ("le ", "la ", "les ", "l ", "el ", "al ", "as ", "os ", "the "):
+        if norm_text.startswith(prefix) and len(norm_text) > len(prefix) + 1:
+            return norm_text[len(prefix) :].strip()
+    return norm_text
+
+
+def format_region_country_subtitle(region_name: str | None, country_name: str | None) -> str:
+    """Formate 'région • pays' pour distinguer les villes homonymes et régions sans jargon de fuseau horaire."""
+    clean_region = (region_name or "").strip()
+    clean_country = (country_name or "Monde").strip() or "Monde"
+    if not clean_region:
+        return clean_country
+    if normalize_geonames_query(clean_region) == normalize_geonames_query(clean_country):
+        return clean_country
+    return f"{clean_region} • {clean_country}"
+
+
+def derive_iata_code(
+    city_name: str,
+    explicit_iata: str | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    country_code: str | None = None,
+) -> str:
+    """
+    Règle C.9 : Utilise la vraie liste OurAirports par distance depuis les coordonnées de la ville,
+    JAMAIS déduit des 3 premières lettres du nom (ex: Monastir -> MIR, jamais MON).
+    """
+    if latitude is not None and longitude is not None:
+        nearest = find_nearest_airport(
+            latitude=float(latitude),
+            longitude=float(longitude),
+            city_name=city_name,
+            country_code=country_code,
+        )
+        return str(nearest["iata_code"])
+
+    preset = WORLD_CITY_GEODATA.get((city_name or "").strip().lower())
+    if preset and preset.get("latitude") is not None and preset.get("longitude") is not None:
+        nearest = find_nearest_airport(
+            latitude=float(preset["latitude"]),
+            longitude=float(preset["longitude"]),
+            city_name=city_name,
+            country_code=country_code or str(preset.get("country_code_iso2") or ""),
+        )
+        return str(nearest["iata_code"])
+
     if explicit_iata and len(explicit_iata.strip()) == 3:
         return explicit_iata.strip().upper()
-    norm = normalize_geonames_query(city_name)
-    if norm in KNOWN_WORLD_IATA_CODES:
-        return KNOWN_WORLD_IATA_CODES[norm]
-    letters = re.sub(r"[^A-Za-z]", "", normalize_geonames_query(city_name)).upper()
-    return (letters[:3] if len(letters) >= 3 else (letters + "XXX")[:3]).upper()
+
+    # Coordonnées par défaut (Paris CDG) si aucune coordonnée n'est fournie
+    nearest_default = find_nearest_airport(48.8566, 2.3522, city_name=city_name, country_code=country_code)
+    return str(nearest_default["iata_code"])
 
 
 def _build_city_result(
@@ -175,6 +210,10 @@ def _build_city_result(
     longitude: float,
     timezone_id: str,
     population: int,
+    region_name: str = "",
+    feature_class: str = "P",
+    feature_code: str = "PPL",
+    is_region: bool = False,
     iata_code: str | None = None,
     destination_id: str | None = None,
     is_seed: bool | None = None,
@@ -190,15 +229,28 @@ def _build_city_result(
     lat = round(float(latitude), 5)
     lng = round(float(longitude), 5)
     coords = {"latitude": lat, "longitude": lng, "lat": lat, "lng": lng}
-    resolved_iata = derive_iata_code(name, iata_code)
+
+    nearest_airport = find_nearest_airport(
+        latitude=lat,
+        longitude=lng,
+        city_name=name,
+        country_code=iso2,
+    )
+    resolved_iata = str(nearest_airport["iata_code"])
+    clean_region = (region_name or "").strip()
+    sous_titre = format_region_country_subtitle(clean_region, country_name)
+
     return GeoNamesCityResult(
         geonameId=int(geoname_id),
         geoname_id=int(geoname_id),
         nom=name,
         name=name,
         city_name=name,
+        region=clean_region,
+        region_name=clean_region,
         pays=country_name,
         country_name=country_name,
+        sous_titre=sous_titre,
         code_pays=iso2,
         country_code_iso2=iso2,
         coordonnees=coords,
@@ -208,7 +260,14 @@ def _build_city_result(
         fuseau_horaire=tz,
         timezone=tz,
         population=max(0, int(population or 0)),
+        feature_class=(feature_class or "P").upper()[:1],
+        feature_code=(feature_code or "PPL").upper(),
+        is_region=bool(is_region),
         iata_code=resolved_iata,
+        airport_name=str(nearest_airport["airport_name"]),
+        nearest_airport_distance_km=float(nearest_airport["distance_km"]),
+        airport_within_100km=bool(nearest_airport["within_100km"]),
+        airport_display_label=str(nearest_airport["display_label"]),
         is_seed=seed_flag,
         destination_id=destination_id,
     )
@@ -218,7 +277,11 @@ async def _build_seed_fallback_cities(
     db: AsyncSession,
     query_filter: str | None = None,
 ) -> tuple[list[GeoNamesCityResult], list[GeoNamesCityResult]]:
-    """Construit la liste des 5 villes du seed (et les filtre optionnellement si une requête correspond)."""
+    """
+    Construit la liste des 5 villes du seed :
+    - `matched` : uniquement les villes de démo dont le nom correspond à `query_filter` (Règle A.3).
+    - `all_seed_results` : les 5 villes de démo utilisées uniquement en repli quand GeoNames est injoignable.
+    """
     db_dests = list((await db.scalars(select(Destination))).all())
     by_lower_name = {d.city_name.strip().lower(): d for d in db_dests}
 
@@ -229,6 +292,7 @@ async def _build_seed_fallback_cities(
             _build_city_result(
                 geoname_id=int(item["geonameId"]),
                 name=str(item["nom"]),
+                region_name=str(item.get("region") or ""),
                 country_name=str(item["pays"]),
                 country_code=str(item["code_pays"]),
                 latitude=float(item["latitude"]),
@@ -242,54 +306,500 @@ async def _build_seed_fallback_cities(
         )
 
     if not query_filter:
-        return all_seed_results, all_seed_results
+        return [], all_seed_results
 
     norm_q = normalize_geonames_query(query_filter)
     if not norm_q:
-        return all_seed_results, all_seed_results
+        return [], all_seed_results
 
     matched = [
         c
         for c in all_seed_results
         if norm_q in normalize_geonames_query(c.nom)
-        or norm_q in normalize_geonames_query(c.pays)
         or norm_q == c.iata_code.lower()
     ]
-    return (matched if matched else all_seed_results), all_seed_results
+    return matched, all_seed_results
+
+
+def _extract_alternate_entries_with_labels(raw: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """
+    Extrait les tuples `(norm_name, display_label, lang)` depuis `name`, `nom`, `toponymName`,
+    `asciiName`, `adminName1`, `adminName2`, `alternateNames` (style=FULL) et `alternatenames`.
+    """
+    entries: list[tuple[str, str, str]] = []
+    for field_name in ("name", "nom", "toponymName", "asciiName", "adminName1", "adminName2", "region"):
+        val = raw.get(field_name)
+        if isinstance(val, str) and val.strip():
+            disp = val.strip()
+            norm_val = normalize_geonames_query(disp)
+            if norm_val:
+                entries.append((norm_val, disp, ""))
+                stripped = _strip_leading_article(norm_val)
+                if stripped and stripped != norm_val:
+                    entries.append((stripped, disp, ""))
+
+    alt_list = raw.get("alternateNames")
+    if isinstance(alt_list, list):
+        for item in alt_list:
+            if isinstance(item, dict):
+                alt_str = str(item.get("name") or "").strip()
+                lang = str(item.get("lang") or "").strip().lower()
+            elif isinstance(item, str):
+                alt_str = item.strip()
+                lang = ""
+            else:
+                alt_str = ""
+                lang = ""
+            if alt_str:
+                norm_alt = normalize_geonames_query(alt_str)
+                if norm_alt:
+                    entries.append((norm_alt, alt_str, lang))
+                    stripped = _strip_leading_article(norm_alt)
+                    if stripped and stripped != norm_alt:
+                        entries.append((stripped, alt_str, lang))
+
+    alt_csv = raw.get("alternatenames")
+    if isinstance(alt_csv, str) and alt_csv.strip():
+        for part in alt_csv.split(","):
+            disp = part.strip()
+            norm_part = normalize_geonames_query(disp)
+            if norm_part:
+                entries.append((norm_part, disp, ""))
+                stripped = _strip_leading_article(norm_part)
+                if stripped and stripped != norm_part:
+                    entries.append((stripped, disp, ""))
+
+    return entries
+
+
+def _extract_exact_alternate_names(raw: dict[str, Any]) -> set[str]:
+    """Extrait tous les noms alternatifs normalisés d'un enregistrement GeoNames (style=FULL)."""
+    alt_norms: set[str] = set()
+    for field_name in ("name", "nom", "toponymName", "asciiName"):
+        val = raw.get(field_name)
+        if isinstance(val, str) and val.strip():
+            norm_val = normalize_geonames_query(val)
+            if norm_val:
+                alt_norms.add(norm_val)
+                alt_norms.add(_strip_leading_article(norm_val))
+
+    alt_list = raw.get("alternateNames")
+    if isinstance(alt_list, list):
+        for entry in alt_list:
+            if isinstance(entry, dict):
+                alt_str = str(entry.get("name") or "").strip()
+            elif isinstance(entry, str):
+                alt_str = entry.strip()
+            else:
+                alt_str = ""
+            if alt_str:
+                norm_alt = normalize_geonames_query(alt_str)
+                if norm_alt:
+                    alt_norms.add(norm_alt)
+                    alt_norms.add(_strip_leading_article(norm_alt))
+
+    alt_csv = raw.get("alternatenames")
+    if isinstance(alt_csv, str) and alt_csv.strip():
+        for part in alt_csv.split(","):
+            norm_part = normalize_geonames_query(part)
+            if norm_part:
+                alt_norms.add(norm_part)
+                alt_norms.add(_strip_leading_article(norm_part))
+
+    return alt_norms
+
+
+def _shares_regional_stem(norm_a: str, norm_b: str, min_stem: int = 5) -> bool:
+    """
+    Vérifie si deux noms normalisés de région partagent une racine linguistique commune d'au moins `min_stem`
+    caractères (ex: "andalousie" / "andalucia" -> "andalu", "toscane" / "toscana" -> "toscan",
+    "santorin" / "santorini" -> "santorin", "catalogne" / "catalunya" -> "catal").
+    """
+    if not norm_a or not norm_b or len(norm_a) < min_stem or len(norm_b) < min_stem:
+        return False
+    common = 0
+    for ch_a, ch_b in zip(norm_a, norm_b):
+        if ch_a != ch_b:
+            break
+        common += 1
+    return common >= min_stem and abs(len(norm_a) - len(norm_b)) <= 4
+
+
+def _humanize_query_region_label(raw_query: str, norm_q: str) -> str:
+    """Formate proprement le libellé d'une région/île à partir de la requête ou des alias de secours."""
+    if norm_q in REGION_QUERY_ALIASES:
+        return REGION_QUERY_ALIASES[norm_q][0]
+    cleaned = (raw_query or norm_q).strip()
+    if not cleaned:
+        return ""
+    # Gestion propre des apostrophes françaises (ex: "côte d'azur" -> "Côte d'Azur")
+    small_words = {"de", "du", "des", "la", "le", "les", "en", "sur", "et"}
+    parts = re.split(r"(\s+|'|’|-)", cleaned)
+    out: list[str] = []
+    for idx, token in enumerate(parts):
+        if not token or re.match(r"^(\s+|'|’|-)$", token):
+            out.append("'" if token in {"'", "’"} else token)
+            continue
+        low = token.lower()
+        if idx > 0 and (low in small_words or (low == "d" and idx + 1 < len(parts) and parts[idx + 1] in {"'", "’"})):
+            out.append(low)
+        else:
+            out.append(low[:1].upper() + low[1:])
+    return "".join(out)
+
+
+def _resolve_french_region_display_name(
+    raw: dict[str, Any],
+    norm_q: str,
+    raw_query: str = "",
+    fallback_region: str = "",
+) -> str:
+    """
+    Détermine le libellé français d'une région ou île à partir des métadonnées GeoNames
+    (`alternateNames` avec `lang='fr'`, `name`, `adminName1`), puis `REGION_QUERY_ALIASES` en secours.
+    """
+    entries = _extract_alternate_entries_with_labels(raw)
+    norm_q_no_article = _strip_leading_article(norm_q)
+
+    # 1. Priorité aux alternateNames en français correspondant exactement ou par racine à la région
+    for norm_val, disp, lang in entries:
+        if lang == "fr" and (
+            norm_val in {norm_q, norm_q_no_article}
+            or _shares_regional_stem(norm_val, norm_q)
+        ):
+            if "(" not in disp and "," not in disp:
+                return disp
+
+    # 2. Toute entrée GeoNames dont le nom normalisé correspond exactement à la requête
+    for norm_val, disp, _lang in entries:
+        if norm_val in {norm_q, norm_q_no_article} and "(" not in disp and "," not in disp:
+            return disp
+
+    # 3. Si la requête est une sous-expression d'adminName1 (ex: "Côte d'Azur" dans "Provence-Alpes-Côte d'Azur")
+    raw_admin1 = str(raw.get("adminName1") or raw.get("region") or "").strip()
+    if raw_admin1 and norm_q in normalize_geonames_query(raw_admin1):
+        # Extrait le segment correspondant s'il existe dans adminName1 (ex: "Côte d'Azur")
+        m = re.search(r"(c[oô]te\s+d['’]azur)", raw_admin1, flags=re.IGNORECASE)
+        if m:
+            return "Côte d'Azur"
+        return _humanize_query_region_label(raw_query, norm_q) or raw_admin1
+
+    # 4. Secours via REGION_QUERY_ALIASES
+    if norm_q in REGION_QUERY_ALIASES:
+        return REGION_QUERY_ALIASES[norm_q][0]
+
+    # 5. Entrée française générale sur un objet région/île (featureClass T ou A)
+    fcl = str(raw.get("fcl") or raw.get("featureClass") or "").strip().upper()
+    if fcl in {"A", "T"}:
+        for _norm_val, disp, lang in entries:
+            if lang == "fr" and "(" not in disp and "," not in disp:
+                return disp
+
+    return _humanize_query_region_label(raw_query, norm_q) or fallback_region or raw_admin1
+
+
+def _does_city_match_query(
+    raw: dict[str, Any],
+    norm_q: str,
+    raw_query: str = "",
+    matched_region_features: list[dict[str, Any]] | None = None,
+) -> tuple[bool, bool, bool, str]:
+    """
+    Vérifie si un enregistrement GeoNames correspond à la requête `norm_q` (Règles A.1, A.2, A.5 & Finition 4) :
+    Retourne `(matches, is_exact_city_match, is_region_match, resolved_region_label)` :
+    - `is_exact_city_match` : le nom de la ville (ou un nom alternatif exact) correspond à `norm_q`.
+    - `is_region_match` : la région/île correspond à `norm_q` via GeoNames (`adminName1`, `adminName2`,
+      `alternateNames`, ou proximité/appartenance à une entité GeoNames `featureClass` `T`/`A`),
+      avec `REGION_QUERY_ALIASES` conservé en secours.
+    """
+    raw_region = str(raw.get("adminName1") or raw.get("region") or "").strip()
+    raw_admin2 = str(raw.get("adminName2") or "").strip()
+    norm_region = normalize_geonames_query(raw_region)
+    norm_admin2 = normalize_geonames_query(raw_admin2)
+
+    # Normalisation française via GeoNames alternateNames ou REGION_QUERY_ALIASES en secours
+    canonical_region = raw_region
+    for _alias_key, (fr_label, alias_set) in REGION_QUERY_ALIASES.items():
+        if norm_region in alias_set or any(a in norm_region for a in alias_set if len(a) >= 4):
+            canonical_region = fr_label
+            break
+
+    if not norm_q:
+        return True, False, False, canonical_region
+
+    norm_q_no_article = _strip_leading_article(norm_q)
+
+    primary_names: set[str] = set()
+    for field_name in ("name", "nom", "toponymName", "asciiName"):
+        val = raw.get(field_name)
+        if isinstance(val, str) and val.strip():
+            n_val = normalize_geonames_query(val)
+            if n_val:
+                primary_names.add(n_val)
+                primary_names.add(_strip_leading_article(n_val))
+
+    all_alt_names = _extract_exact_alternate_names(raw)
+
+    # 1. Correspondance exacte sur le nom principal ou un nom alternatif exact
+    if (
+        norm_q in primary_names
+        or norm_q_no_article in primary_names
+        or norm_q in all_alt_names
+        or norm_q_no_article in all_alt_names
+    ):
+        return True, True, False, canonical_region
+
+    # 2. Correspondance par préfixe sur le nom de la ville ou un mot du nom principal
+    #    (ex: "saint-quentin" pour "Saint-Quentin-en-Yvelines", mais PAS "springfield" pour "Eugene" ou "Chicopee")
+    for p_name in primary_names:
+        if p_name.startswith(norm_q) or p_name.startswith(norm_q_no_article):
+            return True, False, False, canonical_region
+        words = p_name.split()
+        if any(w == norm_q or w == norm_q_no_article for w in words):
+            return True, False, False, canonical_region
+
+    # 3. Correspondance par préfixe sur un nom alternatif (uniquement si le nom alternatif commence par la requête,
+    #    et n'est pas un nom composé d'agglomération commençant par une autre ville comme "Eugene-Springfield")
+    for alt_name in all_alt_names:
+        if alt_name.startswith(norm_q) or alt_name.startswith(norm_q_no_article):
+            primary_tokens = {tok for p in primary_names for tok in p.split() if len(tok) >= 3}
+            alt_tokens = alt_name.split()
+            if len(alt_tokens) >= 2 and any(tok in primary_tokens for tok in alt_tokens[1:]):
+                continue
+            return True, False, False, canonical_region
+
+    # 4. Généralisation GeoNames pour les régions et îles (adminName1, adminName2, alternateNames, featureClass T/A)
+    #    + REGION_QUERY_ALIASES conservé en secours.
+    region_aliases_for_q: set[str] = {norm_q, norm_q_no_article}
+    if norm_q in REGION_QUERY_ALIASES:
+        _fr_label, alias_set = REGION_QUERY_ALIASES[norm_q]
+        region_aliases_for_q.update(alias_set)
+
+    city_cc = str(raw.get("countryCode") or raw.get("code_pays") or "").strip().upper()[:2]
+    matched_reg_display = ""
+    if matched_region_features:
+        for reg_ctx in matched_region_features:
+            if not city_cc or not reg_ctx["country_code"] or city_cc == reg_ctx["country_code"]:
+                matched_reg_display = str(reg_ctx.get("display_name") or "")
+                if matched_reg_display:
+                    break
+
+    # 4a. Correspondance directe ou par sous-expression / racine sur adminName1 ou adminName2
+    #     Ex: "côte d'azur" -> norm_q="cote d azur" contenu dans adminName1="Provence-Alpes-Côte d'Azur"
+    #     Ex: "andalousie" -> racine commune "andalu" avec adminName1="Andalucía" ou "Andalusia"
+    #     Ex: "santorin" -> adminName2="Thira" / "Santorini"
+    for candidate_norm_reg in (norm_region, norm_admin2):
+        if not candidate_norm_reg:
+            continue
+        if (
+            candidate_norm_reg in region_aliases_for_q
+            or any(
+                candidate_norm_reg == alias
+                or candidate_norm_reg.startswith(alias)
+                or (len(alias) >= 4 and alias in candidate_norm_reg)
+                or _shares_regional_stem(candidate_norm_reg, alias)
+                for alias in region_aliases_for_q
+                if len(alias) >= 3
+            )
+        ):
+            resolved_label = matched_reg_display or _resolve_french_region_display_name(
+                raw, norm_q, raw_query=raw_query, fallback_region=canonical_region
+            )
+            return True, False, True, resolved_label
+
+    # 4b. Correspondance via les noms alternatifs GeoNames de la ville mentionnant la région ou l'île
+    #     Ex: "Fira (Santorin)", "Oia, Santorin", "Nice Côte d'Azur", "Sevilla, Andalousie"
+    for alt_norm in all_alt_names:
+        if any(
+            len(alias) >= 4
+            and (
+                alias in alt_norm.split()
+                or alias in alt_norm
+                or any(_shares_regional_stem(word, alias) for word in alt_norm.split() if len(word) >= 5)
+            )
+            for alias in region_aliases_for_q
+        ):
+            resolved_label = matched_reg_display or _resolve_french_region_display_name(
+                raw, norm_q, raw_query=raw_query, fallback_region=canonical_region
+            )
+            return True, False, True, resolved_label
+
+    # 4c. Correspondance via une entité régionale/insulaire GeoNames (featureClass T ou A) présente dans la réponse
+    #     Ex: GeoNames renvoie l'île "Santorin" (fcl=T, fcode=ISL, toponymName="Thira", adminName1="Égée-Méridionale")
+    #     et les villes de l'île (Fira, Oia) qui partagent adminName1/adminName2/toponym ou sont proches (< 120 km).
+    if matched_region_features:
+        city_cc = str(raw.get("countryCode") or raw.get("code_pays") or "").strip().upper()[:2]
+        city_tokens = primary_names | all_alt_names | ({norm_region} if norm_region else set()) | ({norm_admin2} if norm_admin2 else set())
+        try:
+            c_lat = float(raw.get("lat") if raw.get("lat") is not None else raw.get("latitude"))
+            c_lng = float(raw.get("lng") if raw.get("lng") is not None else raw.get("longitude"))
+        except (TypeError, ValueError):
+            c_lat, c_lng = None, None
+
+        for reg_ctx in matched_region_features:
+            if city_cc and reg_ctx["country_code"] and city_cc != reg_ctx["country_code"]:
+                continue
+            shared_tokens = city_tokens & reg_ctx["tokens"]
+            within_reg_radius = False
+            if c_lat is not None and c_lng is not None and reg_ctx["lat"] is not None and reg_ctx["lng"] is not None:
+                dist = haversine_distance_km(c_lat, c_lng, reg_ctx["lat"], reg_ctx["lng"])
+                within_reg_radius = dist <= 150.0
+            if shared_tokens or within_reg_radius:
+                return True, False, True, reg_ctx["display_name"]
+
+    return False, False, False, canonical_region
+
+
+def _extract_matching_region_features_context(
+    raw_items: list[dict[str, Any]],
+    norm_q: str,
+    raw_query: str = "",
+) -> list[dict[str, Any]]:
+    """
+    Repère dans `raw_items` les entités GeoNames de classe `T` (île, relief, côte, péninsule)
+    ou `A` (région administrative) qui correspondent à `norm_q` (via `name`, `toponymName`,
+    `adminName1`, `alternateNames` ou `REGION_QUERY_ALIASES` en secours).
+    """
+    if not norm_q:
+        return []
+    norm_q_no_article = _strip_leading_article(norm_q)
+    search_aliases: set[str] = {norm_q, norm_q_no_article}
+    if norm_q in REGION_QUERY_ALIASES:
+        search_aliases.update(REGION_QUERY_ALIASES[norm_q][1])
+
+    contexts: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        fcl = str(raw.get("fcl") or raw.get("featureClass") or "").strip().upper()
+        if fcl not in {"A", "T"}:
+            continue
+        entries = _extract_alternate_entries_with_labels(raw)
+        all_norms = {e[0] for e in entries if e[0]}
+        is_match = any(
+            n in search_aliases
+            or any(
+                (len(a) >= 4 and (a in n or n in a))
+                or _shares_regional_stem(n, a)
+                for a in search_aliases
+            )
+            for n in all_norms
+        )
+        if not is_match:
+            continue
+
+        display_name = _resolve_french_region_display_name(raw, norm_q, raw_query=raw_query)
+        cc = str(raw.get("countryCode") or raw.get("code_pays") or "").strip().upper()[:2]
+        try:
+            r_lat = float(raw.get("lat") if raw.get("lat") is not None else raw.get("latitude"))
+            r_lng = float(raw.get("lng") if raw.get("lng") is not None else raw.get("longitude"))
+        except (TypeError, ValueError):
+            r_lat, r_lng = None, None
+
+        contexts.append(
+            {
+                "raw": raw,
+                "display_name": display_name,
+                "country_code": cc,
+                "tokens": all_norms,
+                "lat": r_lat,
+                "lng": r_lng,
+                "fcl": fcl,
+            }
+        )
+    return contexts
 
 
 def filter_and_deduplicate_geonames_items(
     raw_items: list[dict[str, Any]],
     db_by_geoname_id: dict[int, Destination] | None = None,
     db_by_lower_name: dict[str, Destination] | None = None,
+    query: str | None = None,
+    max_rows: int = 8,
 ) -> list[GeoNamesCityResult]:
     """
-    Filtre les résultats GeoNames :
-    - Garde uniquement featureClass == 'P' (villes habitées, exclut régions fcl='L', 'A', etc.).
-    - Exclut les banlieues / quartiers (fcode='PPLX', etc. ou mots-clés de région/banlieue,
-      ou communes satellites situées à moins de 25 km d'une ville principale plus peuplée du même pays).
-    - Supprime les doublons par geonameId et par (nom normalisé, code pays).
-    - Extrait le fuseau horaire depuis timezone.timeZoneId (style=FULL).
+    Filtre, enrichit et trie les résultats GeoNames selon les règles A.1 à A.5, C.9 et Finition 4 :
+    1. Le filtre des banlieues est limité aux quartiers (`PPLX`/`PPLQ`). Aucune élimination à < 25 km
+       (Versailles n'est jamais filtrée). Un nom qui correspond exactement à la recherche n'est jamais filtré.
+    2. Les résultats doivent correspondre au nom cherché (ou à un nom alternatif exact), triés par population,
+       avec plusieurs pays et régions si besoin (ex: Springfield dans plusieurs États US, Australie, Canada),
+       distingués par `sous_titre` = "région • pays".
+    3. Régions et îles généralisées avec GeoNames (`adminName1`, `alternateNames`, `featureClass` T ou A,
+       plus `REGION_QUERY_ALIASES` en secours) pour que "bali", "toscane", "santorin", "côte d'azur",
+       "andalousie" renvoient les villes de la région avec "<Région> • <Pays>" en sous-titre et, si aucune
+       ville ne porte le nom cherché, une ligne "Région : <Nom>" (featureClass T ou A).
+    4. Code IATA issu d'OurAirports local (`backend/data/ourairports_iata.csv`) par distance depuis les
+       coordonnées de la ville (Monastir -> MIR, Lisbonne -> LIS, Séoul -> ICN).
     """
     by_gid = db_by_geoname_id or {}
     by_name = db_by_lower_name or {}
+    raw_query_str = (query or "").strip()
+    norm_q = normalize_geonames_query(raw_query_str)
 
-    accepted: list[GeoNamesCityResult] = []
+    # Si `query` n'est pas fourni lors d'un appel direct mais que le 1er élément est une capitale/ville principale,
+    # on détecte s'il existe une ville éponyme pour éviter d'inclure des communes voisines d'un même district.
+    inferred_norm_q = norm_q
+    if not inferred_norm_q and raw_items:
+        first_p = next(
+            (
+                r
+                for r in raw_items
+                if isinstance(r, dict)
+                and str(r.get("fcl") or r.get("featureClass") or "P").strip().upper() == "P"
+            ),
+            None,
+        )
+        if first_p:
+            inferred_norm_q = normalize_geonames_query(
+                str(first_p.get("name") or first_p.get("nom") or "")
+            )
+
+    matched_region_features = _extract_matching_region_features_context(
+        raw_items, inferred_norm_q, raw_query=raw_query_str
+    )
+
+    # Identifie les régions (adminName1, code_pays) qui possèdent déjà une ville portant exactement le nom cherché
+    # (ex: pour q="lisbonne", la ville de Lisbonne existe dans la région de Lisbonne -> on ne garde pas Amadora).
+    regions_with_exact_city: set[tuple[str, str]] = set()
+    if inferred_norm_q:
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            fcl = str(raw.get("fcl") or raw.get("featureClass") or "P").strip().upper()
+            if fcl != "P":
+                continue
+            matches, is_exact_city, _is_reg, canon_reg = _does_city_match_query(
+                raw,
+                inferred_norm_q,
+                raw_query=raw_query_str,
+                matched_region_features=matched_region_features,
+            )
+            if matches and is_exact_city:
+                cc = str(raw.get("countryCode") or raw.get("code_pays") or "XX").strip().upper()[:2]
+                regions_with_exact_city.add((normalize_geonames_query(canon_reg), cc))
+                raw_adm1 = normalize_geonames_query(str(raw.get("adminName1") or raw.get("region") or ""))
+                if raw_adm1:
+                    regions_with_exact_city.add((raw_adm1, cc))
+
+    city_candidates: list[tuple[bool, int, GeoNamesCityResult]] = []
+    region_feature_candidates: list[dict[str, Any]] = []
     seen_geoname_ids: set[int] = set()
-    seen_name_country: set[tuple[str, str]] = set()
+    seen_city_region_country: set[tuple[str, str, str]] = set()
 
     for raw in raw_items:
         if not isinstance(raw, dict):
             continue
 
-        # 1. Filtre strict featureClass == 'P' (exclut fcl='L' comme "Lisbon metropolitan area")
         fcl = str(raw.get("fcl") or raw.get("featureClass") or "P").strip().upper()
-        if fcl != "P":
+        fcode = str(raw.get("fcode") or raw.get("featureCode") or "").strip().upper()
+
+        # Conservation des entités de région/île (featureClass T ou A) pour la règle A.5 / Finition 4
+        if fcl in {"A", "T"}:
+            region_feature_candidates.append(raw)
             continue
 
-        # 2. Filtre les codes de banlieue / section de ville / localité abandonnée
-        fcode = str(raw.get("fcode") or raw.get("featureCode") or "").strip().upper()
-        if fcode in SUBURB_OR_NON_CITY_FCODES:
+        # Exclut les autres classes non-villes (ex: fcl='L' comme "Lisbon metropolitan area")
+        if fcl != "P":
             continue
 
         raw_gid = raw.get("geonameId") or raw.get("geoname_id")
@@ -310,15 +820,45 @@ def filter_and_deduplicate_geonames_items(
         if not name:
             continue
 
-        # 3. Exclut les libellés de régions métropolitaines ou de banlieues
-        combined_labels = normalize_geonames_query(f"{name} {toponym} {fcl_name} {fcode_name}")
-        if any(kw in combined_labels for kw in REGION_OR_SUBURB_KEYWORDS):
+        matches_q, is_exact_city, is_region_only_match, canonical_region = _does_city_match_query(
+            raw,
+            inferred_norm_q,
+            raw_query=raw_query_str,
+            matched_region_features=matched_region_features,
+        )
+        if not matches_q:
             continue
 
         country_name = str(raw.get("countryName") or raw.get("pays") or "Monde").strip() or "Monde"
         country_code = (
             str(raw.get("countryCode") or raw.get("code_pays") or "XX").strip().upper()[:2] or "XX"
         )
+        raw_adm1_norm = normalize_geonames_query(str(raw.get("adminName1") or raw.get("region") or ""))
+
+        # Si la ville ne correspond QUE par le nom de sa région/district (ex: Amadora dans le district de Lisbonne)
+        # mais qu'une ville portant exactement le nom cherché (Lisbonne) existe déjà dans cette région, on l'ignore.
+        if (
+            is_region_only_match
+            and not is_exact_city
+            and (
+                (normalize_geonames_query(canonical_region), country_code) in regions_with_exact_city
+                or (raw_adm1_norm, country_code) in regions_with_exact_city
+            )
+        ):
+            continue
+
+        # Règle A.1 : Un nom qui correspond exactement à la recherche n'est JAMAIS filtré.
+        # Le filtre des banlieues est limité aux quartiers (PPLX/PPLQ).
+        is_exact_requested_name = bool(norm_q) and (
+            normalize_geonames_query(name) == norm_q
+            or normalize_geonames_query(toponym) == norm_q
+        )
+        if not is_exact_requested_name:
+            if fcode in SUBURB_OR_NON_CITY_FCODES:
+                continue
+            combined_labels = normalize_geonames_query(f"{name} {toponym} {fcl_name} {fcode_name}")
+            if any(kw in combined_labels for kw in REGION_OR_SUBURB_KEYWORDS):
+                continue
 
         try:
             lat = float(raw.get("lat") if raw.get("lat") is not None else raw.get("latitude"))
@@ -331,7 +871,7 @@ def filter_and_deduplicate_geonames_items(
         except (TypeError, ValueError):
             population = 0
 
-        # 4. Extraction du fuseau horaire (style=FULL renvoie timezone: {"timeZoneId": "Europe/Lisbon", ...})
+        # Extraction du fuseau horaire (style=FULL renvoie timezone: {"timeZoneId": "Europe/Lisbon", ...})
         tz_field = raw.get("timezone") or raw.get("fuseau_horaire")
         timezone_id = ""
         if isinstance(tz_field, dict):
@@ -343,62 +883,165 @@ def filter_and_deduplicate_geonames_items(
             preset_tz = WORLD_CITY_GEODATA.get(name.lower(), {}).get("timezone")
             timezone_id = str(preset_tz or "UTC")
 
-        # 5. Dédoublonnage par (nom normalisé, pays)
         norm_city = normalize_geonames_query(name)
-        norm_toponym = normalize_geonames_query(toponym) if toponym else norm_city
-        if (norm_city, country_code) in seen_name_country or (
-            norm_toponym,
-            country_code,
-        ) in seen_name_country:
+        norm_reg = normalize_geonames_query(canonical_region)
+
+        # Dédoublonnage par (ville normalisée, région normalisée, code pays)
+        dedup_key = (norm_city, norm_reg, country_code)
+        if dedup_key in seen_city_region_country:
             continue
 
-        # 6. Filtrage des banlieues proches (< 25 km dans le même pays d'une ville déjà retenue plus peuplée)
-        is_suburb_of_accepted = False
-        for existing_city in accepted:
-            if existing_city.country_code_iso2 == country_code:
+        # Dédoublonnage géographique de sécurité : si la même ville dans le même pays apparaît deux fois
+        # à moins de 15 km
+        is_same_city_duplicate = False
+        for _exact, _pop, existing_city in city_candidates:
+            if (
+                normalize_geonames_query(existing_city.nom) == norm_city
+                and existing_city.country_code_iso2 == country_code
+            ):
                 dist_km = haversine_distance_km(
                     existing_city.latitude,
                     existing_city.longitude,
                     lat,
                     lng,
                 )
-                if dist_km <= 25.0 and existing_city.population >= max(population, 1):
-                    is_suburb_of_accepted = True
+                if dist_km <= 15.0:
+                    is_same_city_duplicate = True
                     break
-        if is_suburb_of_accepted:
+        if is_same_city_duplicate:
             continue
 
-        db_dest = by_gid.get(geoname_id) or by_name.get(name.lower())
+        db_dest = by_gid.get(geoname_id) or (
+            by_name.get(name.lower())
+            if (not db_by_lower_name or by_name.get(name.lower(), None) and by_name[name.lower()].country_code_iso2 == country_code)
+            else None
+        )
         city_res = _build_city_result(
             geoname_id=geoname_id,
             name=db_dest.city_name if db_dest else name,
+            region_name=canonical_region,
             country_name=db_dest.country_name if db_dest else country_name,
             country_code=db_dest.country_code_iso2 if db_dest else country_code,
             latitude=lat,
             longitude=lng,
             timezone_id=timezone_id,
             population=population,
+            feature_class="P",
+            feature_code=fcode or "PPL",
+            is_region=False,
             iata_code=db_dest.iata_code if db_dest else None,
             destination_id=db_dest.id if db_dest else None,
         )
-        accepted.append(city_res)
+        city_candidates.append((is_exact_city, population, city_res))
         seen_geoname_ids.add(geoname_id)
-        seen_name_country.add((norm_city, country_code))
-        if norm_toponym:
-            seen_name_country.add((norm_toponym, country_code))
+        seen_city_region_country.add(dedup_key)
 
-    return accepted
+    # Règle A.2 : Tri par correspondance exacte puis par population décroissante
+    city_candidates.sort(key=lambda item: (1 if item[0] else 0, item[1]), reverse=True)
+    accepted: list[GeoNamesCityResult] = [item[2] for item in city_candidates]
+
+    # Règle A.5 & Finition 4 : Si aucune ville (featureClass P) ne porte le nom cherché, mais qu'il s'agit
+    # d'une région ou d'une île (ex: "bali", "toscane", "santorin", "côte d'azur", "andalousie"),
+    # ajouter une ligne "Région : <Nom>" (featureClass T ou A).
+    has_city_with_exact_query_name = bool(norm_q) and any(
+        normalize_geonames_query(c.nom) == norm_q
+        or _strip_leading_article(normalize_geonames_query(c.nom)) == _strip_leading_article(norm_q)
+        for c in accepted
+    )
+
+    if norm_q and not has_city_with_exact_query_name:
+        region_row: GeoNamesCityResult | None = None
+
+        # 1. Cherche d'abord dans les entités GeoNames de classe T (île/relief/côte) ou A (région administrative)
+        for reg_ctx in matched_region_features:
+            raw_reg = reg_ctx["raw"]
+            try:
+                r_gid = int(raw_reg.get("geonameId") or raw_reg.get("geoname_id") or 0)
+                r_lat = float(raw_reg.get("lat") if raw_reg.get("lat") is not None else raw_reg.get("latitude"))
+                r_lng = float(raw_reg.get("lng") if raw_reg.get("lng") is not None else raw_reg.get("longitude"))
+            except (TypeError, ValueError):
+                continue
+            r_country = str(raw_reg.get("countryName") or raw_reg.get("pays") or "Monde").strip() or "Monde"
+            r_cc = str(raw_reg.get("countryCode") or raw_reg.get("code_pays") or "XX").strip().upper()[:2] or "XX"
+            r_fcl = str(raw_reg.get("fcl") or raw_reg.get("featureClass") or "A").strip().upper()[:1] or "A"
+            r_fcode = str(raw_reg.get("fcode") or raw_reg.get("featureCode") or ("ISL" if r_fcl == "T" else "ADM1")).strip().upper()
+            r_pop = int(raw_reg.get("population") or 0)
+            tz_field = raw_reg.get("timezone") or raw_reg.get("fuseau_horaire")
+            r_tz = (
+                str(tz_field.get("timeZoneId") or "UTC")
+                if isinstance(tz_field, dict)
+                else str(tz_field or "UTC")
+            )
+            display_reg_name = reg_ctx["display_name"]
+            region_row = _build_city_result(
+                geoname_id=r_gid or 990000000 + abs(hash(norm_q)) % 999999,
+                name=f"Région : {display_reg_name}",
+                region_name=display_reg_name,
+                country_name=r_country,
+                country_code=r_cc,
+                latitude=r_lat,
+                longitude=r_lng,
+                timezone_id=r_tz,
+                population=r_pop,
+                feature_class=r_fcl if r_fcl in {"A", "T"} else "A",
+                feature_code=r_fcode,
+                is_region=True,
+                is_seed=False,
+            )
+            break
+
+        # 2. Si GeoNames n'a renvoyé que les villes de la région (via adminName1 ou alternateNames),
+        #    synthétise la ligne "Région : <Nom>" à partir de la région commune des villes trouvées.
+        if region_row is None and accepted:
+            first_with_reg = next((c for c in accepted if c.region), None)
+            if first_with_reg:
+                norm_first_reg = normalize_geonames_query(first_with_reg.region)
+                is_regional_result = (
+                    norm_first_reg == norm_q
+                    or norm_q in norm_first_reg
+                    or _shares_regional_stem(norm_first_reg, norm_q)
+                    or norm_q in REGION_QUERY_ALIASES
+                )
+                if is_regional_result:
+                    display_reg_name = first_with_reg.region
+                    is_island_or_coast = any(
+                        tok in norm_q
+                        for tok in ("bali", "corse", "sicile", "sardaigne", "crete", "santorin", "cote d azur")
+                    )
+                    fcl_for_reg = "T" if is_island_or_coast else "A"
+                    region_row = _build_city_result(
+                        geoname_id=first_with_reg.geonameId + 90000000,
+                        name=f"Région : {display_reg_name}",
+                        region_name=display_reg_name,
+                        country_name=first_with_reg.pays,
+                        country_code=first_with_reg.code_pays,
+                        latitude=first_with_reg.latitude,
+                        longitude=first_with_reg.longitude,
+                        timezone_id=first_with_reg.fuseau_horaire,
+                        population=sum(c.population for c in accepted),
+                        feature_class=fcl_for_reg,
+                        feature_code="ISL" if fcl_for_reg == "T" else "ADM1",
+                        is_region=True,
+                        is_seed=False,
+                    )
+
+        if region_row is not None:
+            accepted = accepted[: max(0, max_rows - 1)] + [region_row]
+
+    return accepted[:max_rows]
 
 
 async def fetch_geonames_search_json(q: str, settings: Settings) -> dict[str, Any]:
     """
-    Appelle l'API GeoNames searchJSON avec les paramètres requis :
-    featureClass=P, orderby=population, maxRows=8, lang=fr, style=FULL.
+    Appelle l'API GeoNames searchJSON :
+    - Requête `q` proprement encodée (espaces et accents : "le caire", "São Paulo", "Zürich").
+    - Paramètres : featureClass=P, orderby=population, maxRows=8, lang=fr, style=FULL.
     """
     base_url = (settings.GEONAMES_BASE_URL or "http://api.geonames.org").rstrip("/")
     url = base_url if base_url.endswith("/searchJSON") else f"{base_url}/searchJSON"
+    clean_q = re.sub(r"\s+", " ", (q or "").strip())
     params: dict[str, str | int] = {
-        "q": q,
+        "q": clean_q,
         "featureClass": "P",
         "orderby": "population",
         "maxRows": 8,
@@ -746,14 +1389,33 @@ def _enrich_destination_response(dest: Destination) -> DestinationResponse:
     ]
     city_low = (dest.city_name or "").strip().lower()
     is_seed = city_low in SEED_CITY_NAMES_LOWER
+
+    seed_region_map = {str(item["nom"]).lower(): str(item.get("region") or "") for item in SEED_CITIES_FALLBACK_CATALOG}
+    region_name = str(merged_info.get("region") or seed_region_map.get(city_low) or "").strip()
+    sous_titre = format_region_country_subtitle(region_name, dest.country_name)
+
+    nearest_airport = find_nearest_airport(
+        latitude=float(dest.latitude),
+        longitude=float(dest.longitude),
+        city_name=dest.city_name,
+        country_code=dest.country_code_iso2,
+    )
+    official_iata = str(nearest_airport["iata_code"])
+
     return DestinationResponse(
         id=dest.id,
         geoname_id=dest.geoname_id,
         geonameId=dest.geoname_id,
         city_name=dest.city_name,
+        region_name=region_name,
+        sous_titre=sous_titre,
         country_name=dest.country_name,
         country_code_iso2=dest.country_code_iso2,
-        iata_code=dest.iata_code,
+        iata_code=official_iata,
+        airport_name=str(nearest_airport["airport_name"]),
+        nearest_airport_distance_km=float(nearest_airport["distance_km"]),
+        airport_within_100km=bool(nearest_airport["within_100km"]),
+        airport_display_label=str(nearest_airport["display_label"]),
         timezone=dest.timezone,
         latitude=dest.latitude,
         longitude=dest.longitude,
@@ -900,14 +1562,15 @@ async def search_world_cities_geonames(
     - featureClass=P, orderby=population, maxRows=8, lang=fr, style=FULL (fuseau horaire).
     - Cache Redis par requête normalisée (minuscules, sans accents).
     - Quotas gratuits (1000/heure, 20000/jour) + limite par utilisateur.
-    - Si GeoNames injoignable, quota atteint ou clé absente : message "Recherche de villes indisponible"
-      et repli sur les 5 villes du seed, jamais de plantage.
+    - Règle A.3 : Les 5 villes de démonstration n'apparaissent que si leur nom correspond à la requête,
+      ou en repli quand GeoNames est injoignable.
     """
     raw_query = (q or "").strip()
     norm_q = normalize_geonames_query(raw_query)
     matched_seed, all_seed = await _build_seed_fallback_cities(db, raw_query)
+    fallback_seed = matched_seed if matched_seed else all_seed
 
-    # Moins de 3 lettres : pas d'appel GeoNames, renvoie les villes populaires correspondantes
+    # Moins de 3 lettres : pas d'appel GeoNames, renvoie uniquement les villes du seed dont le nom correspond
     if len(norm_q) < 3:
         return GeoNamesSearchResponse(
             query=raw_query,
@@ -917,13 +1580,13 @@ async def search_world_cities_geonames(
             cached=False,
             quota_exceeded=False,
             reason="min_chars",
-            message="Saisissez au moins 3 lettres pour rechercher parmi les villes du monde.",
+            message="Tapez au moins 3 lettres pour chercher dans le monde entier",
             results=matched_seed,
-            fallback_cities=all_seed,
+            fallback_cities=[],
         )
 
     # 1. Vérification du cache Redis par requête normalisée (minuscules, sans accents)
-    cache_key = f"geonames:search:v1:{norm_q}"
+    cache_key = f"geonames:search:v2:{norm_q}"
     cached_payload = await cache_client.get_json(cache_key)
     if cached_payload and isinstance(cached_payload.get("results"), list):
         db_dests = list((await db.scalars(select(Destination))).all())
@@ -937,7 +1600,6 @@ async def search_world_cities_geonames(
             item_copy = dict(item)
             if db_match:
                 item_copy["destination_id"] = db_match.id
-                item_copy["iata_code"] = db_match.iata_code
             cached_results.append(GeoNamesCityResult(**item_copy))
         return GeoNamesSearchResponse(
             query=raw_query,
@@ -949,7 +1611,7 @@ async def search_world_cities_geonames(
             reason=None,
             message=None,
             results=cached_results,
-            fallback_cities=all_seed,
+            fallback_cities=[],
         )
 
     # 2. Vérification de la présence de la clé GeoNames (GEONAMES_USERNAME)
@@ -964,7 +1626,7 @@ async def search_world_cities_geonames(
             quota_exceeded=False,
             reason="missing_api_key",
             message="Recherche de villes indisponible (clé GeoNames absente). Repli sur les 5 destinations populaires.",
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1002,7 +1664,7 @@ async def search_world_cities_geonames(
                 f"Recherche de villes indisponible : quota horaire GeoNames atteint "
                 f"({settings.GEONAMES_HOURLY_QUOTA} requêtes/heure). Repli sur les 5 villes."
             ),
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1019,7 +1681,7 @@ async def search_world_cities_geonames(
                 f"Recherche de villes indisponible : quota journalier GeoNames atteint "
                 f"({settings.GEONAMES_DAILY_QUOTA} requêtes/jour). Repli sur les 5 villes."
             ),
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1036,7 +1698,7 @@ async def search_world_cities_geonames(
                 f"Recherche de villes indisponible : limite de requêtes par utilisateur atteinte "
                 f"({settings.GEONAMES_USER_HOURLY_QUOTA}/heure). Repli sur les 5 villes."
             ),
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1058,7 +1720,7 @@ async def search_world_cities_geonames(
             quota_exceeded=False,
             reason="network_error",
             message="Recherche de villes indisponible (service GeoNames injoignable). Repli sur les 5 villes.",
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1083,7 +1745,7 @@ async def search_world_cities_geonames(
                 if is_quota
                 else "Recherche de villes indisponible. Repli sur les 5 villes."
             ),
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1098,7 +1760,7 @@ async def search_world_cities_geonames(
             quota_exceeded=False,
             reason="invalid_payload",
             message="Recherche de villes indisponible. Repli sur les 5 villes.",
-            results=matched_seed,
+            results=fallback_seed,
             fallback_cities=all_seed,
         )
 
@@ -1110,6 +1772,8 @@ async def search_world_cities_geonames(
         raw_geonames_list,
         db_by_geoname_id=by_gid,
         db_by_lower_name=by_name,
+        query=raw_query,
+        max_rows=8,
     )
 
     # Mise en cache Redis par requête normalisée (24h)
@@ -1129,7 +1793,7 @@ async def search_world_cities_geonames(
         reason=None,
         message=None,
         results=filtered_results,
-        fallback_cities=all_seed,
+        fallback_cities=[],
     )
 
 
@@ -1158,16 +1822,34 @@ async def _resolve_or_create_destination_impl(
                 select(Destination).where(func.lower(Destination.city_name) == seed_city_low)
             )
 
-    # 2. Recherche par nom de ville (insensible à la casse et aux accents)
+    # 2. Recherche par nom de ville (uniquement si pas de geoname_id contradictoire)
+    name_conflict_with_different_geoname = False
     if existing is None:
-        existing = await db.scalar(
+        candidate = await db.scalar(
             select(Destination).where(func.lower(Destination.city_name) == normalized_name.lower())
         )
-    if existing is None:
+        if candidate is not None:
+            if (
+                payload.geoname_id is not None
+                and candidate.geoname_id is not None
+                and candidate.geoname_id != payload.geoname_id
+            ):
+                name_conflict_with_different_geoname = True
+            else:
+                existing = candidate
+
+    if existing is None and not name_conflict_with_different_geoname:
         all_dests = list((await db.scalars(select(Destination))).all())
         for d in all_dests:
             if normalize_geonames_query(d.city_name) == norm_ascii:
-                existing = d
+                if (
+                    payload.geoname_id is not None
+                    and d.geoname_id is not None
+                    and d.geoname_id != payload.geoname_id
+                ):
+                    name_conflict_with_different_geoname = True
+                else:
+                    existing = d
                 break
 
     if existing is not None:
@@ -1185,10 +1867,6 @@ async def _resolve_or_create_destination_impl(
         return _enrich_destination_response(existing)
 
     preset = WORLD_CITY_GEODATA.get(normalized_name.lower(), {})
-    iata = derive_iata_code(
-        preset.get("city_name", normalized_name),
-        payload.iata_code or preset.get("iata_code"),
-    )
     lat = payload.latitude if payload.latitude is not None else preset.get("latitude", 46.2044)
     lng = payload.longitude if payload.longitude is not None else preset.get("longitude", 6.1432)
     country = (
@@ -1201,15 +1879,27 @@ async def _resolve_or_create_destination_impl(
         if payload.country_code_iso2 and payload.country_code_iso2.upper() != "XX"
         else preset.get("country_code_iso2", payload.country_code_iso2.upper())
     )
+    iata = derive_iata_code(
+        preset.get("city_name", normalized_name),
+        explicit_iata=payload.iata_code or preset.get("iata_code"),
+        latitude=float(lat),
+        longitude=float(lng),
+        country_code=iso2[:2],
+    )
     tz = (
         payload.timezone
         if payload.timezone and payload.timezone != "UTC"
         else preset.get("timezone", payload.timezone or "UTC")
     )
 
+    stored_city_name = str(preset.get("city_name", normalized_name))
+    if name_conflict_with_different_geoname:
+        disambig = (payload.region_name or country or iso2[:2]).strip()
+        stored_city_name = f"{stored_city_name} ({disambig})"[:120]
+
     new_dest = Destination(
         geoname_id=payload.geoname_id,
-        city_name=preset.get("city_name", normalized_name),
+        city_name=stored_city_name,
         country_name=country,
         country_code_iso2=iso2[:2],
         iata_code=iata,
@@ -1220,6 +1910,7 @@ async def _resolve_or_create_destination_impl(
         hero_image_url="https://images.unsplash.com/photo-1488646953014-85cb44e25828?auto=format&fit=crop&w=1400&q=80",
         description=f"Destination mondiale {normalized_name} ({country}) configurée dynamiquement.",
         practical_info={
+            "region": (payload.region_name or "").strip(),
             "visa": "Vérifier les conditions d'entrée consulaires selon votre nationalité.",
             "prises": "Types C et E (230 V - 50 Hz).",
             "pourboires": "5 % à 10 % selon la qualité du service.",

@@ -49,6 +49,7 @@ class PlaceCategory(str, Enum):
     NIGHTLIFE = "NIGHTLIFE"
     SHOPPING = "SHOPPING"
     RESTAURANT = "RESTAURANT"
+    AUTRE = "AUTRE"
 
 
 class TransitMode(str, Enum):

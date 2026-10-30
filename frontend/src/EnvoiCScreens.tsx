@@ -73,6 +73,12 @@ export interface Destination {
   hero_image_url: string;
   description: string;
   practical_info: Record<string, string>;
+  region_name?: string | null;
+  sous_titre?: string | null;
+  airport_name?: string | null;
+  nearest_airport_distance_km?: number | null;
+  airport_within_100km?: boolean | null;
+  airport_display_label?: string | null;
 }
 
 export interface Trip {
@@ -142,10 +148,25 @@ export interface PlaceItem {
   recommended_duration_min: number;
   estimated_cost: string;
   price_tier: string;
+  price_label?: string | null;
   avg_rating: number;
   opening_hours: Record<string, string>;
+  hours_status?: string | null;
+  address?: string | null;
+  website_url?: string | null;
   hero_photos: string[];
+  photo_status?: string | null;
+  photo_file_title?: string | null;
+  photo_author?: string | null;
+  photo_license?: string | null;
+  photo_commons_url?: string | null;
+  photo_source?: string | null;
+  photo_credit_text?: string | null;
+  photo_checked?: boolean;
   source_provider: string;
+  source_url?: string | null;
+  source_attribution?: string | null;
+  notoriety_score?: number;
   is_wishlisted: boolean;
   is_selected_for_trip: boolean;
 }
@@ -159,6 +180,11 @@ export interface TripGalleryPayload {
   cached_in_redis: boolean;
   selected_place_ids: string[];
   places: PlaceItem[];
+  few_places_message?: string | null;
+  can_expand_radius?: boolean;
+  suggested_radius_km?: number | null;
+  radius_km?: number;
+  outage_message?: string | null;
 }
 
 export interface SuggestedSlot {
@@ -1071,6 +1097,9 @@ export interface TravelerPreferences {
   currency: "EUR" | "USD" | "MAD" | "JPY";
   language: "fr" | "en";
   travelStyle: "ECO" | "STANDARD" | "LUXURY";
+  departureCity?: string;
+  departureIata?: string;
+  departureAirportLabel?: string;
 }
 
 
@@ -1110,7 +1139,54 @@ export function categoryLabelFr(cat: string): string {
   if (upper.includes("NIGHT")) {
     return "Soirée & Détente";
   }
+  if (upper === "AUTRE") {
+    return "Autre";
+  }
   return "Incontournable";
+}
+
+function NeutralPlaceCategoryIllustration({
+  category,
+  onClick,
+  testId,
+}: {
+  category: string;
+  onClick?: () => void;
+  testId?: string;
+}) {
+  const upper = (category || "").toUpperCase();
+  let IconComp = Compass;
+  let toneClasses = "bg-stone-100 text-stone-700";
+
+  if (upper.includes("CULTUR") || upper.includes("MUSEUM") || upper.includes("HISTOR")) {
+    IconComp = Building2;
+    toneClasses = "bg-stone-100 text-stone-700";
+  } else if (upper.includes("NATUR") || upper.includes("PARK") || upper.includes("GARDEN")) {
+    IconComp = Sun;
+    toneClasses = "bg-emerald-50/80 text-emerald-800";
+  } else if (upper.includes("FOOD") || upper.includes("RESTAURANT") || upper.includes("GASTRO")) {
+    IconComp = Utensils;
+    toneClasses = "bg-amber-50/80 text-amber-800";
+  } else if (upper.includes("NIGHT")) {
+    IconComp = Sparkles;
+    toneClasses = "bg-slate-100 text-slate-800";
+  }
+
+  return (
+    <div
+      data-testid={testId}
+      onClick={onClick}
+      className={`h-full w-full flex flex-col items-center justify-center p-6 text-center select-none ${
+        onClick ? "cursor-pointer" : ""
+      } ${toneClasses}`}
+    >
+      <div className="flex h-14 w-14 items-center justify-center rounded-full bg-white/80 shadow-sm mb-3">
+        <IconComp className="h-7 w-7" aria-hidden="true" />
+      </div>
+      <span className="text-caption font-semibold">{categoryLabelFr(category)}</span>
+      <span className="text-caption opacity-80 mt-0.5">Photo bientôt disponible</span>
+    </div>
+  );
 }
 
 export function normalizeSchedulePayload(raw: any): TripItinerarySchedule {
@@ -1189,12 +1265,18 @@ export function AccommodationsScreen({
   destination,
   selectedAccommodation,
   onSelectAccommodation,
+  departureDate,
+  returnDate,
+  travelers,
 }: {
   apiBase: string;
   trip: Trip | null;
   destination: Destination | null;
   selectedAccommodation: AccommodationItem | null;
   onSelectAccommodation: (acc: AccommodationItem) => void;
+  departureDate?: string;
+  returnDate?: string;
+  travelers?: string;
 }) {
   const navigate = useNavigate();
   const { notify } = useToast();
@@ -1504,47 +1586,137 @@ export function AccommodationsScreen({
               ))}
             </div>
           ) : accommodations.length === 0 ? (
-            <Card
-              className="p-8 text-center space-y-3"
-              data-testid="accommodations-empty-state"
-            >
-              <Building2 className="h-8 w-8 text-brand-700 mx-auto" />
-              <h2 className="text-h2 text-ink">
-                {destination &&
-                !["paris", "marrakech", "tokyo", "new york", "rome"].includes(
-                  destination.city_name.trim().toLowerCase()
-                )
-                  ? `Hébergements simulés : ${destination.city_name} n'est pas couverte en simulation`
-                  : "Aucun hébergement pour ces critères"}
-              </h2>
-              <p className="text-body text-ink-secondary max-w-lg mx-auto">
-                {destination &&
-                !["paris", "marrakech", "tokyo", "new york", "rome"].includes(
-                  destination.city_name.trim().toLowerCase()
-                )
-                  ? `Les hébergements restent simulés pour l'instant et la ville de ${destination.city_name} n'est pas couverte en simulation (seules Paris, Marrakech, Tokyo, New York et Rome disposent d'hébergements simulés).`
-                  : "Essayez d'élargir votre budget ou d'afficher à la fois les hôtels et les logements Airbnb."}
-              </p>
-              <div className="flex flex-wrap items-center justify-center gap-3 pt-1">
-                <Button
-                  type="button"
-                  data-testid="accommodations-continue-activities-btn"
-                  onClick={() => navigate("/activities")}
+            (() => {
+              const isCustomWorldCity = Boolean(
+                destination &&
+                  !["paris", "marrakech", "tokyo", "new york", "rome"].includes(
+                    destination.city_name.trim().toLowerCase()
+                  )
+              );
+              const targetCity = destination?.city_name || "votre destination";
+              const checkinIso = (
+                departureDate ||
+                (trip?.arrival_at ? trip.arrival_at.slice(0, 10) : "2026-11-10")
+              ).slice(0, 10);
+              const checkoutIso = (
+                returnDate ||
+                (trip?.departure_at ? trip.departure_at.slice(0, 10) : "2026-11-17")
+              ).slice(0, 10);
+              const adultsCount = Math.max(
+                1,
+                parseInt(String(travelers || "2").replace(/[^0-9]/g, ""), 10) || 2
+              );
+              const bookingUrl = `https://www.booking.com/searchresults.fr.html?ss=${encodeURIComponent(
+                targetCity
+              )}&checkin=${encodeURIComponent(checkinIso)}&checkout=${encodeURIComponent(
+                checkoutIso
+              )}&group_adults=${adultsCount}&no_rooms=1`;
+              const airbnbUrl = `https://www.airbnb.fr/s/${encodeURIComponent(
+                targetCity
+              )}/homes?checkin=${encodeURIComponent(checkinIso)}&checkout=${encodeURIComponent(
+                checkoutIso
+              )}&adults=${adultsCount}`;
+
+              return (
+                <Card
+                  className="p-8 text-center space-y-3"
+                  data-testid="accommodations-empty-state"
                 >
-                  Voir la galerie de lieux
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  onClick={() => {
-                    setAccTypeFilter("ALL");
-                    setMaxBudget("2000");
-                  }}
-                >
-                  Afficher tous les hébergements
-                </Button>
-              </div>
-            </Card>
+                  <Building2 className="h-8 w-8 text-brand-700 mx-auto" />
+                  <h2 className="text-h2 text-ink" data-testid="accommodations-empty-title">
+                    {isCustomWorldCity
+                      ? `Nous n'avons pas encore d'hébergements à afficher pour ${targetCity}`
+                      : "Aucun hébergement pour ces critères"}
+                  </h2>
+                  <p className="text-body text-ink-secondary max-w-lg mx-auto">
+                    {isCustomWorldCity
+                      ? `Consultez directement les offres disponibles à ${targetCity} du ${checkinIso} au ${checkoutIso} pour ${adultsCount} voyageur${
+                          adultsCount > 1 ? "s" : ""
+                        }, ou poursuivez l'organisation de votre séjour.`
+                      : "Essayez d'élargir votre budget ou d'afficher à la fois les hôtels et les logements Airbnb."}
+                  </p>
+
+                  {isCustomWorldCity && (
+                    <div className="pt-2 flex flex-col items-center gap-3">
+                      <div className="inline-flex flex-wrap items-center justify-center gap-2">
+                        <a
+                          href={bookingUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          data-testid="accommodations-search-primary-btn"
+                          className="inline-flex items-center justify-center gap-2 rounded-control px-5 py-2.5 text-sm font-semibold bg-accent text-white hover:bg-accent-hover shadow-subtle transition-colors"
+                        >
+                          <span>{`Rechercher un hébergement à ${targetCity}`}</span>
+                          <span aria-hidden="true">↗</span>
+                        </a>
+                      </div>
+
+                      <div
+                        className="inline-flex flex-wrap items-center justify-center gap-2 rounded-control border border-border bg-canvas-subtle px-3 py-1.5 text-xs"
+                        role="group"
+                        aria-label="Choisir une plateforme d'hébergement"
+                        data-testid="accommodations-compare-menu"
+                      >
+                        <span className="text-ink-muted font-medium">Ouvrir sur :</span>
+                        <a
+                          href={bookingUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          data-testid="accommodations-compare-booking"
+                          className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
+                        >
+                          Booking ↗
+                        </a>
+                        <span className="text-border" aria-hidden="true">
+                          •
+                        </span>
+                        <a
+                          href={airbnbUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          data-testid="accommodations-compare-airbnb"
+                          className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
+                        >
+                          Airbnb ↗
+                        </a>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                    <Button
+                      type="button"
+                      variant={isCustomWorldCity ? "secondary" : "primary"}
+                      data-testid="accommodations-continue-activities-btn"
+                      onClick={() => navigate("/activities")}
+                    >
+                      Voir les lieux de la ville
+                    </Button>
+                    {isCustomWorldCity ? (
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        data-testid="accommodations-modify-search-btn"
+                        onClick={() => navigate("/")}
+                      >
+                        Modifier ma recherche
+                      </Button>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={() => {
+                          setAccTypeFilter("ALL");
+                          setMaxBudget("2000");
+                        }}
+                      >
+                        Afficher tous les hébergements
+                      </Button>
+                    )}
+                  </div>
+                </Card>
+              );
+            })()
           ) : (
             accommodations.map((acc, idx) => {
               const isSelected = selectedAccommodation?.id === acc.id;
@@ -1845,13 +2017,14 @@ export function ActivitiesScreen({
   trip: Trip | null;
   destination: Destination | null;
   gallery: TripGalleryPayload | null;
-  onRefreshGallery: () => Promise<void>;
+  onRefreshGallery: (category?: string, radiusKm?: number) => Promise<void>;
 }) {
   const navigate = useNavigate();
   const { notify } = useToast();
 
   const [categoryFilter, setCategoryFilter] = useState<string>("ALL");
   const [schedule, setSchedule] = useState<TripItinerarySchedule | null>(null);
+  const [expandingRadius, setExpandingRadius] = useState<boolean>(false);
 
   // Petit panneau d'ajout (3 champs : jour, heure, durée préremplie)
   const [addPanelPlace, setAddPanelPlace] = useState<PlaceItem | null>(null);
@@ -1864,6 +2037,8 @@ export function ActivitiesScreen({
 
   // Modale Aperçu plein écran
   const [fullscreenPlace, setFullscreenPlace] = useState<PlaceItem | null>(null);
+  const [enrichedPlacesById, setEnrichedPlacesById] = useState<Record<string, PlaceItem>>({});
+  const enrichedRequestKeysRef = useRef<Set<string>>(new Set());
 
   const cityLabel = destination?.city_name || gallery?.city_name || "votre destination";
 
@@ -1889,15 +2064,90 @@ export function ActivitiesScreen({
       .catch(() => null);
   }, [trip?.id, token]);
 
+  // Étape 3 : Récupération des photos en arrière-plan après l'affichage de la liste (la galerie ne bloque pas)
+  const uncheckedWorldPlaceIdsKey = useMemo(() => {
+    if (!gallery?.places?.length) return "";
+    return gallery.places
+      .filter((p) => {
+        const merged = enrichedPlacesById[p.id] || p;
+        return (
+          merged.source_provider !== "simulated" &&
+          !merged.photo_checked &&
+          !(merged.hero_photos && merged.hero_photos.length > 0 && merged.photo_author)
+        );
+      })
+      .map((p) => p.id)
+      .join(",");
+  }, [gallery?.places, enrichedPlacesById]);
+
+  useEffect(() => {
+    if (!trip?.id || !token || !uncheckedWorldPlaceIdsKey) return;
+    const radiusKm = gallery?.radius_km || 10;
+    const reqKey = `${trip.id}:${radiusKm}:${uncheckedWorldPlaceIdsKey}`;
+    if (enrichedRequestKeysRef.current.has(reqKey)) return;
+    enrichedRequestKeysRef.current.add(reqKey);
+
+    fetch(
+      `${apiBase}/api/v1/places/trip/${trip.id}/photos/enrich?radius_km=${radiusKm}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then((enrichedGallery: TripGalleryPayload | null) => {
+        if (!enrichedGallery?.places?.length) return;
+        setEnrichedPlacesById((prev) => {
+          const next = { ...prev };
+          for (const pl of enrichedGallery.places) {
+            next[pl.id] = pl;
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        enrichedRequestKeysRef.current.delete(reqKey);
+      });
+  }, [trip?.id, token, uncheckedWorldPlaceIdsKey, gallery?.radius_km, apiBase]);
+
   const tripDays = useMemo(() => buildTripDayDates(schedule), [schedule]);
 
-  const filteredPlaces = useMemo(() => {
+  const mergedPlaces = useMemo(() => {
     const list = gallery?.places || [];
+    return list.map((p) => (enrichedPlacesById[p.id] ? { ...p, ...enrichedPlacesById[p.id] } : p));
+  }, [gallery, enrichedPlacesById]);
+
+  const activeFullscreenPlace = useMemo(() => {
+    if (!fullscreenPlace) return null;
+    return enrichedPlacesById[fullscreenPlace.id]
+      ? { ...fullscreenPlace, ...enrichedPlacesById[fullscreenPlace.id] }
+      : fullscreenPlace;
+  }, [fullscreenPlace, enrichedPlacesById]);
+
+  const filteredPlaces = useMemo(() => {
+    const list = mergedPlaces;
     if (categoryFilter === "ALL") return list;
-    return list.filter((p) =>
-      p.category.toUpperCase().includes(categoryFilter.toUpperCase())
-    );
-  }, [gallery, categoryFilter]);
+    const filterUpper = categoryFilter.toUpperCase();
+    return list.filter((p) => {
+      const catUpper = (p.category || "").toUpperCase();
+      if (filterUpper === "FOOD" || filterUpper === "RESTAURANT") {
+        return catUpper.includes("FOOD") || catUpper.includes("RESTAURANT");
+      }
+      if (filterUpper === "NIGHTLIFE") {
+        return catUpper.includes("NIGHT");
+      }
+      return catUpper.includes(filterUpper);
+    });
+  }, [mergedPlaces, categoryFilter]);
+
+  async function handleExpandRadiusTo30Km() {
+    setExpandingRadius(true);
+    try {
+      await onRefreshGallery("", gallery?.suggested_radius_km || 30);
+    } finally {
+      setExpandingRadius(false);
+    }
+  }
 
   function openAddPanel(place: PlaceItem) {
     setAddPanelPlace(place);
@@ -2040,6 +2290,8 @@ export function ActivitiesScreen({
           { value: "CULTURE", label: "Culture & Patrimoine" },
           { value: "NATURE", label: "Parcs & Nature" },
           { value: "FOOD", label: "Gastronomie" },
+          { value: "NIGHTLIFE", label: "Soirée & Détente" },
+          { value: "AUTRE", label: "Autre" },
         ].map((cat) => (
           <button
             key={cat.value}
@@ -2056,12 +2308,51 @@ export function ActivitiesScreen({
         ))}
       </div>
 
-      {/* Grille de grandes photos ou message 'Les lieux de cette ville arrivent bientôt' */}
+      {/* Bandeau de panne éventuel */}
+      {gallery?.outage_message && (gallery.places || []).length > 0 && (
+        <div
+          data-testid="places-outage-banner"
+          className="rounded-card border border-amber-300 bg-feedback-warningBg px-4 py-3 text-caption font-medium text-feedback-warning"
+        >
+          {gallery.outage_message}
+        </div>
+      )}
+
+      {/* Bandeau moins de 5 lieux + proposition d'élargir le rayon à 30 km */}
+      {gallery?.few_places_message && (
+        <div
+          data-testid="few-places-banner"
+          className="rounded-card border border-border bg-canvas-subtle px-4 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <p className="text-body font-medium text-ink" data-testid="few-places-message-text">
+            {gallery.few_places_message}
+          </p>
+          {gallery.can_expand_radius && (
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={expandingRadius}
+              data-testid="expand-radius-30km-btn"
+              onClick={handleExpandRadiusTo30Km}
+            >
+              <Compass className="h-4 w-4" />
+              <span>
+                {expandingRadius
+                  ? "Recherche à 30 km..."
+                  : `Élargir le rayon à ${gallery.suggested_radius_km || 30} km`}
+              </span>
+            </Button>
+          )}
+        </div>
+      )}
+
+      {/* Grille de lieux ou état de panne / peu de lieux */}
       {!gallery ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
           {[1, 2, 3, 4, 5, 6].map((n) => (
             <Card key={n} className="overflow-hidden">
-              <Skeleton className="aspect-[4/3] w-full rounded-none" />
+              <Skeleton className="aspect-[16/9] w-full rounded-none" />
               <div className="p-5 space-y-3">
                 <Skeleton className="h-5 w-2/3" />
                 <Skeleton className="h-4 w-full" />
@@ -2071,28 +2362,74 @@ export function ActivitiesScreen({
           ))}
         </div>
       ) : (gallery.places || []).length === 0 ? (
-        <Card
-          className="p-8 text-center space-y-3"
-          data-testid="places-coming-soon-card"
-        >
-          <Compass className="h-8 w-8 text-brand-700 mx-auto" />
-          <h2 className="text-h2 text-ink" data-testid="places-coming-soon-title">
-            Les lieux de cette ville arrivent bientôt
-          </h2>
-          <p className="text-body text-ink-secondary max-w-lg mx-auto">
-            La destination {cityLabel} a bien été créée. Aucune donnée de lieu n'est inventée : le catalogue de lieux réels sera enrichi à l'étape suivante.
-          </p>
-        </Card>
+        gallery.outage_message ? (
+          <Card
+            className="p-8 text-center space-y-3"
+            data-testid="places-outage-card"
+          >
+            <Compass className="h-8 w-8 text-brand-700 mx-auto" />
+            <h2 className="text-h2 text-ink" data-testid="places-outage-title">
+              {gallery.outage_message}
+            </h2>
+            <p className="text-body text-ink-secondary max-w-lg mx-auto">
+              Aucune donnée n'est inventée. Réessayez dans quelques instants.
+            </p>
+          </Card>
+        ) : (
+          <Card
+            className="p-8 text-center space-y-4"
+            data-testid="few-places-empty-card"
+          >
+            <Compass className="h-8 w-8 text-brand-700 mx-auto" />
+            <h2 className="text-h2 text-ink" data-testid="few-places-empty-title">
+              {gallery.few_places_message ||
+                `Peu de lieux disponibles à ${cityLabel} pour l'instant`}
+            </h2>
+            {gallery.can_expand_radius && (
+              <div className="pt-1">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  disabled={expandingRadius}
+                  data-testid="expand-radius-30km-btn"
+                  onClick={handleExpandRadiusTo30Km}
+                >
+                  <Compass className="h-4 w-4" />
+                  <span>
+                    {expandingRadius
+                      ? "Recherche à 30 km..."
+                      : `Élargir le rayon à ${gallery.suggested_radius_km || 30} km`}
+                  </span>
+                </Button>
+              </div>
+            )}
+          </Card>
+        )
       ) : (
         <div
           className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6"
           data-testid="activities-photo-grid"
         >
           {filteredPlaces.map((place, idx) => {
-            const photoUrl =
-              place.hero_photos?.[0] ||
-              destination?.hero_image_url ||
-              FALLBACK_PLACE_IMAGE;
+            const realPhotoUrl = place.hero_photos?.[0] || "";
+            const photoCreditText =
+              place.photo_credit_text ||
+              (place.photo_author && place.photo_license
+                ? `Photo : ${place.photo_author}, ${place.photo_license}`
+                : null);
+            const showCreditStrip =
+              place.source_provider !== "simulated" || Boolean(photoCreditText);
+            const hoursText =
+              place.opening_hours?.display ||
+              place.opening_hours?.mon ||
+              place.hours_status ||
+              "non renseigné";
+            const priceText =
+              place.price_label ||
+              (Number(place.estimated_cost) > 0
+                ? `${Math.round(Number(place.estimated_cost))} €`
+                : "non renseigné");
 
             return (
               <Card
@@ -2101,21 +2438,31 @@ export function ActivitiesScreen({
                 className="overflow-hidden flex flex-col justify-between group hover:shadow-cardHover transition-shadow"
               >
                 <div>
-                  {/* Grande photo avec aperçu plein écran */}
-                  <div className="relative aspect-[4/3] w-full overflow-hidden bg-canvas-subtle">
-                    <img
-                      src={photoUrl}
-                      alt={place.name}
-                      width={640}
-                      height={480}
-                      loading="eager"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => {
-                        e.currentTarget.src = FALLBACK_PLACE_IMAGE;
-                      }}
-                      onClick={() => setFullscreenPlace(place)}
-                      className="h-full w-full object-cover cursor-pointer transition-transform duration-300 group-hover:scale-105"
-                    />
+                  {/* Photo du lieu en 16/9 avec dimensions réservées (pas de saut de page) ou illustration neutre */}
+                  <div
+                    className="relative aspect-[16/9] w-full overflow-hidden bg-canvas-subtle"
+                    data-testid={`place-media-box-${idx}`}
+                  >
+                    {realPhotoUrl ? (
+                      <img
+                        src={realPhotoUrl}
+                        alt={place.name}
+                        width={800}
+                        height={450}
+                        loading="lazy"
+                        decoding="async"
+                        referrerPolicy="no-referrer"
+                        data-testid={`place-photo-img-${idx}`}
+                        onClick={() => setFullscreenPlace(place)}
+                        className="h-full w-full object-cover cursor-pointer transition-transform duration-300 group-hover:scale-105"
+                      />
+                    ) : (
+                      <NeutralPlaceCategoryIllustration
+                        category={place.category}
+                        onClick={() => setFullscreenPlace(place)}
+                        testId={`place-photo-placeholder-${idx}`}
+                      />
+                    )}
                     <div className="absolute top-3 left-3 flex items-center gap-1.5">
                       <Badge className="bg-white/95 text-ink shadow-sm">
                         {categoryLabelFr(place.category)}
@@ -2132,6 +2479,42 @@ export function ActivitiesScreen({
                     </button>
                   </div>
 
+                  {/* Sous la photo : crédit Commons obligatoire avec hauteur fixe réservée (0 saut de mise en page) */}
+                  {showCreditStrip && (
+                    <div
+                      className="h-7 px-3 flex items-center bg-canvas-subtle/70 border-b border-border/60 text-caption text-ink-muted"
+                      data-testid={`place-photo-credit-${idx}`}
+                    >
+                      {photoCreditText ? (
+                        place.photo_commons_url ? (
+                          <a
+                            href={place.photo_commons_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            data-testid={`place-photo-credit-link-${idx}`}
+                            className="truncate underline decoration-border hover:text-brand-700 transition-colors"
+                          >
+                            {photoCreditText}
+                          </a>
+                        ) : (
+                          <span
+                            className="truncate"
+                            data-testid={`place-photo-credit-text-${idx}`}
+                          >
+                            {photoCreditText}
+                          </span>
+                        )
+                      ) : (
+                        <span
+                          className="truncate"
+                          data-testid={`place-photo-credit-empty-${idx}`}
+                        >
+                          Photo bientôt disponible
+                        </span>
+                      )}
+                    </div>
+                  )}
+
                   <div className="p-5">
                     <div className="flex items-center justify-between gap-2 text-caption text-ink-muted">
                       <span className="inline-flex items-center gap-1">
@@ -2139,7 +2522,7 @@ export function ActivitiesScreen({
                         Durée conseillée : {place.recommended_duration_min} min
                       </span>
                       <span className="font-semibold text-ink">
-                        ★ {place.avg_rating.toFixed(1)}
+                        {place.is_outdoor ? "Extérieur" : "Intérieur"}
                       </span>
                     </div>
 
@@ -2147,6 +2530,68 @@ export function ActivitiesScreen({
                     <p className="text-caption text-ink-secondary mt-1 line-clamp-2">
                       {place.description}
                     </p>
+
+                    <div className="mt-3 space-y-1 text-caption text-ink-secondary">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-ink-muted">Horaires :</span>
+                        <span
+                          className="font-medium text-ink text-right truncate max-w-[65%]"
+                          data-testid={`place-hours-${idx}`}
+                        >
+                          {hoursText}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-ink-muted">Tarif :</span>
+                        <span
+                          className="font-medium text-ink text-right truncate max-w-[65%]"
+                          data-testid={`place-price-${idx}`}
+                        >
+                          {priceText}
+                        </span>
+                      </div>
+                      {place.address && (
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-ink-muted">Adresse :</span>
+                          <span className="text-ink text-right truncate max-w-[65%]">
+                            {place.address}
+                          </span>
+                        </div>
+                      )}
+                      {place.website_url && (
+                        <div className="pt-0.5">
+                          <a
+                            href={place.website_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-brand-700 underline hover:text-brand-800"
+                          >
+                            Site officiel
+                          </a>
+                        </div>
+                      )}
+                    </div>
+
+                    {place.source_attribution && (
+                      <div
+                        className="mt-3 pt-2 border-t border-border/60 text-caption text-ink-muted"
+                        data-testid={`place-attribution-${idx}`}
+                      >
+                        {place.source_url ? (
+                          <a
+                            href={place.source_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            data-testid={`place-attribution-link-${idx}`}
+                            className="underline decoration-border hover:text-brand-700 transition-colors"
+                          >
+                            {place.source_attribution}
+                          </a>
+                        ) : (
+                          <span>{place.source_attribution}</span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -2157,7 +2602,7 @@ export function ActivitiesScreen({
                     size="sm"
                     onClick={() => setFullscreenPlace(place)}
                   >
-                    Aperçu photo
+                    Aperçu du lieu
                   </Button>
                   <Button
                     type="button"
@@ -2313,60 +2758,113 @@ export function ActivitiesScreen({
 
       {/* Modale Aperçu plein écran */}
       <Modal
-        open={Boolean(fullscreenPlace)}
+        open={Boolean(activeFullscreenPlace)}
         onOpenChange={(open) => {
           if (!open) setFullscreenPlace(null);
         }}
-        title={fullscreenPlace?.name || "Aperçu du lieu"}
+        title={activeFullscreenPlace?.name || "Aperçu du lieu"}
         description={
-          fullscreenPlace ? categoryLabelFr(fullscreenPlace.category) : undefined
+          activeFullscreenPlace
+            ? categoryLabelFr(activeFullscreenPlace.category)
+            : undefined
         }
         maxWidthClass="max-w-3xl"
       >
-        {fullscreenPlace && (
+        {activeFullscreenPlace && (
           <div className="space-y-4" data-testid="fullscreen-place-modal">
-            <div className="aspect-[16/10] w-full overflow-hidden rounded-card bg-canvas-subtle">
-              <img
-                src={
-                  fullscreenPlace.hero_photos?.[0] ||
-                  destination?.hero_image_url ||
-                  FALLBACK_PLACE_IMAGE
-                }
-                alt={fullscreenPlace.name}
-                width={960}
-                height={600}
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  e.currentTarget.src = FALLBACK_PLACE_IMAGE;
-                }}
-                className="h-full w-full object-cover"
-              />
+            <div className="overflow-hidden rounded-card bg-canvas-subtle border border-border/60">
+              <div className="aspect-[16/9] w-full overflow-hidden bg-canvas-subtle">
+                {activeFullscreenPlace.hero_photos?.[0] ? (
+                  <img
+                    src={activeFullscreenPlace.hero_photos[0]}
+                    alt={activeFullscreenPlace.name}
+                    width={800}
+                    height={450}
+                    loading="lazy"
+                    decoding="async"
+                    referrerPolicy="no-referrer"
+                    data-testid="fullscreen-place-photo-img"
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <NeutralPlaceCategoryIllustration
+                    category={activeFullscreenPlace.category}
+                    testId="fullscreen-place-photo-placeholder"
+                  />
+                )}
+              </div>
+              {(activeFullscreenPlace.photo_credit_text ||
+                (activeFullscreenPlace.photo_author &&
+                  activeFullscreenPlace.photo_license)) && (
+                <div
+                  className="px-4 py-2 bg-canvas-subtle/80 border-t border-border/60 text-caption text-ink-muted"
+                  data-testid="fullscreen-photo-credit"
+                >
+                  {activeFullscreenPlace.photo_commons_url ? (
+                    <a
+                      href={activeFullscreenPlace.photo_commons_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-testid="fullscreen-photo-credit-link"
+                      className="underline decoration-border hover:text-brand-700 transition-colors"
+                    >
+                      {activeFullscreenPlace.photo_credit_text ||
+                        `Photo : ${activeFullscreenPlace.photo_author}, ${activeFullscreenPlace.photo_license}`}
+                    </a>
+                  ) : (
+                    <span>
+                      {activeFullscreenPlace.photo_credit_text ||
+                        `Photo : ${activeFullscreenPlace.photo_author}, ${activeFullscreenPlace.photo_license}`}
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
 
             <p className="text-body text-ink-secondary">
-              {fullscreenPlace.description}
+              {activeFullscreenPlace.description}
             </p>
 
             <div className="flex flex-wrap items-center justify-between gap-4 rounded-card bg-canvas-subtle p-4">
               <div className="space-y-0.5">
                 <div className="text-caption text-ink-muted">Durée conseillée</div>
                 <div className="text-body font-semibold text-ink">
-                  {fullscreenPlace.recommended_duration_min} minutes
+                  {activeFullscreenPlace.recommended_duration_min} minutes
                 </div>
               </div>
               <div className="space-y-0.5">
                 <div className="text-caption text-ink-muted">Environnement</div>
                 <div className="text-body font-semibold text-ink">
-                  {fullscreenPlace.is_outdoor ? "En plein air" : "En intérieur"}
+                  {activeFullscreenPlace.is_outdoor ? "En plein air" : "En intérieur"}
                 </div>
               </div>
               <div className="space-y-0.5">
-                <div className="text-caption text-ink-muted">Appréciation</div>
+                <div className="text-caption text-ink-muted">Horaires</div>
                 <div className="text-body font-semibold text-ink">
-                  ★ {fullscreenPlace.avg_rating.toFixed(1)} / 5
+                  {activeFullscreenPlace.opening_hours?.display ||
+                    activeFullscreenPlace.opening_hours?.mon ||
+                    activeFullscreenPlace.hours_status ||
+                    "non renseigné"}
                 </div>
               </div>
             </div>
+
+            {activeFullscreenPlace.source_attribution && (
+              <div className="text-caption text-ink-muted">
+                {activeFullscreenPlace.source_url ? (
+                  <a
+                    href={activeFullscreenPlace.source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-border hover:text-brand-700"
+                  >
+                    {activeFullscreenPlace.source_attribution}
+                  </a>
+                ) : (
+                  <span>{activeFullscreenPlace.source_attribution}</span>
+                )}
+              </div>
+            )}
 
             <div className="flex justify-end gap-3 pt-2">
               <Button
@@ -2379,9 +2877,9 @@ export function ActivitiesScreen({
               <Button
                 type="button"
                 onClick={() => {
-                  const p = fullscreenPlace;
+                  const p = activeFullscreenPlace;
                   setFullscreenPlace(null);
-                  openAddPanel(p);
+                  if (p) openAddPanel(p);
                 }}
               >
                 <Plus className="h-4 w-4" />
@@ -8081,11 +8579,13 @@ export function SettingsScreen({
   onSavePreferences,
   currentUser,
   onLogout,
+  departureCityNode,
 }: {
   preferences: TravelerPreferences;
   onSavePreferences: (prefs: TravelerPreferences) => void;
   currentUser: UserProfile | null;
   onLogout: () => void;
+  departureCityNode?: React.ReactNode;
 }) {
   const { notify } = useToast();
   const [currency, setCurrency] = useState<TravelerPreferences["currency"]>(
@@ -8114,7 +8614,12 @@ export function SettingsScreen({
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    onSavePreferences({ currency, language, travelStyle });
+    onSavePreferences({
+      ...preferences,
+      currency,
+      language,
+      travelStyle,
+    });
     saveVoiceAccessibilitySettings(voiceSettings);
     notify({
       title: "Préférences enregistrées",
@@ -8138,7 +8643,7 @@ export function SettingsScreen({
         </p>
       </div>
 
-      <Card className="p-6 sm:p-8">
+      <Card className="p-6 sm:p-8 overflow-visible">
         <form onSubmit={handleSubmit} className="space-y-5" data-testid="settings-form">
           {/* Champ 1 : Devise */}
           <div>
@@ -8196,6 +8701,12 @@ export function SettingsScreen({
               ]}
             />
           </div>
+
+          {departureCityNode && (
+            <div data-testid="settings-departure-city-section" className="overflow-visible">
+              {departureCityNode}
+            </div>
+          )}
 
           <div className="pt-2 flex items-center justify-between gap-3">
             {currentUser && (

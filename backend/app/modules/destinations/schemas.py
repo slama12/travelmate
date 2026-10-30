@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 class DestinationResolveRequest(BaseModel):
     geoname_id: int | None = Field(default=None, description="Identifiant unique GeoNames (geonameId)")
     city_name: str = Field(..., min_length=2, max_length=120)
+    region_name: str | None = Field(default=None, max_length=120)
     country_name: str = Field(default="Monde", min_length=2, max_length=120)
     country_code_iso2: str = Field(default="XX", min_length=2, max_length=2)
     iata_code: str | None = Field(default=None, min_length=3, max_length=3)
@@ -30,6 +31,16 @@ class DestinationResolveRequest(BaseModel):
             for alias in ("nom", "name", "toponymName"):
                 if out.get(alias):
                     out["city_name"] = str(out[alias]).strip()
+                    break
+
+        if isinstance(out.get("city_name"), str) and out["city_name"].startswith("Région : "):
+            out["city_name"] = out["city_name"].replace("Région : ", "", 1).strip()
+
+        # region / adminName1 -> region_name
+        if not out.get("region_name"):
+            for alias in ("region", "adminName1"):
+                if out.get(alias):
+                    out["region_name"] = str(out[alias]).strip()
                     break
 
         # pays / countryName / country -> country_name
@@ -79,8 +90,11 @@ class GeoNamesCityResult(BaseModel):
     nom: str
     name: str
     city_name: str
+    region: str = ""
+    region_name: str = ""
     pays: str
     country_name: str
+    sous_titre: str = ""
     code_pays: str
     country_code_iso2: str
     coordonnees: dict[str, float]
@@ -90,7 +104,14 @@ class GeoNamesCityResult(BaseModel):
     fuseau_horaire: str
     timezone: str
     population: int = 0
-    iata_code: str = "XXX"
+    feature_class: str = "P"
+    feature_code: str = "PPL"
+    is_region: bool = False
+    iata_code: str = "CDG"
+    airport_name: str = ""
+    nearest_airport_distance_km: float = 0.0
+    airport_within_100km: bool = True
+    airport_display_label: str = ""
     is_seed: bool = False
     destination_id: str | None = None
 
@@ -156,9 +177,15 @@ class DestinationResponse(BaseModel):
     geoname_id: int | None = None
     geonameId: int | None = None
     city_name: str
+    region_name: str = ""
+    sous_titre: str = ""
     country_name: str
     country_code_iso2: str
     iata_code: str
+    airport_name: str = ""
+    nearest_airport_distance_km: float = 0.0
+    airport_within_100km: bool = True
+    airport_display_label: str = ""
     timezone: str
     latitude: float
     longitude: float

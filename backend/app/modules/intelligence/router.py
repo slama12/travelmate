@@ -792,9 +792,15 @@ async def generate_ai_itinerary_draft(
     trip_dates = _compute_trip_dates_local(trip, dest_tz)
 
     places_res = await db.scalars(
-        select(Place).where(Place.destination_id == destination.id).order_by(Place.avg_rating.desc())
+        select(Place)
+        .where(Place.destination_id == destination.id)
+        .order_by(Place.notoriety_score.desc(), Place.avg_rating.desc())
     )
     db_places = list(places_res.all())
+    if not db_places and destination.city_name.strip().lower() not in {"tokyo", "rome", "new york", "marrakech", "paris"}:
+        from app.modules.places.router import ensure_destination_world_places
+
+        db_places, _, _ = await ensure_destination_world_places(db=db, dest=destination)
     if not db_places:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1396,9 +1402,15 @@ async def _build_safe_trip_context_for_chat(
         }
 
     dest_places_res = await db.scalars(
-        select(Place).where(Place.destination_id == destination.id).order_by(Place.avg_rating.desc())
+        select(Place)
+        .where(Place.destination_id == destination.id)
+        .order_by(Place.notoriety_score.desc(), Place.avg_rating.desc())
     )
     dest_places = list(dest_places_res.all())
+    if not dest_places and destination.city_name.strip().lower() not in {"tokyo", "rome", "new york", "marrakech", "paris"}:
+        from app.modules.places.router import ensure_destination_world_places
+
+        dest_places, _, _ = await ensure_destination_world_places(db=db, dest=destination)
     all_places_by_id = {p.id: p for p in dest_places}
     all_places_by_id.update(places_map)
 
@@ -1647,6 +1659,7 @@ def _format_unscheduled_places_info(
         "FOOD": "Restaurant",
         "NIGHTLIFE": "Vie nocturne",
         "NIGHT": "Vie nocturne",
+        "AUTRE": "Autre",
     }
     lines: list[str] = []
     for p in places_by_id.values():
@@ -2273,14 +2286,18 @@ async def send_trip_chat_message(
         loc_quals = {
             "medina", "marrakech", "maroc", "gueliz", "hivernage", "kasbah", "mellah",
             "mouassine", "aguedal", "palmeraie", "paris", "france", "rome", "italie",
-            "tokyo", "japon", "new", "york",
+            "tokyo", "japon", "new", "york", "lisbonne", "lisboa", "portugal", "monastir",
+            "tunisie", "milan", "milano",
         }
+        for tok in _norm_txt_local(destination.city_name).split():
+            if len(tok) >= 3:
+                loc_quals.add(tok)
         heads = {
             "palais", "jardin", "jardins", "musee", "museum", "place", "mosquee", "parc",
             "cafe", "restaurant", "tour", "quartier", "galerie", "cathedrale", "basilique",
             "chateau", "temple", "sanctuaire", "memorial", "pont", "marche", "hotel",
             "maison", "fondation", "centre", "opera", "theatre", "tombeaux", "medersa",
-            "riad", "fontaine", "statue",
+            "riad", "fontaine", "statue", "monastere", "mosteiro", "castelo", "torre",
         }
         main_part = re.split(r"[\(\&]", cand_name)[0].strip()
         p_main_norm = _norm_txt_local(main_part) or p_norm

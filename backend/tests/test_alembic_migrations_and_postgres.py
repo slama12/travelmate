@@ -65,8 +65,10 @@ def test_alembic_revision_ids_do_not_exceed_32_characters() -> None:
         "0004_weather_ai_chat",
         "0005_step5a_budget_docs_rbac",
         "0006_world_cities_geonames",
+        "0007_world_places_step2",
+        "0008_place_photos_step3",
     }.issubset(revision_ids)
-    assert script_dir.get_current_head() == "0006_world_cities_geonames"
+    assert script_dir.get_current_head() == "0008_place_photos_step3"
 
 
 def _resolve_postgres_admin_and_test_urls() -> tuple[str, str, str, str]:
@@ -164,13 +166,13 @@ async def test_postgres_alembic_upgrade_head_from_empty_db_and_idempotent_seed()
         alembic_cfg = _make_alembic_config(db_url=test_sync_url)
         command.upgrade(alembic_cfg, "head")
 
-        # Vérifie sur PostgreSQL que alembic_version contient bien '0006_world_cities_geonames'
-        # dans une colonne VARCHAR(32) et que les nouvelles colonnes des étapes 4, 5A et 0006 existent
+        # Vérifie sur PostgreSQL que alembic_version contient bien '0008_place_photos_step3'
+        # dans une colonne VARCHAR(32) et que les nouvelles colonnes des étapes 4, 5A, 0006, 0007 et 0008 existent
         verify_engine = create_engine(test_sync_url)
         with verify_engine.connect() as conn:
             assert conn.dialect.name == "postgresql"
             version_num = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            assert version_num == "0006_world_cities_geonames"
+            assert version_num == "0008_place_photos_step3"
             assert len(version_num) <= MAX_ALEMBIC_VERSION_NUM_LEN
 
             col_max_len = conn.execute(
@@ -244,6 +246,33 @@ async def test_postgres_alembic_upgrade_head_from_empty_db_and_idempotent_seed()
                 ).fetchall()
             }
             assert {"geoname_id", "population"}.issubset(dest_cols)
+
+            places_cols = {
+                row[0]
+                for row in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'places'"
+                    )
+                ).fetchall()
+            }
+            assert {
+                "source_provider",
+                "external_place_id",
+                "address",
+                "website_url",
+                "price_label",
+                "hours_status",
+                "source_url",
+                "source_attribution",
+                "notoriety_score",
+                "photo_file_title",
+                "photo_author",
+                "photo_license",
+                "photo_commons_url",
+                "photo_source",
+                "photo_checked_at",
+            }.issubset(places_cols)
         verify_engine.dispose()
 
         # 2. Exécute le seed une 1re fois puis une 2de fois sur PostgreSQL et vérifie l'idempotence

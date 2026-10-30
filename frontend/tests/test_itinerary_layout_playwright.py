@@ -86,7 +86,7 @@ def _ensure_wsl_bridge() -> subprocess.Popen[Any] | None:
     return proc
 
 
-def test_mon_programme_layout_5_widths_playwright() -> dict[str, Any]:
+def test_mon_programme_layout_5_widths_playwright() -> None:
     """
     Test automatisé de rendu Playwright sur "Mon programme" aux 5 largeurs
     (390, 768, 1024, 1280 et 1440 px), chat fermé et chat ouvert :
@@ -511,7 +511,16 @@ def test_mon_programme_layout_5_widths_playwright() -> dict[str, Any]:
         if bridge_proc is not None:
             bridge_proc.terminate()
 
-    return report
+    assert "widths" in report
+    assert set(report["widths"].keys()) == {"390", "768", "1024", "1280", "1440"}
+    for w_key, w_metrics in report["widths"].items():
+        assert "ferme" in w_metrics and "ouvert" in w_metrics, f"Largeur {w_key} incomplète : {w_metrics}"
+        assert w_metrics["ferme"]["overlapsDetected"] == 0
+        assert w_metrics["ouvert"]["overlapsDetected"] == 0
+        assert w_metrics["ferme"]["pillsClippedCount"] == 0
+        assert w_metrics["ouvert"]["pillsClippedCount"] == 0
+        assert w_metrics["ferme"]["titleLineCount"] <= 2
+        assert w_metrics["ouvert"]["titleLineCount"] <= 2
 
 
 def test_real_chat_marrakech_jardin_secret_medina_and_single_row_header() -> None:
@@ -538,7 +547,8 @@ def test_real_chat_marrakech_jardin_secret_medina_and_single_row_header() -> Non
             page = context.new_page()
 
             page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
-            page.wait_for_timeout(1000)
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
+            page.wait_for_timeout(500)
 
             page.evaluate(
                 """async (apiUrl) => {
@@ -635,6 +645,7 @@ def test_real_chat_marrakech_jardin_secret_medina_and_single_row_header() -> Non
 
             page.goto(f"{BASE_URL}/itinerary", wait_until="domcontentloaded", timeout=20000)
             page.wait_for_selector('[data-testid="itinerary-page-title"]', timeout=15000)
+            page.wait_for_selector('[data-testid="timeline-visit-card-0"]', timeout=15000)
 
             if page.locator('[data-testid="floating-chat-panel"]').count() == 0:
                 page.locator('[data-testid="floating-chat-bubble-btn"]').click()
@@ -1166,6 +1177,127 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
                     )
                     return
 
+                if "zzzinconnu" in url.lower():
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(
+                            {
+                                "query": "zzzinconnu",
+                                "normalized_query": "zzzinconnu",
+                                "available": True,
+                                "fallback": False,
+                                "cached": False,
+                                "quota_exceeded": False,
+                                "message": None,
+                                "results": [],
+                                "fallback_cities": [],
+                            }
+                        ),
+                    )
+                    return
+
+                if "monastir" in url.lower():
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(
+                            {
+                                "query": "monastir",
+                                "normalized_query": "monastir",
+                                "available": True,
+                                "fallback": False,
+                                "cached": False,
+                                "quota_exceeded": False,
+                                "message": None,
+                                "results": [
+                                    {
+                                        "geonameId": 2473493,
+                                        "geoname_id": 2473493,
+                                        "nom": "Monastir",
+                                        "name": "Monastir",
+                                        "city_name": "Monastir",
+                                        "pays": "Tunisie",
+                                        "country_name": "Tunisie",
+                                        "code_pays": "TN",
+                                        "country_code_iso2": "TN",
+                                        "region": "Monastir",
+                                        "region_name": "Monastir",
+                                        "sous_titre": "Monastir • Tunisie",
+                                        "coordonnees": {"latitude": 35.77799, "longitude": 10.82617},
+                                        "fuseau_horaire": "Africa/Tunis",
+                                        "timezone": "Africa/Tunis",
+                                        "population": 104535,
+                                        "iata_code": "MIR",
+                                        "airport_within_100km": True,
+                                        "airport_display_label": "Monastir (MIR)",
+                                        "is_seed": False,
+                                    }
+                                ],
+                                "fallback_cities": [],
+                            }
+                        ),
+                    )
+                    return
+
+                if "springfield" in url.lower():
+                    # 8 lignes pour vérifier que la liste (8 lignes max) passe par-dessus le bandeau photo
+                    # et est entièrement visible et cliquable
+                    eight_rows = [
+                        {
+                            "geonameId": 4409896 + idx,
+                            "geoname_id": 4409896 + idx,
+                            "nom": "Springfield",
+                            "name": "Springfield",
+                            "city_name": "Springfield",
+                            "pays": "États-Unis" if idx < 7 else "Australie",
+                            "country_name": "États-Unis" if idx < 7 else "Australie",
+                            "code_pays": "US" if idx < 7 else "AU",
+                            "country_code_iso2": "US" if idx < 7 else "AU",
+                            "region": state_name,
+                            "region_name": state_name,
+                            "sous_titre": f"{state_name} • {'États-Unis' if idx < 7 else 'Australie'}",
+                            "coordonnees": {"latitude": 37.2153, "longitude": -93.2982},
+                            "fuseau_horaire": "America/Chicago",
+                            "timezone": "America/Chicago",
+                            "population": 170000 - idx * 15000,
+                            "iata_code": "SGF",
+                            "airport_within_100km": True,
+                            "airport_display_label": "Springfield (SGF)",
+                            "is_seed": False,
+                        }
+                        for idx, state_name in enumerate(
+                            [
+                                "Missouri",
+                                "Massachusetts",
+                                "Illinois",
+                                "Ohio",
+                                "Oregon",
+                                "Virginie",
+                                "Floride",
+                                "Queensland",
+                            ]
+                        )
+                    ]
+                    route.fulfill(
+                        status=200,
+                        content_type="application/json",
+                        body=json.dumps(
+                            {
+                                "query": "springfield",
+                                "normalized_query": "springfield",
+                                "available": True,
+                                "fallback": False,
+                                "cached": False,
+                                "quota_exceeded": False,
+                                "message": None,
+                                "results": eight_rows,
+                                "fallback_cities": [],
+                            }
+                        ),
+                    )
+                    return
+
                 route.fulfill(
                     status=200,
                     content_type="application/json",
@@ -1189,11 +1321,16 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
                                     "country_name": "Portugal",
                                     "code_pays": "PT",
                                     "country_code_iso2": "PT",
+                                    "region": "Lisbonne",
+                                    "region_name": "Lisbonne",
+                                    "sous_titre": "Lisbonne • Portugal",
                                     "coordonnees": {"latitude": 38.71667, "longitude": -9.13333},
                                     "fuseau_horaire": "Europe/Lisbon",
                                     "timezone": "Europe/Lisbon",
                                     "population": 517802,
                                     "iata_code": "LIS",
+                                    "airport_within_100km": True,
+                                    "airport_display_label": "Lisbonne (LIS)",
                                     "is_seed": False,
                                 }
                             ],
@@ -1234,44 +1371,342 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
             popular_cards = page.locator('[data-testid="popular-destinations-grid"] > div').count()
             assert popular_cards == 5, f"Attendu 5 villes populaires du seed, obtenu {popular_cards}"
 
-            # 2. Moins de 3 lettres ('li') -> pas d'appel GeoNames
+            # 2. Placeholder "Ville ou pays" et moins de 3 lettres ('li') -> mention d'aide, pas d'appel GeoNames
             dest_input = page.locator('[data-testid="home-destination-input"]')
+            assert dest_input.get_attribute("placeholder") == "Ville ou pays"
             dest_input.fill("li")
-            page.wait_for_timeout(400)
+            page.wait_for_selector('[data-testid="autocomplete-min-chars-hint"]', timeout=5000)
+            hint_text = page.locator('[data-testid="autocomplete-min-chars-hint"]').inner_text()
+            assert "Tapez au moins 3 lettres pour chercher dans le monde entier" in hint_text
+            page.wait_for_timeout(380)
             assert len(search_requests) == 0
 
-            # 3. Saisie >= 3 lettres ('lisbonne') -> appel après l'anti-rebond de 300 ms
+            # 2b. Aucune ville trouvée -> message "Aucune ville trouvée pour « zzzinconnu »"
+            dest_input.fill("zzzinconnu")
+            page.wait_for_selector('[data-testid="autocomplete-empty"]', timeout=10000)
+            empty_msg = page.locator('[data-testid="autocomplete-empty"]').inner_text()
+            assert "Aucune ville trouvée pour" in empty_msg
+            assert "zzzinconnu" in empty_msg
+
+            # 2c. Liste de 8 lignes ('springfield') : passe par-dessus le bandeau photo (overflow visible, z-index élevé),
+            #     entièrement visible et cliquable
+            dest_input.fill("springfield")
+            page.wait_for_selector('[data-testid="home-autocomplete-list"] [role="option"]', timeout=10000)
+            options_loc = page.locator('[data-testid="home-autocomplete-list"] [role="option"]')
+            assert options_loc.count() == 8
+
+            assert options_loc.nth(7).is_visible()
+            visibility_check = page.evaluate(
+                """() => {
+                  const banner = document.querySelector('[data-testid="home-hero-banner"]');
+                  const list = document.querySelector('[data-testid="home-autocomplete-list"]');
+                  const options = Array.from(document.querySelectorAll('[data-testid="home-autocomplete-list"] [role="option"]'));
+                  if (!banner || !list || options.length !== 8) return { ok: false, reason: "missing_elements" };
+                  const bannerStyle = window.getComputedStyle(banner);
+                  const listStyle = window.getComputedStyle(list);
+                  const lastOpt = options[options.length - 1];
+                  lastOpt.scrollIntoView({ block: "nearest" });
+                  const rect = lastOpt.getBoundingClientRect();
+                  const centerX = rect.left + rect.width / 2;
+                  const centerY = rect.top + rect.height / 2;
+                  const hitEl = document.elementFromPoint(centerX, centerY);
+                  const hitInsideLastOpt = hitEl ? (lastOpt === hitEl || lastOpt.contains(hitEl)) : false;
+                  return {
+                    ok: true,
+                    bannerOverflowX: bannerStyle.overflowX,
+                    bannerOverflowY: bannerStyle.overflowY,
+                    listZIndex: Number(listStyle.zIndex || 0),
+                    lastOptHeight: rect.height,
+                    hitInsideLastOpt,
+                    listText: list.innerText,
+                  };
+                }"""
+            )
+            assert visibility_check["ok"] is True
+            assert visibility_check["bannerOverflowX"] == "visible"
+            assert visibility_check["bannerOverflowY"] == "visible"
+            assert visibility_check["listZIndex"] >= 100
+            assert visibility_check["lastOptHeight"] > 20
+            assert visibility_check["hitInsideLastOpt"] is True, (
+                f"La 8e ligne de la liste est rognée ou masquée : {visibility_check}"
+            )
+            assert "Missouri • États-Unis" in visibility_check["listText"]
+            assert "Queensland • Australie" in visibility_check["listText"]
+            assert "America/Chicago" not in visibility_check["listText"]
+
+            # 3. Saisie >= 3 lettres ('lisbonne') -> affiche 'Lisbonne • Portugal' sans fuseau horaire
             dest_input.fill("lisbonne")
             page.wait_for_selector('[data-testid="autocomplete-city-lisbonne"]', timeout=10000)
-            assert len(search_requests) >= 1
             option_text = page.locator('[data-testid="autocomplete-city-lisbonne"]').inner_text()
             assert "Lisbonne" in option_text
-            assert "Portugal" in option_text
-            assert "Europe/Lisbon" in option_text
+            assert "Lisbonne • Portugal" in option_text
+            assert "Europe/Lisbon" not in option_text
+            assert "Africa/Casablanca" not in option_text
+            assert "Asia/Makassar" not in option_text
 
             # 4. Sélection de Lisbonne et validation -> création de la destination et navigation vers /flights
             page.locator('[data-testid="autocomplete-city-lisbonne"]').click()
             page.locator('[data-testid="home-search-btn"]').click()
 
-            # 5. Sur /flights : message clair indiquant que Lisbonne n'est pas couverte par les vols simulés
+            # 5. Sur /flights : message "Nous n'avons pas encore de vols à afficher pour Lisbonne"
+            #    (sans les mots "simulé", "simulation", "démonstration"), bouton principal
+            #    "Comparer les vols <départ> → Lisbonne" + petit menu Google Flights / Kayak / Skyscanner
+            #    avec codes aéroport et dates préremplis sans donnée personnelle, et actions secondaires.
             page.wait_for_selector('[data-testid="flights-empty-state"]', timeout=15000)
             flights_empty_text = page.locator('[data-testid="flights-empty-state"]').inner_text()
-            assert "Lisbonne" in flights_empty_text
-            assert "simul" in flights_empty_text.lower()
+            assert "Nous n'avons pas encore de vols à afficher pour Lisbonne" in flights_empty_text
+            for banned_word in ("simulé", "simulés", "simulation", "démonstration"):
+                assert banned_word not in flights_empty_text.lower(), (
+                    f"Mot interdit '{banned_word}' trouvé dans l'écran Vols : {flights_empty_text!r}"
+                )
 
-            # 6. Navigation vers /accommodations : message clair pour les hébergements simulés
+            primary_compare_btn = page.locator('[data-testid="flights-compare-primary-btn"]')
+            assert primary_compare_btn.is_visible()
+            assert "Comparer les vols Paris → Lisbonne" in primary_compare_btn.inner_text()
+            assert primary_compare_btn.get_attribute("target") == "_blank"
+            assert primary_compare_btn.get_attribute("rel") == "noopener noreferrer"
+
+            origin_input = page.locator('[data-testid="flights-origin-input"]')
+            dest_flight_input = page.locator('[data-testid="flights-destination-input"]')
+            assert origin_input.is_visible()
+            assert dest_flight_input.is_visible()
+
+            origin_input.fill("monastir")
+            page.wait_for_selector(
+                '[data-testid="flights-origin-autocomplete-list"] [data-testid="autocomplete-city-monastir"]',
+                timeout=10000,
+            )
+            monastir_opt_text = page.locator(
+                '[data-testid="flights-origin-autocomplete-list"] [data-testid="autocomplete-city-monastir"]'
+            ).inner_text()
+            assert "Monastir • Tunisie" in monastir_opt_text
+            assert "MIR" in monastir_opt_text
+            assert "MON" not in monastir_opt_text
+            assert "Africa/Tunis" not in monastir_opt_text
+            page.locator(
+                '[data-testid="flights-origin-autocomplete-list"] [data-testid="autocomplete-city-monastir"]'
+            ).click()
+            route_sub = page.locator('[data-testid="flights-route-subtitle"]').inner_text()
+            assert "Monastir (MIR)" in route_sub
+
+            # Après sélection de Monastir (MIR), le bouton principal et les 3 comparateurs utilisent MIR -> LIS
+            assert "Comparer les vols Monastir → Lisbonne" in primary_compare_btn.inner_text()
+            for comp_testid, expected_domain in (
+                ("flights-compare-google", "google.com/travel/flights"),
+                ("flights-compare-kayak", "kayak.fr/flights"),
+                ("flights-compare-skyscanner", "skyscanner.fr/transport/vols"),
+            ):
+                comp_link = page.locator(f'[data-testid="{comp_testid}"]')
+                assert comp_link.is_visible()
+                assert comp_link.get_attribute("target") == "_blank"
+                assert comp_link.get_attribute("rel") == "noopener noreferrer"
+                href = comp_link.get_attribute("href") or ""
+                assert expected_domain in href
+                assert "mir" in href.lower()
+                assert "lis" in href.lower()
+                assert "2026-11-10" in href
+                assert "2026-11-17" in href
+                assert "playwright.geonames" not in href.lower()
+                assert "voyageur" not in href.lower()
+
+            # Actions secondaires de l'écran Vols
+            assert "Continuer vers l'hébergement" in page.locator(
+                '[data-testid="flights-continue-accommodations-btn"]'
+            ).inner_text()
+            assert "Voir les lieux de la ville" in page.locator(
+                '[data-testid="flights-continue-activities-btn"]'
+            ).inner_text()
+            assert "Modifier ma recherche" in page.locator(
+                '[data-testid="flights-modify-search-btn"]'
+            ).inner_text()
+
+            # 6. Navigation vers /accommodations : "Rechercher un hébergement à Lisbonne" avec Booking et Airbnb préremplis
             page.locator('[data-testid="flights-continue-accommodations-btn"]').click()
             page.wait_for_selector('[data-testid="accommodations-empty-state"]', timeout=15000)
             acc_empty_text = page.locator('[data-testid="accommodations-empty-state"]').inner_text()
-            assert "Lisbonne" in acc_empty_text
-            assert "simul" in acc_empty_text.lower()
+            assert "Nous n'avons pas encore d'hébergements à afficher pour Lisbonne" in acc_empty_text
+            for banned_word in ("simulé", "simulés", "simulation", "démonstration"):
+                assert banned_word not in acc_empty_text.lower(), (
+                    f"Mot interdit '{banned_word}' trouvé dans l'écran Hébergements : {acc_empty_text!r}"
+                )
 
-            # 7. Navigation vers /activities : "Les lieux de cette ville arrivent bientôt" (aucun lieu inventé)
+            acc_primary_btn = page.locator('[data-testid="accommodations-search-primary-btn"]')
+            assert acc_primary_btn.is_visible()
+            assert "Rechercher un hébergement à Lisbonne" in acc_primary_btn.inner_text()
+            assert acc_primary_btn.get_attribute("target") == "_blank"
+            assert acc_primary_btn.get_attribute("rel") == "noopener noreferrer"
+
+            for acc_testid, expected_domain in (
+                ("accommodations-compare-booking", "booking.com"),
+                ("accommodations-compare-airbnb", "airbnb.fr"),
+            ):
+                acc_link = page.locator(f'[data-testid="{acc_testid}"]')
+                assert acc_link.is_visible()
+                assert acc_link.get_attribute("target") == "_blank"
+                assert acc_link.get_attribute("rel") == "noopener noreferrer"
+                href = acc_link.get_attribute("href") or ""
+                assert expected_domain in href
+                assert "lisbonne" in href.lower()
+                assert "2026-11-10" in href
+                assert "2026-11-17" in href
+                assert "2" in href
+                assert "playwright.geonames" not in href.lower()
+
+            # 7. Navigation vers /activities (Étape 2) : vraie galerie Wikivoyage/Wikipédia avec
+            #    illustration neutre par catégorie, "Photo bientôt disponible", attribution CC BY-SA 4.0
+            #    cliquable et bandeau "Peu de lieux disponibles à Lisbonne pour l'instant" (< 5 lieux) + bouton 30 km
+            def _handle_lisbonne_gallery(route: Any) -> None:
+                url = route.request.url
+                is_expanded = "radius_km=30" in url
+                places_list = [
+                    {
+                        "id": "place-lis-belem",
+                        "name": "Tour de Belém",
+                        "category": "CULTURE",
+                        "category_label": "Culture & Musées",
+                        "description": "Tour fortifiée manuéline emblématique au bord du Tage.",
+                        "latitude": 38.6916,
+                        "longitude": -9.2160,
+                        "is_outdoor": False,
+                        "recommended_duration_min": 60,
+                        "estimated_cost": 8.0,
+                        "price_tier": "ECONOMIC",
+                        "price_label": "8 €",
+                        "avg_rating": 4.8,
+                        "notoriety_score": 195.0,
+                        "opening_hours": {"status": "confirmé", "display": "10:00-17:30", "mon": "10:00-17:30"},
+                        "hours_status": "confirmé",
+                        "hero_photos": [],
+                        "photo_status": "Photo bientôt disponible",
+                        "photo_checked": True,
+                        "source_provider": "Wikivoyage",
+                        "external_place_id": "wv:fr:Lisbonne:tour-de-belem",
+                        "source_url": "https://fr.wikivoyage.org/wiki/Lisbonne",
+                        "source_attribution": "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)",
+                        "already_in_itinerary": False,
+                        "scheduled_slots": [],
+                    },
+                    {
+                        "id": "place-lis-timeout",
+                        "name": "Time Out Market Lisboa",
+                        "category": "RESTAURANT",
+                        "category_label": "Gastronomie",
+                        "description": "Grand marché gourmand réunissant les chefs lisboètes.",
+                        "latitude": 38.7072,
+                        "longitude": -9.1459,
+                        "is_outdoor": False,
+                        "recommended_duration_min": 90,
+                        "estimated_cost": 20.0,
+                        "price_tier": "STANDARD",
+                        "price_label": "non renseigné",
+                        "avg_rating": 4.6,
+                        "notoriety_score": 170.0,
+                        "opening_hours": {"status": "horaires non confirmés", "display": "Tous les jours de 10h à minuit"},
+                        "hours_status": "horaires non confirmés",
+                        "hero_photos": [],
+                        "photo_status": "Photo bientôt disponible",
+                        "photo_checked": True,
+                        "source_provider": "Wikivoyage",
+                        "external_place_id": "wv:fr:Lisbonne:time-out-market",
+                        "source_url": "https://fr.wikivoyage.org/wiki/Lisbonne",
+                        "source_attribution": "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)",
+                        "already_in_itinerary": False,
+                        "scheduled_slots": [],
+                    },
+                ]
+                if is_expanded:
+                    places_list.extend(
+                        [
+                            {
+                                "id": f"place-lis-extra-{idx}",
+                                "name": f"Palais de Sintra {idx}",
+                                "category": "CULTURE",
+                                "category_label": "Culture & Musées",
+                                "description": "Palais historique dans la région de Lisbonne.",
+                                "latitude": 38.7876,
+                                "longitude": -9.3906,
+                                "is_outdoor": False,
+                                "recommended_duration_min": 120,
+                                "estimated_cost": 14.0,
+                                "price_tier": "STANDARD",
+                                "price_label": "14 €",
+                                "avg_rating": 4.7,
+                                "notoriety_score": 160.0 - idx,
+                                "opening_hours": {"status": "non renseigné", "display": "non renseigné"},
+                                "hours_status": "non renseigné",
+                                "hero_photos": [],
+                                "photo_status": "Photo bientôt disponible",
+                                "photo_checked": True,
+                                "source_provider": "Wikipedia",
+                                "external_place_id": f"wp:fr:sintra-{idx}",
+                                "source_url": "https://fr.wikipedia.org/wiki/Palais_national_de_Sintra",
+                                "source_attribution": "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)",
+                                "already_in_itinerary": False,
+                                "scheduled_slots": [],
+                            }
+                            for idx in range(1, 5)
+                        ]
+                    )
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "trip_id": "trip-lisbonne",
+                            "destination_id": "dest-lisbonne",
+                            "city_name": "Lisbonne",
+                            "country_name": "Portugal",
+                            "destination_timezone": "Europe/Lisbon",
+                            "currency": "EUR",
+                            "unlocked": True,
+                            "unlock_message": "Galerie déverrouillée",
+                            "provider_mode": "wikivoyage_wikipedia",
+                            "cached_in_redis": True,
+                            "selected_place_ids": [],
+                            "total_places": len(places_list),
+                            "places_coming_soon": False,
+                            "places_unavailable": False,
+                            "places_message": None,
+                            "few_places_message": (
+                                None
+                                if len(places_list) >= 5
+                                else "Peu de lieux disponibles à Lisbonne pour l'instant"
+                            ),
+                            "can_expand_radius": len(places_list) < 5,
+                            "current_radius_km": 30 if is_expanded else 10,
+                            "suggested_radius_km": 30,
+                            "categories_available": ["ALL", "CULTURE", "RESTAURANT"],
+                            "places": places_list,
+                        }
+                    ),
+                )
+
+            page.route("**/api/v1/places/trip/*/gallery*", _handle_lisbonne_gallery)
             page.locator('[data-testid="accommodations-continue-activities-btn"]').click()
-            page.wait_for_selector('[data-testid="places-coming-soon-card"]', timeout=15000)
-            coming_soon_title = page.locator('[data-testid="places-coming-soon-title"]').inner_text().strip()
-            assert coming_soon_title == "Les lieux de cette ville arrivent bientôt"
-            assert page.locator('[data-testid^="activity-card-"]').count() == 0
+            page.wait_for_selector('[data-testid="activities-photo-grid"]', timeout=15000)
+            page.wait_for_selector('[data-testid="place-photo-placeholder-0"]', timeout=15000)
+            assert page.locator('[data-testid="places-coming-soon-card"]').count() == 0
+            assert page.locator('[data-testid^="place-photo-placeholder-"]').count() == 2
+
+            placeholder_0 = page.locator('[data-testid="place-photo-placeholder-0"]')
+            assert placeholder_0.is_visible()
+            assert "Photo bientôt disponible" in placeholder_0.inner_text()
+
+            attr_link_0 = page.locator('[data-testid="place-attribution-link-0"]')
+            assert attr_link_0.is_visible()
+            assert "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)" in attr_link_0.inner_text()
+            assert attr_link_0.get_attribute("href") == "https://fr.wikivoyage.org/wiki/Lisbonne"
+
+            few_banner = page.locator('[data-testid="few-places-banner"]')
+            assert few_banner.is_visible()
+            assert "Peu de lieux disponibles à Lisbonne pour l'instant" in few_banner.inner_text()
+            expand_btn = page.locator('[data-testid="expand-radius-30km-btn"]')
+            assert expand_btn.is_visible()
+            expand_btn.click()
+            page.wait_for_function(
+                "() => document.querySelectorAll('[data-testid^=\"place-photo-placeholder-\"]').length === 6",
+                timeout=10000,
+            )
 
             # 8. Retour à l'accueil : les 5 villes du seed restent seules dans les destinations populaires,
             #    et si GeoNames est indisponible / quota atteint, message "Recherche de villes indisponible" + repli
@@ -1292,11 +1727,545 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
             bridge_proc.terminate()
 
 
+def test_home_barcelone_geonames_autocomplete_visible_clickable_no_timezone_playwright() -> None:
+    """
+    Point 3 — Test Playwright dédié de l'accueil :
+    Saisie de "barcelone" (fausse réponse GeoNames), liste entièrement visible au-dessus du bandeau photo,
+    cliquable, sans aucun fuseau horaire affiché.
+    """
+    bridge_proc = _ensure_wsl_bridge()
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+
+            def handle_barcelone_search(route: Any, request: Any) -> None:
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "query": "barcelone",
+                            "normalized_query": "barcelone",
+                            "available": True,
+                            "fallback": False,
+                            "cached": False,
+                            "quota_exceeded": False,
+                            "message": None,
+                            "results": [
+                                {
+                                    "geonameId": 3128760,
+                                    "geoname_id": 3128760,
+                                    "nom": "Barcelone",
+                                    "name": "Barcelone",
+                                    "city_name": "Barcelone",
+                                    "pays": "Espagne",
+                                    "country_name": "Espagne",
+                                    "code_pays": "ES",
+                                    "country_code_iso2": "ES",
+                                    "region": "Catalogne",
+                                    "region_name": "Catalogne",
+                                    "sous_titre": "Catalogne • Espagne",
+                                    "coordonnees": {"latitude": 41.38879, "longitude": 2.15899},
+                                    "fuseau_horaire": "Europe/Madrid",
+                                    "timezone": "Europe/Madrid",
+                                    "population": 1620343,
+                                    "iata_code": "BCN",
+                                    "airport_within_100km": True,
+                                    "airport_display_label": "Barcelone (BCN)",
+                                    "is_seed": False,
+                                },
+                                {
+                                    "geonameId": 3648559,
+                                    "geoname_id": 3648559,
+                                    "nom": "Barcelona",
+                                    "name": "Barcelona",
+                                    "city_name": "Barcelona",
+                                    "pays": "Venezuela",
+                                    "country_name": "Venezuela",
+                                    "code_pays": "VE",
+                                    "country_code_iso2": "VE",
+                                    "region": "Anzoátegui",
+                                    "region_name": "Anzoátegui",
+                                    "sous_titre": "Anzoátegui • Venezuela",
+                                    "coordonnees": {"latitude": 10.13625, "longitude": -64.68618},
+                                    "fuseau_horaire": "America/Caracas",
+                                    "timezone": "America/Caracas",
+                                    "population": 424795,
+                                    "iata_code": "BLA",
+                                    "airport_within_100km": True,
+                                    "airport_display_label": "Barcelona (BLA)",
+                                    "is_seed": False,
+                                },
+                                {
+                                    "geonameId": 2525362,
+                                    "geoname_id": 2525362,
+                                    "nom": "Barcellona Pozzo di Gotto",
+                                    "name": "Barcellona Pozzo di Gotto",
+                                    "city_name": "Barcellona Pozzo di Gotto",
+                                    "pays": "Italie",
+                                    "country_name": "Italie",
+                                    "code_pays": "IT",
+                                    "country_code_iso2": "IT",
+                                    "region": "Sicile",
+                                    "region_name": "Sicile",
+                                    "sous_titre": "Sicile • Italie",
+                                    "coordonnees": {"latitude": 38.1481, "longitude": 15.2148},
+                                    "fuseau_horaire": "Europe/Rome",
+                                    "timezone": "Europe/Rome",
+                                    "population": 41569,
+                                    "iata_code": "CTA",
+                                    "airport_within_100km": True,
+                                    "airport_display_label": "Catane (CTA)",
+                                    "is_seed": False,
+                                },
+                            ],
+                            "fallback_cities": [],
+                        }
+                    ),
+                )
+
+            page.route("**/api/v1/destinations/search*", handle_barcelone_search)
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="home-destination-input"]', timeout=15000)
+
+            dest_input = page.locator('[data-testid="home-destination-input"]')
+            dest_input.fill("barcelone")
+
+            page.wait_for_selector('[data-testid="home-autocomplete-list"] [role="option"]', timeout=10000)
+            options = page.locator('[data-testid="home-autocomplete-list"] [role="option"]')
+            assert options.count() == 3
+
+            # Vérifie que toute la liste est entièrement visible au-dessus du bandeau photo et non rognée
+            barcelone_layout = page.evaluate(
+                """() => {
+                  const banner = document.querySelector('[data-testid="home-hero-banner"]');
+                  const list = document.querySelector('[data-testid="home-autocomplete-list"]');
+                  const opts = Array.from(document.querySelectorAll('[data-testid="home-autocomplete-list"] [role="option"]'));
+                  if (!banner || !list || opts.length === 0) {
+                    return { ok: false, reason: "missing_dom" };
+                  }
+                  const bannerStyle = window.getComputedStyle(banner);
+                  const listStyle = window.getComputedStyle(list);
+                  const listRect = list.getBoundingClientRect();
+                  const bannerRect = banner.getBoundingClientRect();
+                  const allClickable = opts.every((opt) => {
+                    const r = opt.getBoundingClientRect();
+                    const cx = r.left + r.width / 2;
+                    const cy = r.top + r.height / 2;
+                    const hit = document.elementFromPoint(cx, cy);
+                    return r.width > 100 && r.height > 24 && Boolean(hit && (hit === opt || opt.contains(hit)));
+                  });
+                  return {
+                    ok: true,
+                    bannerOverflowX: bannerStyle.overflowX,
+                    bannerOverflowY: bannerStyle.overflowY,
+                    listZIndex: Number(listStyle.zIndex || 0),
+                    allClickable,
+                    extendsBelowBannerOrVisible: listRect.bottom > bannerRect.top && listRect.height > 100,
+                    listText: list.innerText,
+                    pageText: document.body.innerText,
+                  };
+                }"""
+            )
+            assert barcelone_layout["ok"] is True
+            assert barcelone_layout["bannerOverflowX"] == "visible"
+            assert barcelone_layout["bannerOverflowY"] == "visible"
+            assert barcelone_layout["listZIndex"] >= 100
+            assert barcelone_layout["allClickable"] is True, (
+                f"Les options d'autocomplétion de 'barcelone' ne sont pas toutes visibles/cliquables : {barcelone_layout}"
+            )
+            assert "Barcelone" in barcelone_layout["listText"]
+            assert "Catalogne • Espagne" in barcelone_layout["listText"]
+            assert "BCN" in barcelone_layout["listText"]
+
+            # Aucun fuseau horaire affiché dans la liste ni sur l'écran d'accueil
+            for tz in ("Europe/Madrid", "America/Caracas", "Europe/Rome", "Africa/Casablanca", "Asia/Makassar"):
+                assert tz not in barcelone_layout["listText"], f"Fuseau horaire {tz} affiché dans la liste !"
+                assert tz not in barcelone_layout["pageText"], f"Fuseau horaire {tz} affiché sur la page !"
+
+            # Cliquable : le clic sur Barcelone remplit le champ avec "Barcelone"
+            page.locator('[data-testid="autocomplete-city-barcelone"]').click()
+            assert dest_input.input_value() == "Barcelone"
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
+def test_world_places_step3_photos_visible_credit_and_no_layout_shift_playwright() -> None:
+    """
+    Étape 3 — Test Playwright dans Docker :
+    - Affichage initial non bloquant de la galerie avec illustration neutre et dimensions 16/9 réservées
+    - Enrichissement asynchrone en arrière-plan (POST /api/v1/places/trip/{id}/photos/enrich)
+    - Image 16/9 visible (vignette ~800 px, lazy loading), crédit 'Photo : <auteur>, <licence>'
+      affiché sous la photo avec lien vers la page Commons
+    - Aucun saut de mise en page (dimensions de la boîte média, de la bande de crédit et de la carte
+      strictement identiques avant et après le chargement de la photo)
+    - Aperçu plein écran avec les mêmes crédits Commons
+    - Lieu sans photo : illustration neutre existante et 'Photo bientôt disponible', jamais la photo d'un autre lieu.
+    """
+    bridge_proc = _ensure_wsl_bridge()
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+
+            # Image 800x450 encodée en SVG data URI pour un rendu instantané et déterministe dans Chromium sans dépendance réseau externe
+            svg_800x450 = (
+                "data:image/svg+xml;utf8,"
+                "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='450' viewBox='0 0 800 450'>"
+                "<rect width='800' height='450' fill='%232c5e4f'/>"
+                "<text x='400' y='225' fill='white' font-size='28' text-anchor='middle'>Castelo de Sao Jorge 800x450</text>"
+                "</svg>"
+            )
+
+            base_places = [
+                {
+                    "id": "place-step3-castelo",
+                    "destination_id": "dest-lisbonne-step3",
+                    "city_name": "Lisbonne",
+                    "name": "Castelo de São Jorge",
+                    "description": "Château historique surplombant les toits de l'Alfama à Lisbonne.",
+                    "category": "CULTURE",
+                    "is_outdoor": True,
+                    "latitude": 38.7139,
+                    "longitude": -9.1334,
+                    "recommended_duration_min": 90,
+                    "estimated_cost": "15.00",
+                    "price_tier": "STANDARD",
+                    "avg_rating": 4.8,
+                    "opening_hours": {"status": "confirmé", "display": "09:00-21:00"},
+                    "hero_photos": [],
+                    "photo_status": "Photo bientôt disponible",
+                    "photo_file_title": None,
+                    "photo_author": None,
+                    "photo_license": None,
+                    "photo_commons_url": None,
+                    "photo_source": None,
+                    "photo_credit_text": None,
+                    "photo_checked": False,
+                    "source_provider": "wikivoyage",
+                    "external_place_id": "wikivoyage:fr:lisbonne:castelo",
+                    "price_label": "15 €",
+                    "hours_status": "confirmé",
+                    "source_url": "https://fr.wikivoyage.org/wiki/Lisbonne",
+                    "source_attribution": "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)",
+                    "notoriety_score": 195,
+                    "is_wishlisted": False,
+                    "is_selected_for_trip": False,
+                },
+                {
+                    "id": "place-step3-no-photo",
+                    "destination_id": "dest-lisbonne-step3",
+                    "city_name": "Lisbonne",
+                    "name": "Belvédère Secret de l'Alfama",
+                    "description": "Petite terrasse calme sans photo sur Wikimedia.",
+                    "category": "NATURE",
+                    "is_outdoor": True,
+                    "latitude": 38.7120,
+                    "longitude": -9.1300,
+                    "recommended_duration_min": 60,
+                    "estimated_cost": "0.00",
+                    "price_tier": "ECONOMIC",
+                    "avg_rating": 4.6,
+                    "opening_hours": {"status": "horaires non renseignés", "display": "non renseigné"},
+                    "hero_photos": [],
+                    "photo_status": "Photo bientôt disponible",
+                    "photo_file_title": None,
+                    "photo_author": None,
+                    "photo_license": None,
+                    "photo_commons_url": None,
+                    "photo_source": None,
+                    "photo_credit_text": None,
+                    "photo_checked": False,
+                    "source_provider": "wikivoyage",
+                    "external_place_id": "wikivoyage:fr:lisbonne:belvedere",
+                    "price_label": "non renseigné",
+                    "hours_status": "horaires non renseignés",
+                    "source_url": "https://fr.wikivoyage.org/wiki/Lisbonne",
+                    "source_attribution": "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)",
+                    "notoriety_score": 120,
+                    "is_wishlisted": False,
+                    "is_selected_for_trip": False,
+                },
+            ]
+
+            enrich_gate = {"allow": False}
+
+            def _handle_gallery(route: Any) -> None:
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "trip_id": "trip-lisbonne-step3",
+                            "city_name": "Lisbonne",
+                            "unlocked": True,
+                            "unlock_message": "Découvrez les lieux incontournables à visiter à Lisbonne.",
+                            "provider_mode": "wikivoyage_wikipedia",
+                            "cached_in_redis": True,
+                            "few_places_message": None,
+                            "can_expand_radius": False,
+                            "suggested_radius_km": None,
+                            "radius_km": 10,
+                            "outage_message": None,
+                            "selected_place_ids": [],
+                            "places": base_places,
+                        }
+                    ),
+                )
+
+            def _handle_enrich(route: Any) -> None:
+                enriched_places = [
+                    {
+                        **base_places[0],
+                        "hero_photos": [svg_800x450],
+                        "photo_status": "Photo disponible",
+                        "photo_file_title": "File:Castelo_Sao_Jorge_Lisboa.jpg",
+                        "photo_author": "Alves Gaspar",
+                        "photo_license": "CC BY-SA 4.0",
+                        "photo_commons_url": "https://commons.wikimedia.org/wiki/File:Castelo_Sao_Jorge_Lisboa.jpg",
+                        "photo_source": "wikidata_p18",
+                        "photo_credit_text": "Photo : Alves Gaspar, CC BY-SA 4.0",
+                        "photo_checked": True,
+                    },
+                    {
+                        **base_places[1],
+                        "hero_photos": [],
+                        "photo_status": "Photo bientôt disponible",
+                        "photo_source": "none",
+                        "photo_checked": True,
+                    },
+                ]
+                route.fulfill(
+                    status=200,
+                    content_type="application/json",
+                    body=json.dumps(
+                        {
+                            "trip_id": "trip-lisbonne-step3",
+                            "city_name": "Lisbonne",
+                            "unlocked": True,
+                            "unlock_message": "Découvrez les lieux incontournables à visiter à Lisbonne.",
+                            "provider_mode": "wikivoyage_wikipedia",
+                            "cached_in_redis": True,
+                            "few_places_message": None,
+                            "can_expand_radius": False,
+                            "suggested_radius_km": None,
+                            "radius_km": 10,
+                            "outage_message": None,
+                            "selected_place_ids": [],
+                            "places": enriched_places,
+                        }
+                    ),
+                )
+
+            page.add_init_script(
+                """
+                window.__TM_ALLOW_PHOTO_ENRICH__ = false;
+                const origFetch = window.fetch.bind(window);
+                window.fetch = async (...args) => {
+                  const url = String(args[0] || "");
+                  if (url.includes("/photos/enrich")) {
+                    while (!window.__TM_ALLOW_PHOTO_ENRICH__) {
+                      await new Promise((r) => setTimeout(r, 25));
+                    }
+                  }
+                  return origFetch(...args);
+                };
+                """
+            )
+            page.route("**/api/v1/places/trip/*/gallery*", _handle_gallery)
+            page.route("**/api/v1/places/trip/*/photos/enrich*", _handle_enrich)
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
+
+            # Création d'un compte et d'un voyage vers Lisbonne
+            page.evaluate(
+                """async (apiUrl) => {
+                  const email = "playwright.step3.photos." + Date.now() + "@travelmate.app";
+                  const regResp = await fetch(apiUrl + "/api/v1/auth/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      full_name: "Voyageur Photos Step3",
+                      password: "PasswordStep3!2026",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  const token = regData.access_token;
+                  localStorage.setItem("travelmate_jwt_token", token);
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_city: "Lisbonne",
+                      destination_country: "Portugal",
+                      country_code_iso2: "PT",
+                      latitude: 38.71667,
+                      longitude: -9.13333,
+                      timezone: "Europe/Lisbon",
+                      geoname_id: 2267057,
+                      population: 517802,
+                      iata_code: "LIS",
+                      title: "Séjour Lisbonne Photos",
+                      travel_style: "STANDARD",
+                      total_budget: 1400,
+                      start_date: "2026-11-10",
+                      end_date: "2026-11-15"
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+                }""",
+                API_URL,
+            )
+
+            page.goto(f"{BASE_URL}/activities", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="activity-card-0"]', timeout=15000)
+            page.wait_for_selector('[data-testid="place-photo-placeholder-0"]', timeout=10000)
+
+            # Mesure géométrique AVANT l'arrivée de la photo (pendant l'illustration neutre)
+            before_metrics = page.evaluate(
+                """() => {
+                  const card0 = document.querySelector('[data-testid="activity-card-0"]');
+                  const media0 = document.querySelector('[data-testid="place-media-box-0"]');
+                  const credit0 = document.querySelector('[data-testid="place-photo-credit-0"]');
+                  const card1 = document.querySelector('[data-testid="activity-card-1"]');
+                  if (!card0 || !media0 || !credit0 || !card1) return null;
+                  const rCard0 = card0.getBoundingClientRect();
+                  const rMedia0 = media0.getBoundingClientRect();
+                  const rCredit0 = credit0.getBoundingClientRect();
+                  const rCard1 = card1.getBoundingClientRect();
+                  return {
+                    card0Height: rCard0.height,
+                    card0Top: rCard0.top,
+                    media0Width: rMedia0.width,
+                    media0Height: rMedia0.height,
+                    credit0Height: rCredit0.height,
+                    card1Top: rCard1.top,
+                    card1Left: rCard1.left,
+                  };
+                }"""
+            )
+            assert before_metrics is not None
+            # Ratio 16/9 réservé dès le départ
+            assert abs((before_metrics["media0Width"] / before_metrics["media0Height"]) - (16.0 / 9.0)) < 0.05
+
+            # Débloque la réponse d'enrichissement des photos en arrière-plan
+            page.evaluate("window.__TM_ALLOW_PHOTO_ENRICH__ = true")
+
+            # Attend que la photo de Castelo de São Jorge s'affiche
+            page.wait_for_selector('[data-testid="place-photo-img-0"]', timeout=10000)
+
+            after_metrics = page.evaluate(
+                """() => {
+                  const card0 = document.querySelector('[data-testid="activity-card-0"]');
+                  const media0 = document.querySelector('[data-testid="place-media-box-0"]');
+                  const credit0 = document.querySelector('[data-testid="place-photo-credit-0"]');
+                  const img0 = document.querySelector('[data-testid="place-photo-img-0"]');
+                  const link0 = document.querySelector('[data-testid="place-photo-credit-link-0"]');
+                  const card1 = document.querySelector('[data-testid="activity-card-1"]');
+                  const placeholder1 = document.querySelector('[data-testid="place-photo-placeholder-1"]');
+                  if (!card0 || !media0 || !credit0 || !img0 || !link0 || !card1 || !placeholder1) return null;
+                  const rCard0 = card0.getBoundingClientRect();
+                  const rMedia0 = media0.getBoundingClientRect();
+                  const rCredit0 = credit0.getBoundingClientRect();
+                  const rCard1 = card1.getBoundingClientRect();
+                  return {
+                    card0Height: rCard0.height,
+                    card0Top: rCard0.top,
+                    media0Width: rMedia0.width,
+                    media0Height: rMedia0.height,
+                    credit0Height: rCredit0.height,
+                    card1Top: rCard1.top,
+                    card1Left: rCard1.left,
+                    imgVisible: img0.offsetWidth > 200 && img0.offsetHeight > 100,
+                    imgLoadingAttr: img0.getAttribute("loading"),
+                    imgWidthAttr: img0.getAttribute("width"),
+                    imgHeightAttr: img0.getAttribute("height"),
+                    creditText: (link0.textContent || "").trim(),
+                    creditHref: link0.getAttribute("href"),
+                    placeholder1Text: (placeholder1.textContent || "").trim(),
+                  };
+                }"""
+            )
+            assert after_metrics is not None
+            assert after_metrics["imgVisible"] is True
+            assert after_metrics["imgLoadingAttr"] == "lazy"
+            assert after_metrics["imgWidthAttr"] == "800"
+            assert after_metrics["imgHeightAttr"] == "450"
+            assert after_metrics["creditText"] == "Photo : Alves Gaspar, CC BY-SA 4.0"
+            assert (
+                after_metrics["creditHref"]
+                == "https://commons.wikimedia.org/wiki/File:Castelo_Sao_Jorge_Lisboa.jpg"
+            )
+
+            # Aucun saut de mise en page (CLS = 0 : hauteurs et positions strictement conservées)
+            assert abs(after_metrics["media0Width"] - before_metrics["media0Width"]) <= 1.0
+            assert abs(after_metrics["media0Height"] - before_metrics["media0Height"]) <= 1.0
+            assert abs(after_metrics["credit0Height"] - before_metrics["credit0Height"]) <= 1.0
+            assert abs(after_metrics["card0Height"] - before_metrics["card0Height"]) <= 1.0
+            assert abs(after_metrics["card1Top"] - before_metrics["card1Top"]) <= 1.0
+            assert abs(after_metrics["card1Left"] - before_metrics["card1Left"]) <= 1.0
+
+            # Lieu sans photo : garde l'illustration neutre et "Photo bientôt disponible"
+            assert "Photo bientôt disponible" in after_metrics["placeholder1Text"]
+            assert page.locator('[data-testid="place-photo-img-1"]').count() == 0
+
+            # Aperçu plein écran avec les mêmes crédits Commons
+            page.locator('[data-testid="fullscreen-place-btn-0"]').click()
+            page.wait_for_selector('[data-testid="fullscreen-place-modal"]', timeout=10000)
+            modal_img = page.locator('[data-testid="fullscreen-place-photo-img"]')
+            assert modal_img.is_visible()
+            modal_credit_link = page.locator('[data-testid="fullscreen-photo-credit-link"]')
+            assert modal_credit_link.is_visible()
+            assert modal_credit_link.inner_text().strip() == "Photo : Alves Gaspar, CC BY-SA 4.0"
+            assert (
+                modal_credit_link.get_attribute("href")
+                == "https://commons.wikimedia.org/wiki/File:Castelo_Sao_Jorge_Lisboa.jpg"
+            )
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
 if __name__ == "__main__":
-    result = test_mon_programme_layout_5_widths_playwright()
+    test_mon_programme_layout_5_widths_playwright()
     test_real_chat_marrakech_jardin_secret_medina_and_single_row_header()
     test_hands_free_voice_fake_speech_recognition_playwright()
     test_world_cities_step1_geonames_search_create_and_fallback_playwright()
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    test_home_barcelone_geonames_autocomplete_visible_clickable_no_timezone_playwright()
+    test_world_places_step3_photos_visible_credit_and_no_layout_shift_playwright()
+
+
 
 

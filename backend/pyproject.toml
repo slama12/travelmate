@@ -8,6 +8,10 @@ requires-python = ">=3.11"
 asyncio_mode = "auto"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "integration: Live external API integration tests (non-blocking)",
+    "live_world_apis: Live external Wikimedia/GeoNames integration tests (non-blocking)",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]

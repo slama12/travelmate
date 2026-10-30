@@ -709,6 +709,13 @@ def test_envoi_b_design_system_routes_and_zero_jargon() -> None:
         "longitude",
         "moteur de validation",
         "Africa/Casablanca",
+        "Asia/Makassar",
+        "Europe/Lisbon",
+        "Asia/Tokyo",
+        "America/New_York",
+        "Europe/Rome",
+        "Africa/Cairo",
+        "Asia/Seoul",
     )
     import re
 

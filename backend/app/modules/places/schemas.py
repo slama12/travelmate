@@ -22,7 +22,23 @@ class PlaceResponse(BaseModel):
     avg_rating: float
     opening_hours: dict[str, Any] = Field(default_factory=dict)
     hero_photos: list[str] = Field(default_factory=list)
+    photo_status: str = "Photo bientôt disponible"
     source_provider: str = "simulated"
+    external_place_id: str | None = None
+    address: str | None = None
+    website_url: str | None = None
+    price_label: str | None = None
+    hours_status: str | None = None
+    source_url: str | None = None
+    source_attribution: str | None = None
+    notoriety_score: int = 0
+    photo_file_title: str | None = None
+    photo_author: str | None = None
+    photo_license: str | None = None
+    photo_commons_url: str | None = None
+    photo_source: str | None = None
+    photo_credit_text: str | None = None
+    photo_checked: bool = False
     is_wishlisted: bool = False
     is_selected_for_trip: bool = False
 
@@ -33,6 +49,11 @@ class CityPlacesResultResponse(BaseModel):
     cached_in_redis: bool = False
     available_in_current_mode: bool = True
     message: str | None = None
+    few_places_message: str | None = None
+    can_expand_radius: bool = False
+    suggested_radius_km: int | None = None
+    radius_km: int = 10
+    outage_message: str | None = None
     places: list[PlaceResponse] = Field(default_factory=list)
 
 
@@ -43,6 +64,11 @@ class TripGalleryResponse(BaseModel):
     unlock_message: str
     provider_mode: str
     cached_in_redis: bool = False
+    few_places_message: str | None = None
+    can_expand_radius: bool = False
+    suggested_radius_km: int | None = None
+    radius_km: int = 10
+    outage_message: str | None = None
     selected_place_ids: list[str] = Field(default_factory=list)
     places: list[PlaceResponse] = Field(default_factory=list)
 

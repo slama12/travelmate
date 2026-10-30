@@ -315,6 +315,7 @@ async def test_geonames_fallbacks_network_error_quota_and_missing_key(
 @pytest.mark.asyncio
 async def test_create_world_city_without_duplicate_and_non_seed_gallery_flights_accommodations(
     client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """
     Règle 3, 4, 5 & 7 :
@@ -391,7 +392,50 @@ async def test_create_world_city_without_duplicate_and_non_seed_gallery_flights_
     assert trip_resp.status_code == 201
     trip = trip_resp.json()
 
-    # 5. Galerie de lieux pour Lisbonne -> "Les lieux de cette ville arrivent bientôt", aucune donnée inventée
+    # 5. Galerie de lieux pour Lisbonne (Étape 2 : remplace 'Les lieux de cette ville arrivent bientôt' par la vraie galerie sans photo inventée)
+    import sys
+    import app.modules.places.router  # noqa: F401
+
+    places_router_mod = sys.modules["app.modules.places.router"]
+    from app.modules.places.world_places_service import (
+        WorldCityPlacesResult,
+        WorldPlaceCandidate,
+    )
+
+    class _StubLisbonnePlacesService:
+        async def fetch_city_places(self, **kwargs):
+            return WorldCityPlacesResult(
+                city_name="Lisbonne",
+                places=[
+                    WorldPlaceCandidate(
+                        name="Tour de Belém",
+                        description="Tour fortifiée manuéline sur le Tage.",
+                        category="CULTURE",
+                        latitude=38.6916,
+                        longitude=-9.2160,
+                        is_outdoor=False,
+                        recommended_duration_min=60,
+                        estimated_cost=8.0,
+                        price_tier="BUDGET",
+                        price_label="8 €",
+                        opening_hours={"status": "confirmé", "display": "10:00-17:30", "mon": "10:00-17:30"},
+                        hours_status="confirmé",
+                        source_provider="Wikivoyage",
+                        external_place_id="wv:fr:Lisbonne:tour-de-belem",
+                        source_url="https://fr.wikivoyage.org/wiki/Lisbonne",
+                        source_attribution="Données Wikivoyage / Wikipédia (CC BY-SA 4.0)",
+                        notoriety_score=180.0,
+                    )
+                ],
+                provider_mode="WIKIVOYAGE_WIKIPEDIA",
+            )
+
+    monkeypatch.setattr(
+        places_router_mod,
+        "get_world_places_service",
+        lambda: _StubLisbonnePlacesService(),
+    )
+
     gallery_resp = await client.get(
         f"/api/v1/places/trip/{trip['id']}/gallery",
         headers=auth_headers,
@@ -399,8 +443,12 @@ async def test_create_world_city_without_duplicate_and_non_seed_gallery_flights_
     assert gallery_resp.status_code == 200
     gallery = gallery_resp.json()
     assert gallery["unlocked"] is True
-    assert gallery["places"] == []
-    assert gallery["unlock_message"] == "Les lieux de cette ville arrivent bientôt"
+    assert len(gallery["places"]) >= 1
+    assert gallery["places"][0]["name"] == "Tour de Belém"
+    assert gallery["places"][0]["hero_photos"] == []
+    assert gallery["places"][0]["photo_status"] == "Photo bientôt disponible"
+    assert gallery["places"][0]["source_attribution"] == "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)"
+    assert "Les lieux de cette ville arrivent bientôt" not in gallery["unlock_message"]
 
     # 6. Vols simulés pour Lisbonne -> aucun vol inventé + message clair dans l'en-tête
     flights_resp = await client.get(
@@ -426,3 +474,802 @@ async def test_create_world_city_without_duplicate_and_non_seed_gallery_flights_
     assert acc_resp.json() == []
     assert acc_resp.headers.get("X-Simulation-Covered") == "false"
     assert "n'est pas couverte en simulation" in acc_resp.headers.get("X-Simulation-Message", "")
+
+
+@pytest.mark.asyncio
+async def test_geonames_versailles_present_without_saint_quentin_and_no_unrequested_demo_cities(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    A.1 & A.3 :
+    - 'versailles' renvoie Saint-Quentin-en-Yvelines mais pas Versailles si le filtre < 25 km d'une capitale
+      élimine les vraies villes : limité aux seuls quartiers (PPLX/PPLQ), un nom exact n'est jamais filtré.
+    - Saint-Quentin-en-Yvelines ne correspond pas au nom cherché 'versailles' et est exclu.
+    - Aucune des 5 villes de démonstration non demandées n'est ajoutée aux résultats.
+    """
+    cache = get_redis_client()
+    await cache.clear_prefix("geonames:")
+
+    versailles_mock_payload: dict[str, Any] = {
+        "totalResultsCount": 3,
+        "geonames": [
+            {
+                "geonameId": 6618604,
+                "name": "Saint-Quentin-en-Yvelines",
+                "toponymName": "Saint-Quentin-en-Yvelines",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "FR",
+                "countryName": "France",
+                "adminName1": "Île-de-France",
+                "lat": "48.78805",
+                "lng": "2.04469",
+                "population": 146600,
+                "timezone": {"timeZoneId": "Europe/Paris"},
+            },
+            {
+                "geonameId": 2969679,
+                "name": "Versailles",
+                "toponymName": "Versailles",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "FR",
+                "countryName": "France",
+                "adminName1": "Île-de-France",
+                "lat": "48.80359",
+                "lng": "2.13424",
+                "population": 85416,
+                "timezone": {"timeZoneId": "Europe/Paris"},
+            },
+            {
+                "geonameId": 9999001,
+                "name": "Quartier Notre-Dame de Versailles",
+                "toponymName": "Quartier Notre-Dame",
+                "fcl": "P",
+                "fcode": "PPLX",
+                "countryCode": "FR",
+                "countryName": "France",
+                "adminName1": "Île-de-France",
+                "lat": "48.80600",
+                "lng": "2.13500",
+                "population": 19000,
+                "timezone": {"timeZoneId": "Europe/Paris"},
+            },
+        ],
+    }
+
+    async def fake_fetch(q: str, settings: Any) -> dict[str, Any]:
+        return versailles_mock_payload
+
+    monkeypatch.setattr(destinations_router, "fetch_geonames_search_json", fake_fetch)
+
+    resp = await client.get("/api/v1/destinations/search", params={"q": "versailles"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["available"] is True
+    assert body["fallback"] is False
+    assert body["fallback_cities"] == []
+
+    names = [item["nom"] for item in body["results"]]
+    assert "Versailles" in names
+    assert "Saint-Quentin-en-Yvelines" not in names
+    assert "Quartier Notre-Dame de Versailles" not in names
+
+    # Aucune des 5 villes de démo non demandées ne doit polluer les résultats
+    for demo_city in ("Marrakech", "Tokyo", "New York", "Rome", "Paris"):
+        assert demo_city not in names
+
+    versailles = body["results"][0]
+    assert versailles["geonameId"] == 2969679
+    assert versailles["region"] == "Île-de-France"
+    assert versailles["sous_titre"] == "Île-de-France • France"
+    assert versailles["iata_code"] in ("ORY", "CDG")
+
+
+@pytest.mark.asyncio
+async def test_geonames_springfield_multi_country_sorted_by_population_without_eugene_or_chicopee(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    A.2 :
+    - 'springfield' renvoie Eugene, Springfield, Chicopee dans l'API brute :
+      seuls les résultats dont le nom (ou nom alternatif exact) correspond à 'springfield' sont gardés,
+      triés par population décroissante, avec plusieurs États/pays et distingués par 'région • pays'.
+    """
+    cache = get_redis_client()
+    await cache.clear_prefix("geonames:")
+
+    springfield_mock_payload: dict[str, Any] = {
+        "totalResultsCount": 6,
+        "geonames": [
+            {
+                "geonameId": 5725846,
+                "name": "Eugene",
+                "toponymName": "Eugene",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "US",
+                "countryName": "États-Unis",
+                "adminName1": "Oregon",
+                "lat": "44.05207",
+                "lng": "-123.08675",
+                "population": 176654,
+                "timezone": {"timeZoneId": "America/Los_Angeles"},
+            },
+            {
+                "geonameId": 4250542,
+                "name": "Springfield",
+                "toponymName": "Springfield",
+                "fcl": "P",
+                "fcode": "PPLA",
+                "countryCode": "US",
+                "countryName": "États-Unis",
+                "adminName1": "Illinois",
+                "lat": "39.78172",
+                "lng": "-89.65015",
+                "population": 114394,
+                "timezone": {"timeZoneId": "America/Chicago"},
+            },
+            {
+                "geonameId": 4409896,
+                "name": "Springfield",
+                "toponymName": "Springfield",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "US",
+                "countryName": "États-Unis",
+                "adminName1": "Missouri",
+                "lat": "37.21533",
+                "lng": "-93.29824",
+                "population": 169176,
+                "timezone": {"timeZoneId": "America/Chicago"},
+            },
+            {
+                "geonameId": 4932978,
+                "name": "Chicopee",
+                "toponymName": "Chicopee",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "US",
+                "countryName": "États-Unis",
+                "adminName1": "Massachusetts",
+                "lat": "42.1487",
+                "lng": "-72.60787",
+                "population": 55560,
+                "timezone": {"timeZoneId": "America/New_York"},
+            },
+            {
+                "geonameId": 4951788,
+                "name": "Springfield",
+                "toponymName": "Springfield",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "US",
+                "countryName": "États-Unis",
+                "adminName1": "Massachusetts",
+                "lat": "42.10148",
+                "lng": "-72.58981",
+                "population": 155929,
+                "timezone": {"timeZoneId": "America/New_York"},
+            },
+            {
+                "geonameId": 2148955,
+                "name": "Springfield",
+                "toponymName": "Springfield",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "AU",
+                "countryName": "Australie",
+                "adminName1": "Queensland",
+                "lat": "-27.6672",
+                "lng": "152.9182",
+                "population": 28450,
+                "timezone": {"timeZoneId": "Australia/Brisbane"},
+            },
+        ],
+    }
+
+    async def fake_fetch(q: str, settings: Any) -> dict[str, Any]:
+        return springfield_mock_payload
+
+    monkeypatch.setattr(destinations_router, "fetch_geonames_search_json", fake_fetch)
+
+    resp = await client.get("/api/v1/destinations/search", params={"q": "springfield"})
+    assert resp.status_code == 200
+    body = resp.json()
+    results = body["results"]
+
+    names = [r["nom"] for r in results]
+    assert "Eugene" not in names
+    assert "Chicopee" not in names
+    assert all(n == "Springfield" for n in names)
+    assert len(results) == 4
+
+    # Tri décroissant par population
+    populations = [r["population"] for r in results]
+    assert populations == [169176, 155929, 114394, 28450]
+
+    # Multi-pays et distinction 'région • pays'
+    subtitles = [r["sous_titre"] for r in results]
+    assert subtitles == [
+        "Missouri • États-Unis",
+        "Massachusetts • États-Unis",
+        "Illinois • États-Unis",
+        "Queensland • Australie",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_geonames_spaces_accents_and_regional_queries_bali_toscane(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    A.4 & A.5 :
+    - Requêtes avec espaces et accents ('le caire', 'São Paulo', 'Zürich') : URL bien encodée.
+    - Régions et îles ('bali', 'toscane') : renvoie des villes de cette région avec 'Bali • Indonésie'
+      en sous-titre, et si aucune ville ne porte le nom, ajoute une ligne 'Région : Bali' (featureClass T ou A).
+    """
+    cache = get_redis_client()
+    await cache.clear_prefix("geonames:")
+
+    bali_mock_payload: dict[str, Any] = {
+        "totalResultsCount": 4,
+        "geonames": [
+            {
+                "geonameId": 1645528,
+                "name": "Denpasar",
+                "toponymName": "Denpasar",
+                "fcl": "P",
+                "fcode": "PPLA",
+                "countryCode": "ID",
+                "countryName": "Indonésie",
+                "adminName1": "Bali",
+                "lat": "-8.65",
+                "lng": "115.21667",
+                "population": 725314,
+                "timezone": {"timeZoneId": "Asia/Makassar"},
+            },
+            {
+                "geonameId": 1623045,
+                "name": "Ubud",
+                "toponymName": "Ubud",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "ID",
+                "countryName": "Indonésie",
+                "adminName1": "Bali",
+                "lat": "-8.50685",
+                "lng": "115.26247",
+                "population": 74800,
+                "timezone": {"timeZoneId": "Asia/Makassar"},
+            },
+            {
+                "geonameId": 1639002,
+                "name": "Kuta",
+                "toponymName": "Kuta",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "ID",
+                "countryName": "Indonésie",
+                "adminName1": "Bali",
+                "lat": "-8.72332",
+                "lng": "115.17234",
+                "population": 58969,
+                "timezone": {"timeZoneId": "Asia/Makassar"},
+            },
+            {
+                "geonameId": 1650535,
+                "name": "Bali",
+                "toponymName": "Provinsi Bali",
+                "fcl": "A",
+                "fcode": "ADM1",
+                "countryCode": "ID",
+                "countryName": "Indonésie",
+                "adminName1": "Bali",
+                "lat": "-8.3695",
+                "lng": "115.1383",
+                "population": 4317404,
+                "timezone": {"timeZoneId": "Asia/Makassar"},
+            },
+        ],
+    }
+
+    sao_paulo_mock_payload: dict[str, Any] = {
+        "totalResultsCount": 1,
+        "geonames": [
+            {
+                "geonameId": 3448439,
+                "name": "São Paulo",
+                "toponymName": "São Paulo",
+                "fcl": "P",
+                "fcode": "PPLA",
+                "countryCode": "BR",
+                "countryName": "Brésil",
+                "adminName1": "São Paulo",
+                "lat": "-23.5475",
+                "lng": "-46.63611",
+                "population": 12325232,
+                "timezone": {"timeZoneId": "America/Sao_Paulo"},
+            }
+        ],
+    }
+
+    zurich_mock_payload: dict[str, Any] = {
+        "totalResultsCount": 1,
+        "geonames": [
+            {
+                "geonameId": 2657896,
+                "name": "Zurich",
+                "toponymName": "Zürich",
+                "fcl": "P",
+                "fcode": "PPLA",
+                "countryCode": "CH",
+                "countryName": "Suisse",
+                "adminName1": "Zurich",
+                "lat": "47.36667",
+                "lng": "8.55",
+                "population": 402762,
+                "timezone": {"timeZoneId": "Europe/Zurich"},
+                "alternateNames": [
+                    {"lang": "de", "name": "Zürich"},
+                    {"lang": "fr", "name": "Zurich"},
+                ],
+            }
+        ],
+    }
+
+    async def fake_fetch(q: str, settings: Any) -> dict[str, Any]:
+        norm = destinations_router.normalize_geonames_query(q)
+        if "bali" in norm:
+            return bali_mock_payload
+        if "sao paulo" in norm:
+            return sao_paulo_mock_payload
+        if "zurich" in norm:
+            return zurich_mock_payload
+        if "le caire" in norm:
+            return CAIRO_GEONAMES_MOCK_PAYLOAD
+        return {"totalResultsCount": 0, "geonames": []}
+
+    monkeypatch.setattr(destinations_router, "fetch_geonames_search_json", fake_fetch)
+
+    # 1. 'le caire', 'São Paulo', 'Zürich'
+    r_cairo = await client.get("/api/v1/destinations/search", params={"q": "le caire"})
+    assert r_cairo.status_code == 200
+    assert r_cairo.json()["results"][0]["nom"] == "Le Caire"
+    assert r_cairo.json()["results"][0]["iata_code"] == "CAI"
+
+    r_sp = await client.get("/api/v1/destinations/search", params={"q": "São Paulo"})
+    assert r_sp.status_code == 200
+    assert r_sp.json()["results"][0]["nom"] == "São Paulo"
+    assert r_sp.json()["results"][0]["iata_code"] == "GRU"
+
+    r_zh = await client.get("/api/v1/destinations/search", params={"q": "Zürich"})
+    assert r_zh.status_code == 200
+    assert r_zh.json()["results"][0]["nom"] == "Zurich"
+    assert r_zh.json()["results"][0]["iata_code"] == "ZRH"
+
+    # 2. 'bali' -> villes de la région Bali avec 'Bali • Indonésie' + ligne 'Région : Bali'
+    r_bali = await client.get("/api/v1/destinations/search", params={"q": "bali"})
+    assert r_bali.status_code == 200
+    bali_results = r_bali.json()["results"]
+    bali_names = [x["nom"] for x in bali_results]
+    assert "Denpasar" in bali_names
+    assert "Ubud" in bali_names
+    assert "Kuta" in bali_names
+    assert "Région : Bali" in bali_names
+
+    denpasar = next(x for x in bali_results if x["nom"] == "Denpasar")
+    assert denpasar["sous_titre"] == "Bali • Indonésie"
+    assert denpasar["iata_code"] == "DPS"
+
+    region_row = next(x for x in bali_results if x["nom"] == "Région : Bali")
+    assert region_row["is_region"] is True
+    assert region_row["feature_class"] in ("A", "T")
+    assert region_row["sous_titre"] == "Bali • Indonésie"
+    assert region_row["iata_code"] == "DPS"
+
+
+@pytest.mark.asyncio
+async def test_ourairports_monastir_mir_never_deduced_from_name_and_distant_airport_distance(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    C.9 :
+    - Monastir affiche le code officiel MIR (jamais MON déduit du nom).
+    - Utilise OurAirports (code IATA officiel, distance depuis les coordonnées de la ville).
+    - Si aucun aéroport n'est à moins de 100 km, affiche le plus proche avec sa distance.
+    """
+    cache = get_redis_client()
+    await cache.clear_prefix("geonames:")
+
+    monastir_mock_payload: dict[str, Any] = {
+        "totalResultsCount": 1,
+        "geonames": [
+            {
+                "geonameId": 2473493,
+                "name": "Monastir",
+                "toponymName": "Monastir",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "TN",
+                "countryName": "Tunisie",
+                "adminName1": "Monastir",
+                "lat": "35.77799",
+                "lng": "10.82617",
+                "population": 104535,
+                "timezone": {"timeZoneId": "Africa/Tunis"},
+            }
+        ],
+    }
+
+    async def fake_fetch(q: str, settings: Any) -> dict[str, Any]:
+        return monastir_mock_payload
+
+    monkeypatch.setattr(destinations_router, "fetch_geonames_search_json", fake_fetch)
+
+    resp = await client.get("/api/v1/destinations/search", params={"q": "monastir"})
+    assert resp.status_code == 200
+    monastir = resp.json()["results"][0]
+    assert monastir["nom"] == "Monastir"
+    assert monastir["iata_code"] == "MIR"
+    assert monastir["iata_code"] != "MON"
+    assert monastir["airport_within_100km"] is True
+    assert monastir["airport_display_label"] == "Monastir (MIR)"
+    assert monastir["sous_titre"] == "Monastir • Tunisie"
+
+    # Création/résolution de Monastir : conserve le code IATA officiel MIR
+    resolve_resp = await client.post(
+        "/api/v1/destinations/resolve",
+        json={
+            "geonameId": 2473493,
+            "nom": "Monastir",
+            "pays": "Tunisie",
+            "code_pays": "TN",
+            "region": "Monastir",
+            "coordonnees": {"latitude": 35.77799, "longitude": 10.82617},
+            "fuseau_horaire": "Africa/Tunis",
+            "population": 104535,
+        },
+    )
+    assert resolve_resp.status_code == 200
+    resolved_monastir = resolve_resp.json()
+    assert resolved_monastir["iata_code"] == "MIR"
+    assert resolved_monastir["airport_within_100km"] is True
+    assert resolved_monastir["airport_display_label"] == "Monastir (MIR)"
+
+    # Ville éloignée à plus de 100 km de tout aéroport OurAirports (ex: Merzouga dans le désert marocain)
+    from app.core.airports import find_nearest_airport
+
+    distant_airport = find_nearest_airport(
+        latitude=31.0994,
+        longitude=-4.0119,
+        city_name="Merzouga",
+        country_code="MA",
+    )
+    assert distant_airport["within_100km"] is False
+    assert distant_airport["distance_km"] > 100.0
+    assert "km" in distant_airport["display_label"]
+    assert distant_airport["iata_code"] in distant_airport["display_label"]
+
+
+@pytest.mark.asyncio
+async def test_geonames_generalized_regions_santorin_cote_d_azur_andalousie_and_alias_fallback(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    Point 4 — Régions :
+    Généralise la détection des régions/îles avec GeoNames (adminName1, noms alternatifs, featureClass T/A)
+    pour que "santorin", "côte d'azur", "andalousie" fonctionnent sans dépendre d'une liste écrite à la main,
+    tout en gardant REGION_QUERY_ALIASES en secours.
+    """
+    cache = get_redis_client()
+    await cache.clear_prefix("geonames:")
+
+    # Mock des réponses GeoNames réalistes pour "santorin", "côte d'azur" et "andalousie"
+    santorin_payload: dict[str, Any] = {
+        "totalResultsCount": 3,
+        "geonames": [
+            {
+                "geonameId": 252920,
+                "name": "Santorini Island",
+                "toponymName": "Nísos Thíra",
+                "fcl": "T",
+                "fcode": "ISL",
+                "countryCode": "GR",
+                "countryName": "Grèce",
+                "adminName1": "South Aegean",
+                "lat": "36.39315",
+                "lng": "25.46151",
+                "population": 15550,
+                "timezone": {"timeZoneId": "Europe/Athens"},
+                "alternateNames": [
+                    {"name": "Santorin", "lang": "fr"},
+                    {"name": "Santorini", "lang": "en"},
+                    {"name": "Thira", "lang": "el"},
+                ],
+            },
+            {
+                "geonameId": 252923,
+                "name": "Fira",
+                "toponymName": "Firá",
+                "fcl": "P",
+                "fcode": "PPLA3",
+                "countryCode": "GR",
+                "countryName": "Grèce",
+                "adminName1": "South Aegean",
+                "adminName2": "Thira",
+                "lat": "36.41665",
+                "lng": "25.43244",
+                "population": 2376,
+                "timezone": {"timeZoneId": "Europe/Athens"},
+                "alternateNames": [{"name": "Fira Santorin", "lang": "fr"}],
+            },
+            {
+                "geonameId": 256245,
+                "name": "Oia",
+                "toponymName": "Oía",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "GR",
+                "countryName": "Grèce",
+                "adminName1": "South Aegean",
+                "adminName2": "Thira",
+                "lat": "36.46182",
+                "lng": "25.37595",
+                "population": 1226,
+                "timezone": {"timeZoneId": "Europe/Athens"},
+                "alternateNames": [{"name": "Oia", "lang": "fr"}],
+            },
+        ],
+    }
+
+    cote_d_azur_payload: dict[str, Any] = {
+        "totalResultsCount": 3,
+        "geonames": [
+            {
+                "geonameId": 3023493,
+                "name": "Côte d'Azur",
+                "toponymName": "Côte d'Azur",
+                "fcl": "T",
+                "fcode": "CST",
+                "countryCode": "FR",
+                "countryName": "France",
+                "adminName1": "Provence-Alpes-Côte d'Azur",
+                "lat": "43.55",
+                "lng": "7.01",
+                "population": 2000000,
+                "timezone": {"timeZoneId": "Europe/Paris"},
+                "alternateNames": [{"name": "Côte d'Azur", "lang": "fr"}],
+            },
+            {
+                "geonameId": 2990440,
+                "name": "Nice",
+                "toponymName": "Nice",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "FR",
+                "countryName": "France",
+                "adminName1": "Provence-Alpes-Côte d'Azur",
+                "lat": "43.70313",
+                "lng": "7.26608",
+                "population": 342669,
+                "timezone": {"timeZoneId": "Europe/Paris"},
+                "alternateNames": [{"name": "Nice", "lang": "fr"}],
+            },
+            {
+                "geonameId": 3028808,
+                "name": "Cannes",
+                "toponymName": "Cannes",
+                "fcl": "P",
+                "fcode": "PPL",
+                "countryCode": "FR",
+                "countryName": "France",
+                "adminName1": "Provence-Alpes-Côte d'Azur",
+                "lat": "43.55135",
+                "lng": "7.01275",
+                "population": 74545,
+                "timezone": {"timeZoneId": "Europe/Paris"},
+                "alternateNames": [{"name": "Cannes", "lang": "fr"}],
+            },
+        ],
+    }
+
+    andalousie_payload: dict[str, Any] = {
+        "totalResultsCount": 4,
+        "geonames": [
+            {
+                "geonameId": 2593109,
+                "name": "Andalucia",
+                "toponymName": "Andalucía",
+                "fcl": "A",
+                "fcode": "ADM1",
+                "countryCode": "ES",
+                "countryName": "Espagne",
+                "adminName1": "Andalucía",
+                "lat": "37.6",
+                "lng": "-4.5",
+                "population": 8414240,
+                "timezone": {"timeZoneId": "Europe/Madrid"},
+                "alternateNames": [
+                    {"name": "Andalousie", "lang": "fr"},
+                    {"name": "Andalusia", "lang": "en"},
+                    {"name": "Andalucía", "lang": "es"},
+                ],
+            },
+            {
+                "geonameId": 2510911,
+                "name": "Séville",
+                "toponymName": "Sevilla",
+                "fcl": "P",
+                "fcode": "PPLA",
+                "countryCode": "ES",
+                "countryName": "Espagne",
+                "adminName1": "Andalucía",
+                "lat": "37.38283",
+                "lng": "-5.97317",
+                "population": 684234,
+                "timezone": {"timeZoneId": "Europe/Madrid"},
+                "alternateNames": [{"name": "Séville", "lang": "fr"}, {"name": "Sevilla", "lang": "es"}],
+            },
+            {
+                "geonameId": 2514256,
+                "name": "Malaga",
+                "toponymName": "Málaga",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "ES",
+                "countryName": "Espagne",
+                "adminName1": "Andalucía",
+                "lat": "36.72016",
+                "lng": "-4.42034",
+                "population": 578460,
+                "timezone": {"timeZoneId": "Europe/Madrid"},
+                "alternateNames": [{"name": "Malaga", "lang": "fr"}, {"name": "Málaga", "lang": "es"}],
+            },
+            {
+                "geonameId": 2517117,
+                "name": "Grenade",
+                "toponymName": "Granada",
+                "fcl": "P",
+                "fcode": "PPLA2",
+                "countryCode": "ES",
+                "countryName": "Espagne",
+                "adminName1": "Andalucía",
+                "lat": "37.18817",
+                "lng": "-3.60667",
+                "population": 232462,
+                "timezone": {"timeZoneId": "Europe/Madrid"},
+                "alternateNames": [{"name": "Grenade", "lang": "fr"}, {"name": "Granada", "lang": "es"}],
+            },
+        ],
+    }
+
+    # On vide REGION_QUERY_ALIASES pour prouver que la généralisation GeoNames (adminName1, alternateNames, T/A)
+    # fonctionne par elle-même sans liste écrite à la main
+    saved_aliases = dict(destinations_router.REGION_QUERY_ALIASES)
+    monkeypatch.setattr(destinations_router, "REGION_QUERY_ALIASES", {})
+
+    async def fake_fetch_generalized(q: str, settings: Any) -> dict[str, Any]:
+        norm = destinations_router.normalize_geonames_query(q)
+        if "santorin" in norm:
+            return santorin_payload
+        if "azur" in norm:
+            return cote_d_azur_payload
+        if "andalousie" in norm:
+            return andalousie_payload
+        return {"totalResultsCount": 0, "geonames": []}
+
+    monkeypatch.setattr(destinations_router, "fetch_geonames_search_json", fake_fetch_generalized)
+
+    # 1. "santorin"
+    resp_santorin = await client.get("/api/v1/destinations/search", params={"q": "santorin"})
+    assert resp_santorin.status_code == 200
+    santorin_results = resp_santorin.json()["results"]
+    santorin_names = [r["nom"] for r in santorin_results]
+    assert "Fira" in santorin_names
+    assert "Oia" in santorin_names
+    assert "Région : Santorin" in santorin_names
+    fira = next(r for r in santorin_results if r["nom"] == "Fira")
+    assert fira["sous_titre"] == "Santorin • Grèce"
+    assert fira["iata_code"] == "JTR"
+
+    # 2. "côte d'azur"
+    resp_azur = await client.get("/api/v1/destinations/search", params={"q": "côte d'azur"})
+    assert resp_azur.status_code == 200
+    azur_results = resp_azur.json()["results"]
+    azur_names = [r["nom"] for r in azur_results]
+    assert "Nice" in azur_names
+    assert "Cannes" in azur_names
+    assert any(n.startswith("Région :") for n in azur_names)
+    nice = next(r for r in azur_results if r["nom"] == "Nice")
+    assert "France" in nice["sous_titre"]
+    assert nice["iata_code"] == "NCE"
+
+    # 3. "andalousie"
+    resp_andalousie = await client.get("/api/v1/destinations/search", params={"q": "andalousie"})
+    assert resp_andalousie.status_code == 200
+    andalousie_results = resp_andalousie.json()["results"]
+    andalousie_names = [r["nom"] for r in andalousie_results]
+    assert "Séville" in andalousie_names
+    assert "Malaga" in andalousie_names
+    assert "Grenade" in andalousie_names
+    assert "Région : Andalousie" in andalousie_names
+    seville = next(r for r in andalousie_results if r["nom"] == "Séville")
+    assert seville["sous_titre"] == "Andalousie • Espagne"
+    assert seville["iata_code"] == "SVQ"
+
+    # 4. Vérifie que REGION_QUERY_ALIASES reste fonctionnel en secours si GeoNames ne renvoie ni T/A ni alternateNames
+    monkeypatch.setattr(destinations_router, "REGION_QUERY_ALIASES", saved_aliases)
+    assert "santorin" in destinations_router.REGION_QUERY_ALIASES
+    assert "cote d azur" in destinations_router.REGION_QUERY_ALIASES
+    assert "andalousie" in destinations_router.REGION_QUERY_ALIASES
+
+
+@pytest.mark.asyncio
+async def test_ourairports_local_file_and_license_and_mir_lis_icn(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """
+    Point 5 — Aéroports :
+    - Le fichier OurAirports est inclus localement dans backend/data/ourairports_iata.csv
+      avec sa licence backend/data/OURAIRPORTS_LICENSE.txt (jamais téléchargé au démarrage).
+    - Teste explicitement Monastir -> MIR, Lisbonne -> LIS, Séoul -> ICN.
+    """
+    from app.core.airports import (
+        OURAIRPORTS_CATALOG,
+        OURAIRPORTS_CSV_PATH,
+        OURAIRPORTS_LICENSE_PATH,
+        find_nearest_airport,
+        load_ourairports_catalog,
+    )
+
+    assert OURAIRPORTS_CSV_PATH.is_file(), f"Fichier OurAirports absent : {OURAIRPORTS_CSV_PATH}"
+    assert OURAIRPORTS_CSV_PATH.name == "ourairports_iata.csv"
+    assert OURAIRPORTS_CSV_PATH.parent.name == "data"
+    assert OURAIRPORTS_LICENSE_PATH.is_file(), f"Licence OurAirports absente : {OURAIRPORTS_LICENSE_PATH}"
+    license_text = OURAIRPORTS_LICENSE_PATH.read_text(encoding="utf-8")
+    assert "OurAirports" in license_text
+    assert "Public Domain" in license_text
+
+    reloaded_catalog = load_ourairports_catalog(OURAIRPORTS_CSV_PATH)
+    assert len(reloaded_catalog) >= 150
+    assert len(OURAIRPORTS_CATALOG) == len(reloaded_catalog)
+
+    # 1. Monastir -> MIR
+    mir = find_nearest_airport(
+        latitude=35.77799,
+        longitude=10.82617,
+        city_name="Monastir",
+        country_code="TN",
+    )
+    assert mir["iata_code"] == "MIR"
+    assert mir["within_100km"] is True
+
+    # 2. Lisbonne -> LIS
+    lis = find_nearest_airport(
+        latitude=38.71667,
+        longitude=-9.13333,
+        city_name="Lisbonne",
+        country_code="PT",
+    )
+    assert lis["iata_code"] == "LIS"
+    assert lis["within_100km"] is True
+
+    # 3. Séoul -> ICN
+    icn = find_nearest_airport(
+        latitude=37.566,
+        longitude=126.9784,
+        city_name="Séoul",
+        country_code="KR",
+    )
+    assert icn["iata_code"] == "ICN"
+    assert icn["within_100km"] is True
+
+
+

@@ -190,7 +190,11 @@ def get_opening_window_minutes(
     Retourne None si le lieu est fermé ce jour-là.
     """
     if not opening_hours:
-        return (8 * 60, 22 * 60, "08:00-22:00")
+        return (0, 23 * 60 + 59, "00:00-23:59")
+
+    status_val = str(opening_hours.get("status") or "").strip().lower()
+    if status_val in ("horaires non confirmés", "horaires non confirmes", "non renseigné", "non renseigne"):
+        return (0, 23 * 60 + 59, "00:00-23:59")
 
     day_key = WEEKDAY_KEYS[local_dt.weekday()]
     raw_range = opening_hours.get(day_key) or opening_hours.get("daily")
@@ -200,6 +204,15 @@ def get_opening_window_minutes(
     cleaned = str(raw_range).strip().lower()
     if cleaned in ("closed", "fermé", "ferme"):
         return None
+    if cleaned in (
+        "horaires non confirmés",
+        "horaires non confirmes",
+        "non renseigné",
+        "non renseigne",
+        "24h/24",
+        "00:00-23:59",
+    ):
+        return (0, 23 * 60 + 59, "00:00-23:59")
 
     try:
         open_str, close_str = cleaned.split("-")
@@ -211,7 +224,7 @@ def get_opening_window_minutes(
             close_min = 23 * 60 + 59
         return (open_min, close_min, f"{oh:02d}:{om:02d}-{ch:02d}:{cm:02d}")
     except Exception:
-        return (8 * 60, 22 * 60, "08:00-22:00")
+        return (0, 23 * 60 + 59, "00:00-23:59")
 
 
 class ItineraryValidationEngine:
