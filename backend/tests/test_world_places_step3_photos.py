@@ -23,6 +23,8 @@ from app.modules.places.world_place_photos_service import (
     format_photo_credit,
     is_forbidden_image_title_or_type,
     normalize_and_validate_free_license,
+    verify_place_photo_correspondence,
+    verify_seed_demo_photos_integrity,
 )
 
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
@@ -667,25 +669,195 @@ async def test_parallel_enrichment_concurrency_4_dedup_cache_and_backfill(
     assert late_place.photo_license == "CC BY-SA 4.0"
 
 
-def test_demo_cities_photo_audit_verifies_5_landmarks_and_flags_mismatches() -> None:
+def test_demo_cities_photo_audit_verifies_5_landmarks_and_no_duplicates() -> None:
     """
-    6 : Les 5 villes de démo gardent leurs photos actuelles.
-    Vérifie que chaque photo de démo correspond bien à son lieu (Jardin Majorelle,
-    Tour Eiffel, Colisée, Met, Senso-ji) et signale celles qui ne correspondent pas.
+    1, 2, 3, 4 & 5 :
+    - Plus aucun doublon d'image dans une ville ni dans tout le seed.
+    - Zéro URL Unsplash restante : uniquement le pipeline Wikidata P18 -> Wikipédia pageimages -> Commons imageinfo,
+      ou l'illustration neutre (hero_photos == []).
+    - Contrôle automatique : pour chaque photo, le titre du fichier Commons ou l'entité Wikidata correspond
+      au lieu (nom normalisé ou alias), et aucune URL d'image n'apparaît sur deux lieux.
+    - Les 5 lieux témoins (Jardin Majorelle, Tour Eiffel, Colisée, Met, Senso-ji) ont la bonne source Commons
+      et leur crédit auteur + licence libre présent.
     """
     audit = audit_demo_cities_photos()
+    assert audit["is_valid"] is True
     assert audit["demo_cities_count"] == 5
     assert audit["total_demo_places"] == 70
-    assert audit["demo_photos_preserved"] is True
+    assert audit["places_with_photo"] == 52
+    assert audit["places_without_photo"] == 18
+    assert audit["unsplash_urls"] == []
+    assert audit["duplicate_urls"] == []
+    assert audit["duplicate_file_titles"] == []
+    assert audit["mismatched_places"] == []
+    assert audit["missing_credits"] == []
 
     focus = audit["focus_landmarks"]
     assert set(focus.keys()) == {"Jardin Majorelle", "Tour Eiffel", "Colisée", "Met", "Senso-ji"}
-    assert focus["Colisée"]["matches_place"] is True
-    assert focus["Jardin Majorelle"]["matches_place"] is False
-    assert focus["Tour Eiffel"]["matches_place"] is False
-    assert focus["Met"]["matches_place"] is False
-    assert focus["Senso-ji"]["matches_place"] is False
-    assert len(audit["other_mismatches"]) >= 10
+
+    expected_focus = {
+        "Jardin Majorelle": {
+            "file_title": "File:Le jardin des majorelle 16.JPG",
+            "author": "Viault",
+            "license": "CC BY-SA 4.0",
+            "credit": "Photo : Viault, CC BY-SA 4.0",
+            "qid": "Q1395431",
+        },
+        "Tour Eiffel": {
+            "file_title": "File:Tour Eiffel Wikimedia Commons.jpg",
+            "author": "Benh LIEU SONG",
+            "license": "Public domain",
+            "credit": "Photo : Benh LIEU SONG, Public domain",
+            "qid": "Q243",
+        },
+        "Colisée": {
+            "file_title": "File:Colosseo 2020.jpg",
+            "author": "FeaturedPics",
+            "license": "CC BY-SA 4.0",
+            "credit": "Photo : FeaturedPics, CC BY-SA 4.0",
+            "qid": "Q10285",
+        },
+        "Met": {
+            "file_title": "File:Metropolitan Museum of Art (The Met) - Central Park, NYC.jpg",
+            "author": "Hugo Schneider",
+            "license": "CC BY-SA 2.0",
+            "credit": "Photo : Hugo Schneider, CC BY-SA 2.0",
+            "qid": "Q160236",
+        },
+        "Senso-ji": {
+            "file_title": "File:Sensoji 2023.jpg",
+            "author": "Akonnchiroll",
+            "license": "CC0",
+            "credit": "Photo : Akonnchiroll, CC0",
+            "qid": "Q615183",
+        },
+    }
+
+    for key, exp in expected_focus.items():
+        item = focus[key]
+        assert item["matches_place"] is True
+        assert item["title_matches"] is True
+        assert item["wikidata_matches"] is True
+        assert item["status"] == "correspond"
+        assert item["photo_source"] == "wikidata_p18"
+        assert item["wikidata_id"] == exp["qid"]
+        assert item["photo_file_title"] == exp["file_title"]
+        assert item["photo_author"] == exp["author"]
+        assert item["photo_license"] == exp["license"]
+        assert item["credit_text"] == exp["credit"]
+        assert item["url"] and "wikimedia.org/wikipedia/commons/thumb/" in item["url"]
+        assert item["photo_commons_url"] and "commons.wikimedia.org/wiki/File:" in item["photo_commons_url"]
+
+
+def test_automatic_control_rejects_mismatched_title_and_duplicate_urls() -> None:
+    """
+    3 : Vérifie que le contrôle automatique détecte immédiatement :
+    - une photo dont le titre Commons et l'entité Wikidata ne correspondent pas au lieu,
+    - une URL d'image qui apparaît sur deux lieux.
+    """
+    bad_corr = verify_place_photo_correspondence(
+        place_name="Le Jardin Secret (Médina)",
+        photo_file_title="File:Taj Mahal in Agra India.jpg",
+        external_place_id=None,
+        opening_hours={},
+    )
+    assert bad_corr["matches"] is False
+
+    shared_url = "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a8/Tour_Eiffel_Wikimedia_Commons.jpg/800px-Tour_Eiffel_Wikimedia_Commons.jpg"
+    synthetic_destinations = [
+        {
+            "city_name": "Paris",
+            "places": [
+                {
+                    "name": "Le Jules Verne (Tour Eiffel)",
+                    "hero_photos": [shared_url],
+                    "external_place_id": "Q243",
+                    "photo_file_title": "File:Tour Eiffel Wikimedia Commons.jpg",
+                    "photo_author": "Benh LIEU SONG",
+                    "photo_license": "Public domain",
+                    "photo_commons_url": "https://commons.wikimedia.org/wiki/File:Tour_Eiffel_Wikimedia_Commons.jpg",
+                    "photo_source": "wikidata_p18",
+                    "opening_hours": {"_wikidata_id": "Q243", "_wikipedia_title": "Tour Eiffel", "_aliases": ["Tour Eiffel"]},
+                },
+                {
+                    "name": "Jardin des Tuileries",
+                    "hero_photos": [shared_url],
+                    "external_place_id": "Q818517",
+                    "photo_file_title": "File:Tour Eiffel Wikimedia Commons.jpg",
+                    "photo_author": "Benh LIEU SONG",
+                    "photo_license": "Public domain",
+                    "photo_commons_url": "https://commons.wikimedia.org/wiki/File:Tour_Eiffel_Wikimedia_Commons.jpg",
+                    "photo_source": "wikidata_p18",
+                    "opening_hours": {"_wikidata_id": "Q818517", "_wikipedia_title": "Jardin des Tuileries", "_aliases": ["Tuileries"]},
+                },
+            ],
+        }
+    ]
+    report = verify_seed_demo_photos_integrity(synthetic_destinations)
+    assert report["is_valid"] is False
+    assert len(report["duplicate_urls"]) >= 1
+    assert len(report["mismatched_places"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_alembic_single_head_and_seeded_db_places_have_no_duplicates_and_credits(
+    db_session: Any,
+) -> None:
+    """
+    5 : Vérifie qu'il n'y a qu'une seule tête Alembic (`alembic heads`) et qu'en base PostgreSQL
+    le seed applique bien toutes les photos Commons uniques et leurs crédits aux 5 villes de démo.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import select
+    from app.core.seed import SEED_DESTINATIONS, seed_initial_data
+
+    backend_root = Path(__file__).resolve().parents[1]
+    alembic_cfg = Config(str(backend_root / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(backend_root / "alembic"))
+    script_dir = ScriptDirectory.from_config(alembic_cfg)
+    heads = script_dir.get_heads()
+    assert len(heads) == 1, f"Attendu une seule tête Alembic, trouvé : {heads}"
+    assert heads[0] == "0008_place_photos_step3"
+    assert len(heads[0]) <= 32
+
+    await seed_initial_data(db_session)
+
+    demo_cities = [d["city_name"] for d in SEED_DESTINATIONS]
+    dests = list(
+        (await db_session.scalars(select(Destination).where(Destination.city_name.in_(demo_cities)))).all()
+    )
+    assert len(dests) == 5
+    dest_ids = [d.id for d in dests]
+
+    db_places = list(
+        (
+            await db_session.scalars(
+                select(Place).where(
+                    Place.destination_id.in_(dest_ids),
+                    Place.source_provider == "simulated",
+                )
+            )
+        ).all()
+    )
+    assert len(db_places) == 70
+
+    seen_db_urls: set[str] = set()
+    for p in db_places:
+        if p.hero_photos:
+            assert len(p.hero_photos) == 1
+            url = p.hero_photos[0]
+            assert "unsplash.com" not in url.lower()
+            assert url not in seen_db_urls, f"URL dupliquée en base pour {p.name}: {url}"
+            seen_db_urls.add(url)
+            assert p.photo_file_title and p.photo_file_title.startswith("File:")
+            assert p.photo_author
+            assert normalize_and_validate_free_license(p.photo_license) is not None
+            assert p.photo_commons_url and p.photo_commons_url.startswith("https://commons.wikimedia.org/wiki/File:")
+            assert format_photo_credit(p.photo_author, p.photo_license) == f"Photo : {p.photo_author}, {p.photo_license}"
+        else:
+            assert p.photo_source == "none"
+
 
 
 def test_requirements_lock_contains_all_imported_modules() -> None:

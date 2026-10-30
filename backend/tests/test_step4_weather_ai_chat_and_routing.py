@@ -729,10 +729,13 @@ async def test_enriched_seed_each_city_has_at_least_12_real_places_with_photo_ho
             assert any(
                 isinstance(v, str) and "-" in v and ":" in v for v in p["opening_hours"].values()
             ), f"Horaires invalides pour {p['name']}: {p['opening_hours']}"
-            assert isinstance(p["hero_photos"], list) and len(p["hero_photos"]) >= 1
-            photo_url = p["hero_photos"][0]
-            assert isinstance(photo_url, str) and photo_url.startswith("https://")
-            city_photos.append(photo_url)
+            assert isinstance(p["hero_photos"], list)
+            if p["hero_photos"]:
+                photo_url = p["hero_photos"][0]
+                assert isinstance(photo_url, str) and photo_url.startswith("https://")
+                city_photos.append(photo_url)
+            else:
+                assert p["photo_status"] == "Photo bientôt disponible"
 
         assert len(city_photos) == len(set(city_photos)), f"Photos dupliquées détectées à {city}"
 

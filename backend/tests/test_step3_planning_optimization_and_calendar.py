@@ -941,17 +941,21 @@ async def test_place_photos_match_landmarks_including_jardin_majorelle(
     assert len(majorelle["hero_photos"]) >= 1
     assert "majorelle" in majorelle["hero_photos"][0].lower()
 
-    # Vérifie l'unicité de toutes les photos de lieux sur les 5 villes du seed
+    # Vérifie l'unicité de toutes les photos de lieux sur les 5 villes du seed (ou illustration neutre si pas de photo libre fiable)
     seen_photos: dict[str, str] = {}
     for city in ("Paris", "Tokyo", "Rome", "New York", "Marrakech"):
         resp = await client.get(f"/api/v1/places/city/{city}", headers=headers)
         assert resp.status_code == 200
         for place in resp.json()["places"]:
-            assert len(place["hero_photos"]) >= 1
-            photo_url = place["hero_photos"][0]
-            assert photo_url.startswith("https://")
-            assert photo_url not in seen_photos, (
-                f"Photo dupliquée entre « {place['name']} » et « {seen_photos[photo_url]} » : {photo_url}"
-            )
-            seen_photos[photo_url] = place["name"]
+            if place["hero_photos"]:
+                assert len(place["hero_photos"]) == 1
+                photo_url = place["hero_photos"][0]
+                assert photo_url.startswith("https://")
+                assert photo_url not in seen_photos, (
+                    f"Photo dupliquée entre « {place['name']} » et « {seen_photos[photo_url]} » : {photo_url}"
+                )
+                seen_photos[photo_url] = place["name"]
+            else:
+                assert place["photo_status"] == "Photo bientôt disponible"
+
 

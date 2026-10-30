@@ -2418,8 +2418,7 @@ export function ActivitiesScreen({
               (place.photo_author && place.photo_license
                 ? `Photo : ${place.photo_author}, ${place.photo_license}`
                 : null);
-            const showCreditStrip =
-              place.source_provider !== "simulated" || Boolean(photoCreditText);
+            const showCreditStrip = true;
             const hoursText =
               place.opening_hours?.display ||
               place.opening_hours?.mon ||

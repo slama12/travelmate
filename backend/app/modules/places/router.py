@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 
 from app.core.redis import cache_client
+from app.core.seed import SEED_DESTINATIONS
 from app.core.database import AsyncSession, get_db
 from app.core.providers import CityNotSimulatedError, get_provider_registry
 from app.models.entities import Destination, FlightBooking, Place, Trip, User, WishlistItem
@@ -361,6 +362,15 @@ async def _get_or_fetch_city_places(
     if dest:
         stmt = select(Place).where(Place.destination_id == dest.id)
         existing_places = list((await db.scalars(stmt)).all())
+        seed_dest = next(
+            (d for d in SEED_DESTINATIONS if d["city_name"].lower() == dest.city_name.lower()),
+            None,
+        )
+        if seed_dest and existing_places:
+            order_map = {
+                p_item["name"]: idx for idx, p_item in enumerate(seed_dest.get("places", []))
+            }
+            existing_places.sort(key=lambda pl: (order_map.get(pl.name, 999), pl.name))
 
     if not existing_places:
         # Interrogation du provider (SimulatedPlacesProvider ou RealPlacesProvider)
@@ -408,6 +418,11 @@ async def _get_or_fetch_city_places(
                 hero_photos=item.get("hero_photos", []),
                 source_provider=item.get("source_provider", provider_mode),
                 external_place_id=item.get("external_place_id"),
+                photo_file_title=item.get("photo_file_title"),
+                photo_author=item.get("photo_author"),
+                photo_license=item.get("photo_license"),
+                photo_commons_url=item.get("photo_commons_url"),
+                photo_source=item.get("photo_source"),
             )
             db.add(new_place)
             existing_places.append(new_place)

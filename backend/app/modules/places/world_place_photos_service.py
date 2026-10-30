@@ -1257,168 +1257,331 @@ class WorldPlacePhotoService:
         }
 
 
+_GENERIC_STOPWORDS_FOR_PHOTO_MATCH: set[str] = {
+    "de", "du", "des", "la", "le", "les", "et", "en", "au", "aux", "sur", "dans", "par", "avec",
+    "the", "of", "in", "on", "at", "and", "to", "for", "from", "by", "as", "seen",
+    "musee", "museum", "museo", "musei", "jardin", "jardins", "garden", "gardens", "giardino",
+    "parc", "park", "parco", "place", "piazza", "palais", "palace", "temple", "sanctuaire",
+    "shrine", "tour", "tower", "chateau", "castle", "colline", "marche", "market", "pont", "bridge",
+    "paris", "tokyo", "rome", "roma", "new", "york", "nyc", "marrakech", "marrakesh", "morocco", "morroco",
+    "street", "view", "east", "west", "north", "south", "night", "inside", "outside", "building",
+    "main", "large", "small", "court", "corner", "looking", "wikimedia", "commons", "crop", "cropped",
+}
+
+
+def _extract_distinctive_tokens(raw_text: str) -> set[str]:
+    norm = normalize_place_text(raw_text)
+    tokens: set[str] = set()
+    for tok in norm.split():
+        if len(tok) < 3 or tok.isdigit():
+            continue
+        if tok in _GENERIC_STOPWORDS_FOR_PHOTO_MATCH:
+            continue
+        tokens.add(tok)
+    for hyph in re.findall(r"[A-Za-zÀ-ÿ0-9]+-[A-Za-zÀ-ÿ0-9\-]+", str(raw_text or "")):
+        compact = normalize_place_text(hyph).replace(" ", "")
+        if len(compact) >= 4 and not compact.isdigit() and compact not in _GENERIC_STOPWORDS_FOR_PHOTO_MATCH:
+            tokens.add(compact)
+    return tokens
+
+
+def verify_place_photo_correspondence(
+    *,
+    place_name: str,
+    photo_file_title: str | None,
+    external_place_id: str | None = None,
+    opening_hours: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Contrôle automatique (Point 3) :
+    Pour chaque photo, le titre du fichier Commons ou l'entité Wikidata doit correspondre
+    au lieu (nom normalisé ou alias).
+    """
+    oh = opening_hours if isinstance(opening_hours, dict) else {}
+    raw_candidates: list[str] = [str(place_name or "").strip()]
+    # Ajoute aussi le nom hors parenthèses et le contenu entre parenthèses comme variantes du nom
+    base_no_paren = re.sub(r"\([^)]*\)", " ", str(place_name or "")).strip()
+    if base_no_paren and base_no_paren not in raw_candidates:
+        raw_candidates.append(base_no_paren)
+    for paren_match in re.findall(r"\(([^)]+)\)", str(place_name or "")):
+        if paren_match.strip():
+            raw_candidates.append(paren_match.strip())
+
+    wp_title = str(oh.get("_wikipedia_title") or "").strip()
+    if wp_title:
+        raw_candidates.append(wp_title)
+        wp_no_paren = re.sub(r"\([^)]*\)", " ", wp_title).strip()
+        if wp_no_paren:
+            raw_candidates.append(wp_no_paren)
+
+    aliases = oh.get("_aliases")
+    if isinstance(aliases, list):
+        for al in aliases:
+            if isinstance(al, str) and al.strip():
+                raw_candidates.append(al.strip())
+
+    normalized_candidates = [
+        normalize_place_text(c) for c in raw_candidates if normalize_place_text(c)
+    ]
+    candidate_tokens: set[str] = set()
+    for c in raw_candidates:
+        candidate_tokens |= _extract_distinctive_tokens(c)
+
+    norm_file = normalize_commons_file_title(photo_file_title or "")
+    file_body = re.sub(r"\.[a-z0-9]{2,5}$", "", norm_file[5:].strip(), flags=re.IGNORECASE) if norm_file else ""
+    norm_file_text = normalize_place_text(file_body)
+    file_tokens = _extract_distinctive_tokens(file_body)
+
+    title_phrase_match = bool(
+        norm_file_text
+        and any(cand and (cand in norm_file_text or norm_file_text in cand) for cand in normalized_candidates)
+    )
+    shared_tokens = sorted(candidate_tokens & file_tokens)
+    title_matches = bool(title_phrase_match or len(shared_tokens) >= 1)
+
+    ext_qid = str(external_place_id or "").strip().upper()
+    oh_qid = str(oh.get("_wikidata_id") or "").strip().upper()
+    has_valid_qid = bool(re.match(r"^Q\d+$", ext_qid)) and (not oh_qid or ext_qid == oh_qid)
+    # L'entité Wikidata correspond au lieu si l'identifiant QID est valide et rattaché au titre/alias normalisé du lieu
+    entity_label_norms = [
+        normalize_place_text(c)
+        for c in ([wp_title] + (aliases if isinstance(aliases, list) else []))
+        if isinstance(c, str) and normalize_place_text(c)
+    ]
+    place_name_norms = [
+        normalize_place_text(c)
+        for c in [place_name, base_no_paren] + re.findall(r"\(([^)]+)\)", str(place_name or ""))
+        if normalize_place_text(c)
+    ]
+    place_tokens = _extract_distinctive_tokens(place_name)
+    entity_tokens: set[str] = set()
+    for c in ([wp_title] + (aliases if isinstance(aliases, list) else [])):
+        if isinstance(c, str):
+            entity_tokens |= _extract_distinctive_tokens(c)
+
+    wikidata_matches = bool(
+        has_valid_qid
+        and (
+            any(
+                en in pn or pn in en
+                for en in entity_label_norms
+                for pn in place_name_norms
+            )
+            or bool(place_tokens & entity_tokens)
+        )
+    )
+
+    return {
+        "matches": bool(title_matches and wikidata_matches) if has_valid_qid else bool(title_matches),
+        "title_matches": title_matches,
+        "wikidata_matches": wikidata_matches,
+        "shared_tokens": shared_tokens,
+        "normalized_file_text": norm_file_text,
+        "wikidata_id": ext_qid or None,
+    }
+
+
+def verify_seed_demo_photos_integrity(
+    destinations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Contrôle automatique complet sur les 70 lieux des 5 villes de démo (Points 1, 2, 3, 4, 5) :
+    - Aucune photo Unsplash restante.
+    - Aucune URL d'image ni aucun titre de fichier Commons n'apparaît sur deux lieux (dans une ville ou globalement).
+    - Pour chaque lieu avec photo :
+      * source wikidata_p18 ou wikipedia_pageimages
+      * titre Commons, auteur, licence libre valide et URL Commons présents
+      * le titre du fichier Commons ou l'entité Wikidata correspond au lieu (nom normalisé ou alias).
+    - Pour chaque lieu sans photo : illustration neutre (hero_photos == [], photo_source == 'none').
+    """
+    if destinations is None:
+        from app.core.seed import SEED_DESTINATIONS
+        destinations = SEED_DESTINATIONS
+
+    seen_urls_global: dict[str, str] = {}
+    seen_titles_global: dict[str, str] = {}
+    duplicate_urls: list[dict[str, str]] = []
+    duplicate_file_titles: list[dict[str, str]] = []
+    unsplash_urls: list[dict[str, str]] = []
+    mismatched_places: list[dict[str, Any]] = []
+    missing_credits: list[dict[str, str]] = []
+
+    total_places = 0
+    places_with_photo = 0
+    places_without_photo = 0
+
+    for dest in destinations:
+        city = str(dest.get("city_name") or "")
+        seen_urls_city: dict[str, str] = {}
+        for place in dest.get("places", []):
+            total_places += 1
+            name = str(place.get("name") or "")
+            label = f"{city} :: {name}"
+            photos = place.get("hero_photos") or []
+
+            if not photos:
+                places_without_photo += 1
+                if place.get("photo_source") not in (None, "none"):
+                    mismatched_places.append(
+                        {"place": label, "reason": "lieu_sans_photo_avec_source_invalide"}
+                    )
+                continue
+
+            places_with_photo += 1
+            if len(photos) != 1:
+                mismatched_places.append({"place": label, "reason": "multiple_hero_photos"})
+
+            url = str(photos[0] or "").strip()
+            file_title = str(place.get("photo_file_title") or "").strip()
+            author = str(place.get("photo_author") or "").strip()
+            lic = str(place.get("photo_license") or "").strip()
+            commons_url = str(place.get("photo_commons_url") or "").strip()
+            source = str(place.get("photo_source") or "").strip()
+
+            if "unsplash.com" in url.lower():
+                unsplash_urls.append({"place": label, "url": url})
+
+            if url in seen_urls_city:
+                duplicate_urls.append(
+                    {"city": city, "url": url, "first_place": seen_urls_city[url], "second_place": label}
+                )
+            else:
+                seen_urls_city[url] = label
+
+            if url in seen_urls_global:
+                duplicate_urls.append(
+                    {"city": "global", "url": url, "first_place": seen_urls_global[url], "second_place": label}
+                )
+            else:
+                seen_urls_global[url] = label
+
+            norm_title_key = normalize_commons_file_title(file_title).lower() if file_title else ""
+            if norm_title_key:
+                if norm_title_key in seen_titles_global:
+                    duplicate_file_titles.append(
+                        {
+                            "file_title": file_title,
+                            "first_place": seen_titles_global[norm_title_key],
+                            "second_place": label,
+                        }
+                    )
+                else:
+                    seen_titles_global[norm_title_key] = label
+
+            if (
+                not file_title
+                or not author
+                or not normalize_and_validate_free_license(lic)
+                or not commons_url.startswith("https://commons.wikimedia.org/wiki/File:")
+                or source not in ("wikidata_p18", "wikipedia_pageimages")
+                or is_forbidden_image_title_or_type(file_title)[0]
+            ):
+                missing_credits.append(
+                    {
+                        "place": label,
+                        "photo_file_title": file_title,
+                        "photo_author": author,
+                        "photo_license": lic,
+                        "photo_commons_url": commons_url,
+                        "photo_source": source,
+                    }
+                )
+
+            correspondence = verify_place_photo_correspondence(
+                place_name=name,
+                photo_file_title=file_title,
+                external_place_id=place.get("external_place_id"),
+                opening_hours=place.get("opening_hours"),
+            )
+            if not correspondence["matches"]:
+                mismatched_places.append(
+                    {
+                        "place": label,
+                        "photo_file_title": file_title,
+                        "external_place_id": place.get("external_place_id"),
+                        "detail": correspondence,
+                    }
+                )
+
+    is_valid = (
+        len(unsplash_urls) == 0
+        and len(duplicate_urls) == 0
+        and len(duplicate_file_titles) == 0
+        and len(mismatched_places) == 0
+        and len(missing_credits) == 0
+    )
+
+    return {
+        "is_valid": is_valid,
+        "demo_cities_count": len(destinations),
+        "total_demo_places": total_places,
+        "places_with_photo": places_with_photo,
+        "places_without_photo": places_without_photo,
+        "unsplash_urls": unsplash_urls,
+        "duplicate_urls": duplicate_urls,
+        "duplicate_file_titles": duplicate_file_titles,
+        "mismatched_places": mismatched_places,
+        "missing_credits": missing_credits,
+    }
+
+
 def audit_demo_cities_photos() -> dict[str, Any]:
     """
-    Règle 6 :
-    Les 5 villes de démo gardent leurs photos actuelles.
-    Vérifie que chaque photo de démo correspond bien à son lieu
-    (Jardin Majorelle, Tour Eiffel, Colisée, Met, Senso-ji) et signale celles qui ne correspondent pas.
+    Vérifie l'état des 70 lieux des 5 villes de démo après application du pipeline
+    Wikidata P18 -> Wikipédia pageimages -> Commons imageinfo, ainsi que les 5 lieux témoins :
+    Jardin Majorelle, Tour Eiffel, Colisée, Met, Senso-ji.
     """
     from app.core.seed import SEED_DESTINATIONS
 
-    focus_landmarks: dict[str, dict[str, Any]] = {
-        "Jardin Majorelle": {
-            "city": "Marrakech",
-            "place_name": "Jardin Majorelle & Musée Yves Saint Laurent",
-            "url": "https://upload.wikimedia.org/wikipedia/commons/e/e0/Jardin_Majorelle_Marrakech.jpg",
-            "matches_place": False,
-            "status": "correspondance_nominale_mais_url_404",
-            "detail": (
-                "Le nom de fichier cible bien le Jardin Majorelle sur Wikimedia Commons, "
-                "mais le chemin MD5 /commons/e/e0/Jardin_Majorelle_Marrakech.jpg renvoie HTTP 404."
-            ),
-        },
-        "Tour Eiffel": {
-            "city": "Paris",
-            "place_name": "Le Jules Verne (Tour Eiffel)",
-            "url": "https://images.unsplash.com/photo-1514933651103-005eec06c04b?auto=format&fit=crop&w=1000&q=80",
-            "matches_place": False,
-            "status": "ne_correspond_pas",
-            "detail": (
-                "Paris n'a pas de fiche monument 'Tour Eiffel' (seulement le restaurant 'Le Jules Verne (Tour Eiffel)'), "
-                "dont la photo montre un intérieur de bar/pub générique et non la Tour Eiffel. "
-                "De plus, la photo de la Tour Eiffel (photo-1499856871958-5b9627545d1a) est placée par erreur sur 'Jardin des Tuileries'."
-            ),
-        },
-        "Colisée": {
-            "city": "Rome",
-            "place_name": "Colisée & Forum Romain",
-            "url": "https://images.unsplash.com/photo-1552832230-c0197dd311b5?auto=format&fit=crop&w=1000&q=80",
-            "matches_place": True,
-            "status": "correspond",
-            "detail": (
-                "La photo montre bien l'extérieur du Colisée à Rome "
-                "(elle est toutefois réutilisée à l'identique comme hero_image_url de la ville de Rome)."
-            ),
-        },
-        "Met": {
-            "city": "New York",
-            "place_name": "Metropolitan Museum of Art (The Met)",
-            "url": "https://images.unsplash.com/photo-1566127444979-b3d2b654e3d7?auto=format&fit=crop&w=1000&q=80",
-            "matches_place": False,
-            "status": "ne_correspond_pas_photo_generique",
-            "detail": (
-                "La photo montre une galerie de sculptures/antiquités générique sur Unsplash "
-                "et non une vue identifiable du Metropolitan Museum of Art (The Met)."
-            ),
-        },
-        "Senso-ji": {
-            "city": "Tokyo",
-            "place_name": "Temple Senso-ji (Asakusa)",
-            "url": "https://images.unsplash.com/photo-1536098561742-ca998e48cbcc?auto=format&fit=crop&w=1000&q=80",
-            "matches_place": False,
-            "status": "ne_correspond_pas",
-            "detail": (
-                "La photo montre une rue de Tokyo avec la Tokyo Tower rouge et blanche (Minato) "
-                "et non le temple bouddhiste Senso-ji à Asakusa."
-            ),
-        },
+    integrity = verify_seed_demo_photos_integrity(SEED_DESTINATIONS)
+
+    focus_targets = {
+        "Jardin Majorelle": ("Marrakech", "Jardin Majorelle & Musée Yves Saint Laurent"),
+        "Tour Eiffel": ("Paris", "Le Jules Verne (Tour Eiffel)"),
+        "Colisée": ("Rome", "Colisée & Forum Romain"),
+        "Met": ("New York", "Metropolitan Museum of Art (The Met)"),
+        "Senso-ji": ("Tokyo", "Temple Senso-ji (Asakusa)"),
     }
 
-    other_mismatches: list[dict[str, str]] = [
-        {
-            "city": "Paris",
-            "place_name": "Sainte-Chapelle",
-            "url": "https://images.unsplash.com/photo-1541963463532-d68292c34b19?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre un livre ouvert devant des étagères, pas les vitraux de la Sainte-Chapelle.",
-        },
-        {
-            "city": "Paris",
-            "place_name": "Centre Pompidou",
-            "url": "https://images.unsplash.com/photo-1513635269975-59663e0ac1ad?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre Big Ben et le pont de Westminster à Londres, pas le Centre Pompidou à Paris.",
-        },
-        {
-            "city": "Paris",
-            "place_name": "Parc des Buttes-Chaumont",
-            "url": "https://images.unsplash.com/photo-1500382017468-9049fed747ef?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre un champ de blé rural au soleil couchant, pas le Parc des Buttes-Chaumont.",
-        },
-        {
-            "city": "Paris",
-            "place_name": "Jardin des Tuileries",
-            "url": "https://images.unsplash.com/photo-1499856871958-5b9627545d1a?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre la Seine, le pont Alexandre III et la Tour Eiffel, pas le Jardin des Tuileries.",
-        },
-        {
-            "city": "Tokyo",
-            "place_name": "Sanctuaire Meiji Jingu",
-            "url": "https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre la pagode Yasaka (Hōkan-ji) à Kyoto, pas le sanctuaire Meiji Jingu à Tokyo.",
-        },
-        {
-            "city": "Tokyo",
-            "place_name": "Parc d'Ueno & Étang de Shinobazu",
-            "url": "https://images.unsplash.com/photo-1528164344705-475426879c0d?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre la pagode Chureito et le Mont Fuji à Fujiyoshida, pas le parc d'Ueno.",
-        },
-        {
-            "city": "Tokyo",
-            "place_name": "Jardin National Shinjuku Gyoen",
-            "url": "https://images.unsplash.com/photo-1490806843957-31f4c9a91c65?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre le Mont Fuji derrière des cerisiers, pas Shinjuku Gyoen.",
-        },
-        {
-            "city": "Rome",
-            "place_name": "Jardins de la Villa Borghèse",
-            "url": "https://images.unsplash.com/photo-1548013146-72479768bada?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre le Taj Mahal à Agra (Inde), pas la Villa Borghèse à Rome.",
-        },
-        {
-            "city": "Rome",
-            "place_name": "Jardin des Orangers (Parco Savello)",
-            "url": "https://images.unsplash.com/photo-1516483638261-f4dbaf036963?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre la côte des Cinque Terre (Manarola), pas le Jardin des Orangers à Rome.",
-        },
-        {
-            "city": "Rome",
-            "place_name": "Colline du Janicule (Gianicolo)",
-            "url": "https://images.unsplash.com/photo-1523906834658-6e24ef2386f9?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre le Grand Canal et le pont du Rialto à Venise, pas le Janicule à Rome.",
-        },
-        {
-            "city": "New York",
-            "place_name": "Brooklyn Bridge & Promenade de DUMBO",
-            "url": "https://images.unsplash.com/photo-1496442226666-8d4d0e62e6e9?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre les écrans lumineux de Times Square, pas le pont de Brooklyn.",
-        },
-        {
-            "city": "Marrakech",
-            "place_name": "Musée de Marrakech (Palais Mnebhi)",
-            "url": "https://images.unsplash.com/photo-1512958789358-4dac0f880120?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre une ruelle bleue de Chefchaouen, pas le Musée de Marrakech.",
-        },
-        {
-            "city": "Marrakech",
-            "place_name": "Le Jardin Secret (Médina)",
-            "url": "https://images.unsplash.com/photo-1564507004663-b6dfb3c824d5?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre le Taj Mahal en Inde, pas Le Jardin Secret à Marrakech.",
-        },
-        {
-            "city": "Marrakech",
-            "place_name": "Palais de la Bahia",
-            "url": "https://images.unsplash.com/photo-1539020140153-e479b8c22e70?auto=format&fit=crop&w=1000&q=80",
-            "issue": "Montre une kasbah désertique (Aït Benhaddou) et duplique la photo de l'hébergement Riad Patio Andalou Médina.",
-        },
-    ]
+    places_index: dict[tuple[str, str], dict[str, Any]] = {}
+    for dest in SEED_DESTINATIONS:
+        city = str(dest.get("city_name") or "")
+        for p in dest.get("places", []):
+            places_index[(city, str(p.get("name") or ""))] = p
 
-    total_demo_places = sum(len(d.get("places", [])) for d in SEED_DESTINATIONS)
+    focus_landmarks: dict[str, dict[str, Any]] = {}
+    for short_label, (city, place_name) in focus_targets.items():
+        p = places_index.get((city, place_name), {})
+        photos = p.get("hero_photos") or []
+        url = photos[0] if photos else None
+        corr = verify_place_photo_correspondence(
+            place_name=place_name,
+            photo_file_title=p.get("photo_file_title"),
+            external_place_id=p.get("external_place_id"),
+            opening_hours=p.get("opening_hours"),
+        )
+        focus_landmarks[short_label] = {
+            "city": city,
+            "place_name": place_name,
+            "wikidata_id": p.get("external_place_id"),
+            "url": url,
+            "photo_file_title": p.get("photo_file_title"),
+            "photo_author": p.get("photo_author"),
+            "photo_license": p.get("photo_license"),
+            "photo_commons_url": p.get("photo_commons_url"),
+            "photo_source": p.get("photo_source"),
+            "credit_text": format_photo_credit(p.get("photo_author"), p.get("photo_license")),
+            "matches_place": bool(url and corr["matches"]),
+            "title_matches": corr["title_matches"],
+            "wikidata_matches": corr["wikidata_matches"],
+            "status": "correspond" if (url and corr["matches"]) else "ne_correspond_pas",
+        }
+
     return {
-        "demo_cities_count": len(SEED_DESTINATIONS),
-        "total_demo_places": total_demo_places,
+        **integrity,
         "demo_photos_preserved": True,
         "focus_landmarks": focus_landmarks,
-        "other_mismatches": other_mismatches,
+        "other_mismatches": integrity["mismatched_places"],
     }
 
 
@@ -1427,3 +1590,4 @@ world_place_photo_service = WorldPlacePhotoService()
 
 def get_world_place_photo_service() -> WorldPlacePhotoService:
     return world_place_photo_service
+

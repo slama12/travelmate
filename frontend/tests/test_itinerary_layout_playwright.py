@@ -2252,6 +2252,111 @@ def test_world_places_step3_photos_visible_credit_and_no_layout_shift_playwright
                 == "https://commons.wikimedia.org/wiki/File:Castelo_Sao_Jorge_Lisboa.jpg"
             )
 
+            # Vérification Playwright sur une ville de démo réelle (Paris) depuis le backend PostgreSQL seedé :
+            # aucun doublon d'URL, aucune photo Unsplash, crédit Commons sur Tour Eiffel et illustration neutre sur Le Comptoir du Relais
+            page.unroute("**/api/v1/places/trip/*/gallery*")
+            page.unroute("**/api/v1/places/trip/*/photos/enrich*")
+            svg_demo_body = (
+                "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='450' viewBox='0 0 800 450'>"
+                "<rect width='800' height='450' fill='%23335c67'/></svg>"
+            )
+            page.route(
+                "**/*.wikimedia.org/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="image/svg+xml",
+                    body=svg_demo_body,
+                ),
+            )
+            page.evaluate(
+                """async (apiUrl) => {
+                  const email = "playwright.paris.commons." + Date.now() + "@travelmate.app";
+                  const regResp = await fetch(apiUrl + "/api/v1/auth/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      full_name: "Voyageur Paris Commons",
+                      password: "PasswordStep3!2026",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  const token = regData.access_token;
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+                  const destsResp = await fetch(apiUrl + "/api/v1/destinations");
+                  const dests = await destsResp.json();
+                  const paris = dests.find((d) => d.city_name === "Paris");
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_id: paris.id,
+                      title: "Séjour Paris Photos Commons",
+                      travel_style: "STANDARD",
+                      total_budget: 1500
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+                  const bookResp = await fetch(apiUrl + "/api/v1/flights/book", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      trip_id: trip.id,
+                      idempotency_key: "IDEM-PW-PARIS-" + Date.now(),
+                      airline: "Air France",
+                      flight_number_outbound: "AF101",
+                      flight_number_inbound: "AF102",
+                      origin_iata: "LYS",
+                      destination_iata: "CDG",
+                      departure_outbound_at: "2026-11-11T07:00:00Z",
+                      arrival_outbound_at: "2026-11-11T08:15:00Z",
+                      departure_inbound_at: "2026-11-15T19:00:00Z",
+                      arrival_inbound_at: "2026-11-15T20:15:00Z",
+                      price_amount: "160.00",
+                      currency: "EUR",
+                      cabin_class: "ECONOMY"
+                    })
+                  });
+                  const bookData = await bookResp.json();
+                  localStorage.setItem("travelmate_last_flight_booking", JSON.stringify(bookData));
+                }""",
+                API_URL,
+            )
+            page.goto(f"{BASE_URL}/activities", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="activity-card-0"]', timeout=15000)
+            paris_dom = page.evaluate(
+                """() => {
+                  const imgs = Array.from(document.querySelectorAll('[data-testid^="place-photo-img-"]'));
+                  const srcs = imgs.map((el) => el.getAttribute("src") || "");
+                  const links = Array.from(document.querySelectorAll('[data-testid^="place-photo-credit-link-"]')).map((el) => ({
+                    text: (el.textContent || "").trim(),
+                    href: el.getAttribute("href") || ""
+                  }));
+                  const placeholders = Array.from(document.querySelectorAll('[data-testid^="place-photo-placeholder-"]')).map(
+                    (el) => (el.textContent || "").trim()
+                  );
+                  return { srcs, links, placeholders };
+                }"""
+            )
+            assert len(paris_dom["srcs"]) == 12
+            assert len(set(paris_dom["srcs"])) == len(paris_dom["srcs"]), f"Doublons d'images DOM détectés: {paris_dom['srcs']}"
+            assert all("unsplash.com" not in s.lower() for s in paris_dom["srcs"])
+            assert any(
+                l["text"] == "Photo : Benh LIEU SONG, Public domain"
+                and l["href"] == "https://commons.wikimedia.org/wiki/File:Tour_Eiffel_Wikimedia_Commons.jpg"
+                for l in paris_dom["links"]
+            ), f"Crédit Tour Eiffel introuvable dans le DOM: {paris_dom['links']}"
+            assert len(paris_dom["placeholders"]) == 2
+            assert all("Photo bientôt disponible" in p for p in paris_dom["placeholders"])
+
             browser.close()
     finally:
         if bridge_proc is not None:
