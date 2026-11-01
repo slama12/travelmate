@@ -17,12 +17,14 @@ from app.modules.budget.schemas import (
     BudgetExpenseCreateRequest,
     BudgetExpenseItemResponse,
     BudgetPlannedUpdateRequest,
+    BudgetStageBreakdownSchema,
     CurrencyConvertResponse,
     TripBudgetSummaryResponse,
     convert_currency_decimal,
     normalize_budget_category,
     quantize_money,
 )
+from app.modules.trips.stages_service import ensure_trip_stages
 
 router = APIRouter()
 
@@ -64,7 +66,6 @@ def _parse_item_currency_note(item: BudgetItem, trip_currency: str) -> tuple[Dec
     amt = quantize_money(item.amount or Decimal("0.00"))
     curr = (item.currency or trip_currency or "EUR").upper()
     raw_title = item.title or ""
-    # Format interne optionnel : "Libellé [ORIG:108.00:USD:0.9259]"
     if "[ORIG:" in raw_title and raw_title.endswith("]"):
         prefix, meta = raw_title.rsplit("[ORIG:", 1)
         clean_title = prefix.strip()
@@ -88,6 +89,10 @@ async def build_trip_budget_summary(
     trip_currency = (trip.currency or "EUR").upper()
     total_planned = quantize_money(trip.total_budget_planned or Decimal("0.00"))
 
+    stages = await ensure_trip_stages(db, trip)
+    stage_by_id = {st.id: st for st in stages}
+    first_stage = stages[0] if stages else None
+
     rows = (
         await db.scalars(
             select(BudgetItem)
@@ -100,6 +105,17 @@ async def build_trip_budget_summary(
     cat_counts: dict[str, int] = {cat: 0 for cat in MAIN_BUDGET_CATEGORIES}
     total_spent = Decimal("0.00")
     serialized_items: list[BudgetExpenseItemResponse] = []
+
+    stage_spent: dict[str, Decimal] = {st.id: Decimal("0.00") for st in stages}
+    stage_cat_totals: dict[str, dict[str, Decimal]] = {
+        st.id: {cat: Decimal("0.00") for cat in MAIN_BUDGET_CATEGORIES}
+        for st in stages
+    }
+    stage_cat_counts: dict[str, dict[str, int]] = {
+        st.id: {cat: 0 for cat in MAIN_BUDGET_CATEGORIES}
+        for st in stages
+    }
+    stage_items_map: dict[str, list[BudgetExpenseItemResponse]] = {st.id: [] for st in stages}
 
     for row in rows:
         cat_key = (row.category or "OTHER").upper()
@@ -118,23 +134,39 @@ async def build_trip_budget_summary(
         cat_label_fr = CATEGORY_LABELS_FR.get(cat_key, "Autre")
         source_label = "Réservation enregistrée" if cat_key == "FLIGHT" and "Vol " in clean_title else "Dépense manuelle"
 
-        serialized_items.append(
-            BudgetExpenseItemResponse(
-                id=row.id,
-                trip_id=row.trip_id,
-                category=cat_key,
-                category_label_fr=cat_label_fr,
-                title=clean_title,
-                amount=amt,
-                currency=trip_currency,
-                original_amount=orig_amt,
-                original_currency=orig_curr,
-                exchange_rate=rate,
-                is_committed=bool(row.is_committed),
-                source_label_fr=source_label,
-                created_at_fr=format_datetime_fr(row.created_at),
-            )
+        resolved_stage = stage_by_id.get(row.stage_id or "") if row.stage_id else first_stage
+        eff_stage_id = resolved_stage.id if resolved_stage else None
+        eff_stage_order = resolved_stage.order_index if resolved_stage else None
+        eff_stage_city = resolved_stage.city_name if resolved_stage else None
+
+        item_resp = BudgetExpenseItemResponse(
+            id=row.id,
+            trip_id=row.trip_id,
+            stage_id=eff_stage_id,
+            stage_order_index=eff_stage_order,
+            stage_city_name=eff_stage_city,
+            category=cat_key,
+            category_label_fr=cat_label_fr,
+            title=clean_title,
+            amount=amt,
+            currency=trip_currency,
+            original_amount=orig_amt,
+            original_currency=orig_curr,
+            exchange_rate=rate,
+            is_committed=bool(row.is_committed),
+            source_label_fr=source_label,
+            created_at_fr=format_datetime_fr(row.created_at),
         )
+        serialized_items.append(item_resp)
+
+        if eff_stage_id and eff_stage_id in stage_spent:
+            stage_spent[eff_stage_id] = quantize_money(stage_spent[eff_stage_id] + amt)
+            if cat_key in stage_cat_totals[eff_stage_id]:
+                stage_cat_totals[eff_stage_id][cat_key] = quantize_money(
+                    stage_cat_totals[eff_stage_id][cat_key] + amt
+                )
+                stage_cat_counts[eff_stage_id][cat_key] += 1
+            stage_items_map[eff_stage_id].append(item_resp)
 
     if total_planned > Decimal("0.00"):
         usage_percent = ((total_spent * Decimal("100.00")) / total_planned).quantize(
@@ -185,6 +217,56 @@ async def build_trip_budget_summary(
             )
         )
 
+    stages_breakdown: list[BudgetStageBreakdownSchema] = []
+    for st in stages:
+        st_spent = stage_spent.get(st.id, Decimal("0.00"))
+        if total_spent > Decimal("0.00"):
+            st_share = ((st_spent * Decimal("100.00")) / total_spent).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        else:
+            st_share = Decimal("0.00")
+
+        st_cats: list[BudgetCategoryBreakdownSchema] = []
+        for cat in MAIN_BUDGET_CATEGORIES:
+            sc_spent = stage_cat_totals[st.id][cat]
+            if st_spent > Decimal("0.00"):
+                sc_share = ((sc_spent * Decimal("100.00")) / st_spent).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+            else:
+                sc_share = Decimal("0.00")
+            st_cats.append(
+                BudgetCategoryBreakdownSchema(
+                    category=cat,
+                    label_fr=CATEGORY_LABELS_FR[cat],
+                    spent_amount=sc_spent,
+                    share_percent=sc_share,
+                    items_count=stage_cat_counts[st.id][cat],
+                )
+            )
+
+        st_planned = (
+            quantize_money(st.budget_planned)
+            if st.budget_planned is not None
+            else None
+        )
+        stages_breakdown.append(
+            BudgetStageBreakdownSchema(
+                stage_id=st.id,
+                order_index=st.order_index,
+                city_name=st.city_name,
+                country_name=st.country_name,
+                nights=st.nights,
+                planned_amount=st_planned,
+                spent_amount=st_spent,
+                share_percent=st_share,
+                items_count=len(stage_items_map.get(st.id, [])),
+                categories=st_cats,
+                items=stage_items_map.get(st.id, []),
+            )
+        )
+
     return TripBudgetSummaryResponse(
         trip_id=trip.id,
         destination_city=destination.city_name,
@@ -198,6 +280,7 @@ async def build_trip_budget_summary(
         alert_level=alert_level,
         alert_message_fr=alert_message_fr,
         categories=categories_breakdown,
+        stages_breakdown=stages_breakdown,
         items=serialized_items,
         supported_currencies=sorted(EXCHANGE_RATES_PER_EUR.keys()),
         exchange_rates_per_eur=EXCHANGE_RATES_PER_EUR,
@@ -239,7 +322,7 @@ async def get_trip_budget(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TripBudgetSummaryResponse:
-    """Retourne le résumé complet du budget du séjour (montants en Decimal)."""
+    """Retourne le résumé complet du budget du séjour (montants en Decimal) avec détail par étape."""
     trip, destination, _role = await require_trip_access(
         db, trip_id, current_user.id, allowed_roles=READ_ROLES
     )
@@ -280,12 +363,25 @@ async def add_manual_budget_expense(
     db: AsyncSession = Depends(get_db),
 ) -> TripBudgetSummaryResponse:
     """
-    Ajoute une dépense manuelle (4 champs : montant, catégorie, libellé, devise).
+    Ajoute une dépense manuelle (montant, catégorie, libellé, devise, étape optionnelle).
     Convertit automatiquement le montant en Decimal vers la devise du voyage si nécessaire.
     """
     trip, destination, _role = await require_trip_access(
         db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
     )
+    stages = await ensure_trip_stages(db, trip)
+    target_stage_id: str | None = None
+    if payload.stage_id:
+        matched_stage = next((st for st in stages if st.id == payload.stage_id), None)
+        if matched_stage is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Étape introuvable sur ce voyage.",
+            )
+        target_stage_id = matched_stage.id
+    elif stages:
+        target_stage_id = stages[0].id
+
     trip_currency = (trip.currency or "EUR").upper()
     orig_amount = quantize_money(payload.amount)
     orig_currency = payload.currency.upper()
@@ -298,6 +394,7 @@ async def add_manual_budget_expense(
 
     item = BudgetItem(
         trip_id=trip.id,
+        stage_id=target_stage_id,
         category=norm_category,
         title=stored_title,
         amount=converted_amount,
@@ -358,12 +455,17 @@ async def export_trip_budget_csv(
     writer.writerow(["Solde restant", f"{summary.remaining:.2f}"])
     writer.writerow(["Dépassement", "Oui" if summary.over_budget_alert else "Non"])
     writer.writerow([])
+    writer.writerow(["Répartition par étape", "Ville", "Pays", "Nuits", "Montant dépensé", "Part (%)"])
+    for st in summary.stages_breakdown:
+        writer.writerow([f"Étape {st.order_index}", st.city_name, st.country_name, str(st.nights), f"{st.spent_amount:.2f}", f"{st.share_percent:.2f}%"])
+    writer.writerow([])
     writer.writerow(["Répartition par catégorie", "Montant dépensé", "Part (%)", "Nombre de lignes"])
     for cat in summary.categories:
         writer.writerow([cat.label_fr, f"{cat.spent_amount:.2f}", f"{cat.share_percent:.2f}%", str(cat.items_count)])
     writer.writerow([])
     writer.writerow(
         [
+            "Étape",
             "Catégorie",
             "Libellé",
             f"Montant ({summary.currency})",
@@ -375,6 +477,7 @@ async def export_trip_budget_csv(
     for it in summary.items:
         writer.writerow(
             [
+                it.stage_city_name or destination.city_name,
                 it.category_label_fr,
                 it.title,
                 f"{it.amount:.2f}",

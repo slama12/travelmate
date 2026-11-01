@@ -83,3 +83,45 @@ class AlertType(str, Enum):
     VISIT_REMINDER = "VISIT_REMINDER"
     PRICE_DROP = "PRICE_DROP"
     WEATHER_RAIN = "WEATHER_RAIN"
+
+
+class StageArrivalTransportMode(str, Enum):
+    VOL = "VOL"
+    TRAIN = "TRAIN"
+    BUS = "BUS"
+    BATEAU = "BATEAU"
+    VOITURE = "VOITURE"
+
+
+STAGE_TRANSPORT_MODE_MAP: dict[str, str] = {
+    "VOL": StageArrivalTransportMode.VOL.value,
+    "VOLS": StageArrivalTransportMode.VOL.value,
+    "AVION": StageArrivalTransportMode.VOL.value,
+    "FLIGHT": StageArrivalTransportMode.VOL.value,
+    "PLANE": StageArrivalTransportMode.VOL.value,
+    "TRAIN": StageArrivalTransportMode.TRAIN.value,
+    "TGV": StageArrivalTransportMode.TRAIN.value,
+    "RAIL": StageArrivalTransportMode.TRAIN.value,
+    "BUS": StageArrivalTransportMode.BUS.value,
+    "CAR_BUS": StageArrivalTransportMode.BUS.value,
+    "AUTOCAR": StageArrivalTransportMode.BUS.value,
+    "COACH": StageArrivalTransportMode.BUS.value,
+    "BATEAU": StageArrivalTransportMode.BATEAU.value,
+    "FERRY": StageArrivalTransportMode.BATEAU.value,
+    "BOAT": StageArrivalTransportMode.BATEAU.value,
+    "SHIP": StageArrivalTransportMode.BATEAU.value,
+    "VOITURE": StageArrivalTransportMode.VOITURE.value,
+    "AUTO": StageArrivalTransportMode.VOITURE.value,
+    "CAR": StageArrivalTransportMode.VOITURE.value,
+}
+
+
+def normalize_stage_transport_mode(raw: str | None) -> str:
+    cleaned = (raw or "VOL").strip().upper()
+    if cleaned not in STAGE_TRANSPORT_MODE_MAP:
+        raise ValueError(
+            f"Type de trajet d'arrivée invalide ({raw!r}). "
+            "Valeurs autorisées : vol, train, bus, bateau, voiture."
+        )
+    return STAGE_TRANSPORT_MODE_MAP[cleaned]
+

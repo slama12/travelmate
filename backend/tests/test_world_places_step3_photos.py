@@ -818,7 +818,7 @@ async def test_alembic_single_head_and_seeded_db_places_have_no_duplicates_and_c
     script_dir = ScriptDirectory.from_config(alembic_cfg)
     heads = script_dir.get_heads()
     assert len(heads) == 1, f"Attendu une seule tête Alembic, trouvé : {heads}"
-    assert heads[0] == "0008_place_photos_step3"
+    assert heads[0] == "0009_multi_city_stages_step1"
     assert len(heads[0]) <= 32
 
     await seed_initial_data(db_session)

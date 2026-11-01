@@ -185,6 +185,10 @@ class ChatProposedActionSchema(BaseModel):
         "PROCESS_PAYMENT",
     ]
     item_id: str | None = None
+    stage_id: str | None = None
+    stage_order_index: int | None = None
+    stage_city_name: str | None = None
+    stage_timezone: str | None = None
     place_id: str
     place_name: str
     visit_date: str
@@ -208,6 +212,7 @@ class ChatProposedActionSchema(BaseModel):
     undo_available: bool = False
     undo_window_seconds: int = 30
     undo_snapshot: dict[str, Any] | None = None
+
 
 
 class ChatMessageResponse(BaseModel):

@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class SuggestedSlotSchema(BaseModel):
@@ -15,13 +15,14 @@ class SuggestedSlotSchema(BaseModel):
 
 
 class ItineraryItemCreateRequest(BaseModel):
-    trip_id: str
+    trip_id: str | None = None
     place_id: str
-    # Saisie soit par (visit_date + local_start_time dans le fuseau de la destination), soit par start_at (ISO UTC/offset)
+    stage_id: str | None = None
+    # Saisie soit par (visit_date + local_start_time dans le fuseau de l'étape), soit par start_at (ISO UTC/offset)
     visit_date: date | None = None
     local_start_time: str | None = Field(
         default=None,
-        description="Heure locale de début au format HH:MM dans le fuseau de la destination",
+        description="Heure locale de début au format HH:MM dans le fuseau de la destination / de l'étape",
     )
     start_at: datetime | None = Field(
         default=None,
@@ -34,14 +35,22 @@ class ItineraryItemCreateRequest(BaseModel):
         description="Durée en minutes (par défaut : durée conseillée du lieu)",
     )
     transit_mode: str = Field(default="METRO", description="WALKING, METRO ou CAR")
+    transit_mode_to_next: str | None = None
     notes: str | None = Field(default=None, max_length=500)
     allow_duplicate: bool = Field(
         default=False,
         description="Autorise explicitement la planification d'un même lieu une deuxième fois dans le séjour",
     )
 
+    @model_validator(mode="after")
+    def _sync_transit_mode(self) -> "ItineraryItemCreateRequest":
+        if self.transit_mode_to_next and self.transit_mode == "METRO":
+            self.transit_mode = self.transit_mode_to_next
+        return self
+
 
 class ItineraryItemUpdateRequest(BaseModel):
+    stage_id: str | None = None
     visit_date: date | None = None
     local_start_time: str | None = None
     start_at: datetime | None = None
@@ -55,6 +64,9 @@ class ItineraryItemResponse(BaseModel):
 
     id: str
     trip_id: str
+    stage_id: str | None = None
+    stage_order_index: int | None = None
+    stage_city_name: str | None = None
     place_id: str
     place_name: str
     place_category: str
@@ -70,7 +82,14 @@ class ItineraryItemResponse(BaseModel):
     local_start_time: str
     local_end_time: str
     destination_timezone: str
+    timezone: str = ""
     duration_minutes: int
+
+    @model_validator(mode="after")
+    def _sync_tz(self) -> "ItineraryItemResponse":
+        if not self.timezone and self.destination_timezone:
+            self.timezone = self.destination_timezone
+        return self
     transit_mode_to_next: str
     transit_duration_to_next_min: int
     transit_distance_meters: int

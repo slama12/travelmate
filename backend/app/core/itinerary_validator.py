@@ -64,11 +64,50 @@ _FALLBACK_TIMEZONES: dict[str, _DSTFallbackTz] = {
     "Europe/Paris": _DSTFallbackTz("Europe/Paris", 1, "EU"),
     "Europe/Rome": _DSTFallbackTz("Europe/Rome", 1, "EU"),
     "Europe/Madrid": _DSTFallbackTz("Europe/Madrid", 1, "EU"),
+    "Europe/Berlin": _DSTFallbackTz("Europe/Berlin", 1, "EU"),
     "Europe/London": _DSTFallbackTz("Europe/London", 0, "EU"),
+    "Europe/Lisbon": _DSTFallbackTz("Europe/Lisbon", 0, "EU"),
+    "Europe/Athens": _DSTFallbackTz("Europe/Athens", 2, "EU"),
     "Asia/Tokyo": _DSTFallbackTz("Asia/Tokyo", 9, None),
+    "Asia/Seoul": _DSTFallbackTz("Asia/Seoul", 9, None),
+    "Asia/Bangkok": _DSTFallbackTz("Asia/Bangkok", 7, None),
     "America/New_York": _DSTFallbackTz("America/New_York", -5, "US"),
+    "America/Toronto": _DSTFallbackTz("America/Toronto", -5, "US"),
+    "America/Los_Angeles": _DSTFallbackTz("America/Los_Angeles", -8, "US"),
     "Africa/Casablanca": _DSTFallbackTz("Africa/Casablanca", 1, None),
+    "Africa/Tunis": _DSTFallbackTz("Africa/Tunis", 1, None),
+    "Australia/Sydney": _DSTFallbackTz("Australia/Sydney", 10, None),
 }
+
+
+def get_arrival_buffer_hours_for_mode(transport_mode: str | None = None) -> float:
+    """Retourne le tampon d'arrivée (en heures) selon le type de trajet d'arrivée de l'étape."""
+    settings = get_settings()
+    mode = (transport_mode or "VOL").strip().upper()
+    if mode in ("TRAIN", "TGV", "RAIL"):
+        return float(settings.STAGE_TRAIN_ARRIVAL_BUFFER_HOURS)
+    if mode in ("BUS", "CAR_BUS", "AUTOCAR", "COACH"):
+        return float(settings.STAGE_BUS_ARRIVAL_BUFFER_HOURS)
+    if mode in ("BATEAU", "FERRY", "BOAT", "SHIP"):
+        return float(settings.STAGE_BOAT_ARRIVAL_BUFFER_HOURS)
+    if mode in ("VOITURE", "AUTO", "CAR"):
+        return float(settings.STAGE_CAR_ARRIVAL_BUFFER_HOURS)
+    return float(settings.TRIP_ARRIVAL_BUFFER_HOURS)
+
+
+def get_departure_buffer_hours_for_mode(transport_mode: str | None = None) -> float:
+    """Retourne le tampon de départ (en heures) selon le type de trajet de départ de l'étape."""
+    settings = get_settings()
+    mode = (transport_mode or "VOL").strip().upper()
+    if mode in ("TRAIN", "TGV", "RAIL"):
+        return float(settings.STAGE_TRAIN_DEPARTURE_BUFFER_HOURS)
+    if mode in ("BUS", "CAR_BUS", "AUTOCAR", "COACH"):
+        return float(settings.STAGE_BUS_DEPARTURE_BUFFER_HOURS)
+    if mode in ("BATEAU", "FERRY", "BOAT", "SHIP"):
+        return float(settings.STAGE_BOAT_DEPARTURE_BUFFER_HOURS)
+    if mode in ("VOITURE", "AUTO", "CAR"):
+        return float(settings.STAGE_CAR_DEPARTURE_BUFFER_HOURS)
+    return float(settings.TRIP_DEPARTURE_BUFFER_HOURS)
 
 
 def resolve_destination_tz(timezone_name: str | None) -> tzinfo:
@@ -237,15 +276,16 @@ class ItineraryValidationEngine:
     def resolve_trip_window_buffers(
         arrival_buffer_hours: float | None = None,
         departure_buffer_hours: float | None = None,
+        arrival_transport_mode: str | None = None,
+        departure_transport_mode: str | None = None,
     ) -> tuple[float, float]:
-        settings = get_settings()
         arr_buf = (
-            float(settings.TRIP_ARRIVAL_BUFFER_HOURS)
+            get_arrival_buffer_hours_for_mode(arrival_transport_mode)
             if arrival_buffer_hours is None
             else float(arrival_buffer_hours)
         )
         dep_buf = (
-            float(settings.TRIP_DEPARTURE_BUFFER_HOURS)
+            get_departure_buffer_hours_for_mode(departure_transport_mode or arrival_transport_mode)
             if departure_buffer_hours is None
             else float(departure_buffer_hours)
         )
@@ -270,6 +310,8 @@ class ItineraryValidationEngine:
         exclude_item_id: str | None = None,
         arrival_buffer_hours: float | None = None,
         departure_buffer_hours: float | None = None,
+        arrival_transport_mode: str | None = None,
+        departure_transport_mode: str | None = None,
         allow_duplicate_place: bool = False,
     ) -> ValidationResult:
         start_utc = ensure_utc(start_at_utc)
@@ -298,6 +340,8 @@ class ItineraryValidationEngine:
         arr_buf_h, dep_buf_h = cls.resolve_trip_window_buffers(
             arrival_buffer_hours=arrival_buffer_hours,
             departure_buffer_hours=departure_buffer_hours,
+            arrival_transport_mode=arrival_transport_mode,
+            departure_transport_mode=departure_transport_mode,
         )
         raw_arr_utc = ensure_utc(trip_arrival_utc)
         raw_dep_utc = ensure_utc(trip_departure_utc)
@@ -546,6 +590,8 @@ class ItineraryValidationEngine:
         max_suggestions: int = 3,
         arrival_buffer_hours: float | None = None,
         departure_buffer_hours: float | None = None,
+        arrival_transport_mode: str | None = None,
+        departure_transport_mode: str | None = None,
     ) -> list[SuggestedSlot]:
         """
         Recherche et retourne 2 à 3 créneaux libres et 100 % valides dans la fenêtre utile du séjour
@@ -558,6 +604,8 @@ class ItineraryValidationEngine:
         arr_buf_h, dep_buf_h = cls.resolve_trip_window_buffers(
             arrival_buffer_hours=arrival_buffer_hours,
             departure_buffer_hours=departure_buffer_hours,
+            arrival_transport_mode=arrival_transport_mode,
+            departure_transport_mode=departure_transport_mode,
         )
         arr_utc = ensure_utc(trip_arrival_utc)
         dep_utc = ensure_utc(trip_departure_utc)
@@ -664,6 +712,8 @@ class ItineraryValidationEngine:
         exclude_item_id: str | None = None,
         arrival_buffer_hours: float | None = None,
         departure_buffer_hours: float | None = None,
+        arrival_transport_mode: str | None = None,
+        departure_transport_mode: str | None = None,
         allow_duplicate_place: bool = False,
     ) -> ValidationResult:
         """
@@ -689,6 +739,8 @@ class ItineraryValidationEngine:
             exclude_item_id=exclude_item_id,
             arrival_buffer_hours=arrival_buffer_hours,
             departure_buffer_hours=departure_buffer_hours,
+            arrival_transport_mode=arrival_transport_mode,
+            departure_transport_mode=departure_transport_mode,
             allow_duplicate_place=allow_duplicate_place,
         )
         if not result.valid and result.reason_code != "DUPLICATE_PLACE":
@@ -709,5 +761,7 @@ class ItineraryValidationEngine:
                 max_suggestions=3,
                 arrival_buffer_hours=arrival_buffer_hours,
                 departure_buffer_hours=departure_buffer_hours,
+                arrival_transport_mode=arrival_transport_mode,
+                departure_transport_mode=departure_transport_mode,
             )
         return result

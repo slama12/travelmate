@@ -71,6 +71,7 @@ from app.modules.intelligence.schemas import (
 )
 from app.modules.itinerary.router import (
     _build_snapshots,
+    _filter_items_for_stage_validation,
     _load_trip_items_with_places,
     _recompute_trip_day_transits,
     _sync_item_with_google_calendar,
@@ -81,6 +82,11 @@ from app.modules.itinerary.schemas import (
     ItineraryItemResponse,
     SuggestedSlotSchema,
     TripItineraryScheduleResponse,
+)
+from app.modules.trips.stages_service import (
+    ensure_trip_stages,
+    get_effective_departure_mode_for_stage,
+    resolve_stage_for_visit,
 )
 
 logger = logging.getLogger("travelmate.intelligence.chat")
@@ -104,6 +110,8 @@ def _validate_slot(
     transit_mode: str = "METRO",
     exclude_item_id: str | None = None,
     allow_duplicate_place: bool = False,
+    arrival_transport_mode: str | None = None,
+    departure_transport_mode: str | None = None,
 ) -> ValidationResult:
     return ItineraryValidationEngine.validate_visit(
         trip_arrival_utc=trip_arrival_utc,
@@ -120,7 +128,10 @@ def _validate_slot(
         existing_visits=existing_items,
         exclude_item_id=exclude_item_id,
         allow_duplicate_place=allow_duplicate_place,
+        arrival_transport_mode=arrival_transport_mode,
+        departure_transport_mode=departure_transport_mode,
     )
+
 
 
 from app.core.rbac import READ_ROLES, WRITE_ROLES, require_trip_access
@@ -189,19 +200,30 @@ def _format_date_fr(d: date) -> str:
     return f"{_FR_WEEKDAYS[d.weekday()]} {d.day} {_FR_MONTHS[d.month]}"
 
 
-def _compute_trip_dates_local(trip: Trip, dest_tz: str) -> list[date]:
+def _compute_trip_dates_local(trip: Trip, dest_tz: str, stages: list[Any] | None = None) -> list[date]:
+    if stages:
+        loc_arr = stages[0].arrival_date
+        loc_dep = stages[-1].departure_date
+        dates: list[date] = []
+        cur = loc_arr
+        while cur <= loc_dep and len(dates) < 60:
+            dates.append(cur)
+            cur += timedelta(days=1)
+        if dates:
+            return dates
     if trip.arrival_at and trip.departure_at:
         loc_arr = to_destination_local(ensure_utc(trip.arrival_at), dest_tz).date()
         loc_dep = to_destination_local(ensure_utc(trip.departure_at), dest_tz).date()
-        dates: list[date] = []
+        dates = []
         cur = loc_arr
-        while cur <= loc_dep and len(dates) < 14:
+        while cur <= loc_dep and len(dates) < 60:
             dates.append(cur)
             cur += timedelta(days=1)
         if dates:
             return dates
     base = date(2026, 11, 10)
     return [base + timedelta(days=i) for i in range(8)]
+
 
 
 def _format_weather_badge(cond_code: str, temp_c: float | None, available: bool) -> str:
@@ -1366,6 +1388,10 @@ async def _build_safe_trip_context_for_chat(
     3. Les descriptions de lieux sont encapsulées et nettoyées comme de simples données passives.
     """
     dest_tz = destination.timezone or "UTC"
+    stages = await ensure_trip_stages(db, trip)
+    stage_by_id = {s.id: s for s in stages}
+    stage_dest_ids = list({destination.id, *[s.destination_id for s in stages if s.destination_id]})
+
     items, places_map = await _load_trip_items_with_places(db, trip.id)
     items.sort(key=lambda x: ensure_utc(x.start_at))
 
@@ -1403,7 +1429,7 @@ async def _build_safe_trip_context_for_chat(
 
     dest_places_res = await db.scalars(
         select(Place)
-        .where(Place.destination_id == destination.id)
+        .where(Place.destination_id.in_(stage_dest_ids))
         .order_by(Place.notoriety_score.desc(), Place.avg_rating.desc())
     )
     dest_places = list(dest_places_res.all())
@@ -1433,12 +1459,19 @@ async def _build_safe_trip_context_for_chat(
         p = all_places_by_id.get(item.place_id)
         if not p:
             continue
-        loc_s = to_destination_local(ensure_utc(item.start_at), dest_tz)
-        loc_e = to_destination_local(ensure_utc(item.end_at), dest_tz)
+        item_stage = stage_by_id.get(item.stage_id or "")
+        if item_stage is None and stages:
+            item_stage, _ = resolve_stage_for_visit(stages, visit_date=item.visit_date, place=p)
+        item_tz = item_stage.timezone if item_stage else dest_tz
+        loc_s = to_destination_local(ensure_utc(item.start_at), item_tz)
+        loc_e = to_destination_local(ensure_utc(item.end_at), item_tz)
         visits_cost += float(p.estimated_cost or 0.0)
         itinerary_safe.append(
             {
                 "item_id": item.id,
+                "stage_id": item_stage.id if item_stage else item.stage_id,
+                "stage_city_name": item_stage.city_name if item_stage else destination.city_name,
+                "stage_timezone": item_tz,
                 "place_id": p.id,
                 "place_name": p.name,
                 "category": p.category,
@@ -1451,7 +1484,7 @@ async def _build_safe_trip_context_for_chat(
             }
         )
 
-    trip_dates = _compute_trip_dates_local(trip, dest_tz)
+    trip_dates = _compute_trip_dates_local(trip, dest_tz, stages=stages)
     weather_days, _, _, _ = await _fetch_trip_weather_forecasts(
         destination=destination,
         trip_dates=trip_dates,
@@ -1536,7 +1569,22 @@ async def _build_safe_trip_context_for_chat(
             "travel_style": trip.travel_style,
             "total_budget_planned": planned_total,
             "currency": trip.currency,
+            "stages_count": len(stages),
         },
+        "stages": [
+            {
+                "id": s.id,
+                "order_index": s.order_index,
+                "city_name": s.city_name,
+                "country": s.country,
+                "timezone": s.timezone,
+                "arrival_date": s.arrival_date.isoformat(),
+                "departure_date": s.departure_date.isoformat(),
+                "nights": s.nights,
+                "arrival_transport_mode": s.arrival_transport_mode,
+            }
+            for s in stages
+        ],
         "flight": flight_data,
         "accommodation": acc_data,
         "budget": budget_dict,
@@ -1547,6 +1595,7 @@ async def _build_safe_trip_context_for_chat(
         "available_places": available_places_safe,
     }
     return safe_context, all_places_by_id, items
+
 
 
 def _serialize_chat_message(msg: ChatMessage) -> ChatMessageResponse:
@@ -1964,6 +2013,8 @@ async def send_trip_chat_message(
         db, trip_id, current_user.id, write=True
     )
     dest_tz = destination.timezone or "UTC"
+    stages = await ensure_trip_stages(db, trip)
+    stage_by_id = {s.id: s for s in stages}
 
     hist_res = await db.scalars(
         select(ChatMessage)
@@ -2015,7 +2066,9 @@ async def send_trip_chat_message(
     if last_context_place is None and existing_items:
         last_item = existing_items[-1]
         last_context_place = places_by_id.get(last_item.place_id)
-        loc_last = to_destination_local(ensure_utc(last_item.start_at), dest_tz)
+        last_item_stage = stage_by_id.get(last_item.stage_id or "")
+        last_tz = last_item_stage.timezone if last_item_stage else dest_tz
+        loc_last = to_destination_local(ensure_utc(last_item.start_at), last_tz)
         last_context_date = loc_last.strftime("%Y-%m-%d")
         last_context_time = loc_last.strftime("%H:%M")
 
@@ -2026,7 +2079,9 @@ async def send_trip_chat_message(
             None,
         )
         if sched_for_last is not None:
-            loc_sched = to_destination_local(ensure_utc(sched_for_last.start_at), dest_tz)
+            sched_stage = stage_by_id.get(sched_for_last.stage_id or "")
+            sched_tz = sched_stage.timezone if sched_stage else dest_tz
+            loc_sched = to_destination_local(ensure_utc(sched_for_last.start_at), sched_tz)
             last_context_date = loc_sched.strftime("%Y-%m-%d")
             last_context_time = loc_sched.strftime("%H:%M")
         safe_context["last_place_id"] = last_context_place.id
@@ -2049,7 +2104,8 @@ async def send_trip_chat_message(
     )
     db.add(user_msg)
 
-    trip_dates = _compute_trip_dates_local(trip, dest_tz)
+    trip_dates = _compute_trip_dates_local(trip, dest_tz, stages=stages)
+
 
     def _norm_txt_local(s: str) -> str:
         s_clean = str(s).lower().replace("œ", "oe").replace("æ", "ae")
@@ -2677,8 +2733,10 @@ async def send_trip_chat_message(
         v_date_str: str | None = None
         if act_type == "REMOVE_VISIT":
             if matching_existing_item is not None:
+                m_stage = stage_by_id.get(matching_existing_item.stage_id or "")
+                m_tz = m_stage.timezone if m_stage else dest_tz
                 v_date_str = to_destination_local(
-                    ensure_utc(matching_existing_item.start_at), dest_tz
+                    ensure_utc(matching_existing_item.start_at), m_tz
                 ).strftime("%Y-%m-%d")
                 item_id = matching_existing_item.id
             else:
@@ -2690,8 +2748,10 @@ async def send_trip_chat_message(
         elif named_trip_date is not None:
             v_date_str = named_trip_date.isoformat()
         elif matching_existing_item is not None:
+            m_stage = stage_by_id.get(matching_existing_item.stage_id or "")
+            m_tz = m_stage.timezone if m_stage else dest_tz
             v_date_str = to_destination_local(
-                ensure_utc(matching_existing_item.start_at), dest_tz
+                ensure_utc(matching_existing_item.start_at), m_tz
             ).strftime("%Y-%m-%d")
         else:
             # Date absente du message et aucune visite existante au programme pour ce lieu -> poser une question (ASK)
@@ -2712,9 +2772,21 @@ async def send_trip_chat_message(
             if "?" not in reply_text:
                 reply_text = f"Je ne trouve pas ce lieu à {destination.city_name}. De quel lieu parlez-vous ?"
         elif act_type == "REMOVE_VISIT" and v_date_str is not None:
+            rem_date_obj = date.fromisoformat(v_date_str)
+            rem_stage, _ = resolve_stage_for_visit(
+                stages,
+                visit_date=rem_date_obj,
+                local_start_time=v_time_str,
+                duration_minutes=dur_min,
+                place=place_obj,
+            )
             proposed_action_dict = {
                 "action_type": "REMOVE_VISIT",
                 "item_id": item_id,
+                "stage_id": rem_stage.id if rem_stage else None,
+                "stage_order_index": rem_stage.order_index if rem_stage else None,
+                "stage_city_name": rem_stage.city_name if rem_stage else destination.city_name,
+                "stage_timezone": rem_stage.timezone if rem_stage else dest_tz,
                 "place_id": place_id,
                 "place_name": place_obj.name,
                 "visit_date": v_date_str,
@@ -2734,32 +2806,60 @@ async def send_trip_chat_message(
             action_status = "PENDING_CONFIRMATION"
         elif place_obj is not None and v_date_str is not None:
             v_date_obj = date.fromisoformat(v_date_str)
+            target_stage, target_stage_idx = resolve_stage_for_visit(
+                stages,
+                visit_date=v_date_obj,
+                local_start_time=v_time_str,
+                duration_minutes=dur_min,
+                place=place_obj,
+            )
+            stage_tz = target_stage.timezone if target_stage else dest_tz
+            stage_arr_utc = (
+                ensure_utc(target_stage.arrival_at)
+                if target_stage
+                else (ensure_utc(trip.arrival_at) if trip.arrival_at else None)
+            )
+            stage_dep_utc = (
+                ensure_utc(target_stage.departure_at)
+                if target_stage
+                else (ensure_utc(trip.departure_at) if trip.departure_at else None)
+            )
+            stage_arr_mode = target_stage.arrival_transport_mode if target_stage else None
+            stage_dep_mode = (
+                get_effective_departure_mode_for_stage(stages, target_stage_idx)
+                if target_stage
+                else None
+            )
+
             req_start_utc, req_end_utc = parse_local_slot_to_utc(
                 visit_date=v_date_obj,
                 local_start_time_str=v_time_str,
                 duration_minutes=dur_min,
-                timezone_name=dest_tz,
+                timezone_name=stage_tz,
             )
-            loc_end_str = to_destination_local(req_end_utc, dest_tz).strftime("%H:%M")
-            snapshots = _build_snapshots(existing_items, places_by_id)
+            loc_end_str = to_destination_local(req_end_utc, stage_tz).strftime("%H:%M")
+            stage_items = _filter_items_for_stage_validation(existing_items, target_stage, stages)
+            snapshots = _build_snapshots(stage_items, places_by_id, stage_tz)
             if act_type == "MOVE_VISIT" and item_id:
                 snapshots = [s for s in snapshots if s.item_id != item_id]
 
             val_res = _validate_slot(
                 requested_start_utc=req_start_utc,
                 duration_minutes=dur_min,
-                destination_timezone=dest_tz,
+                destination_timezone=stage_tz,
                 place_id=place_obj.id,
                 place_name=place_obj.name,
                 place_latitude=place_obj.latitude,
                 place_longitude=place_obj.longitude,
                 place_opening_hours=place_obj.opening_hours or {},
-                trip_arrival_utc=ensure_utc(trip.arrival_at) if trip.arrival_at else None,
-                trip_departure_utc=ensure_utc(trip.departure_at) if trip.departure_at else None,
+                trip_arrival_utc=stage_arr_utc,
+                trip_departure_utc=stage_dep_utc,
                 existing_items=snapshots,
                 transit_mode=t_mode,
                 exclude_item_id=item_id if act_type == "MOVE_VISIT" else None,
                 allow_duplicate_place=explicit_second_time if act_type == "ADD_VISIT" else True,
+                arrival_transport_mode=stage_arr_mode,
+                departure_transport_mode=stage_dep_mode,
             )
 
             # Si le moteur de validation refuse un doublon de lieu, on renvoie un message de refus clair sans carte de confirmation
@@ -2793,10 +2893,20 @@ async def send_trip_chat_message(
                         )
 
                 if not val_res.valid:
-                    # Si l'horaire demandé est libre un autre jour du séjour (ex. la veille ou le lendemain),
+                    # Si l'horaire demandé est libre un autre jour de la même étape (ex. la veille ou le lendemain),
                     # le placer en tête des propositions alternatives.
+                    candidate_pool = (
+                        [
+                            d
+                            for d in trip_dates
+                            if d != v_date_obj
+                            and target_stage.arrival_date <= d <= target_stage.departure_date
+                        ]
+                        if target_stage is not None
+                        else [d for d in trip_dates if d != v_date_obj]
+                    )
                     other_days = sorted(
-                        [d for d in trip_dates if d != v_date_obj],
+                        candidate_pool,
                         key=lambda d: (0 if (d - v_date_obj).days == -1 else 1, abs((d - v_date_obj).days), d),
                     )
                     for cand_day in other_days:
@@ -2804,34 +2914,36 @@ async def send_trip_chat_message(
                             visit_date=cand_day,
                             local_start_time_str=v_time_str,
                             duration_minutes=dur_min,
-                            timezone_name=dest_tz,
+                            timezone_name=stage_tz,
                         )
                         cand_check = _validate_slot(
                             requested_start_utc=cand_s_utc,
                             duration_minutes=dur_min,
-                            destination_timezone=dest_tz,
+                            destination_timezone=stage_tz,
                             place_id=place_obj.id,
                             place_name=place_obj.name,
                             place_latitude=place_obj.latitude,
                             place_longitude=place_obj.longitude,
                             place_opening_hours=place_obj.opening_hours or {},
-                            trip_arrival_utc=ensure_utc(trip.arrival_at) if trip.arrival_at else None,
-                            trip_departure_utc=ensure_utc(trip.departure_at) if trip.departure_at else None,
+                            trip_arrival_utc=stage_arr_utc,
+                            trip_departure_utc=stage_dep_utc,
                             existing_items=snapshots,
                             transit_mode=t_mode,
                             exclude_item_id=item_id if act_type == "MOVE_VISIT" else None,
                             allow_duplicate_place=True,
+                            arrival_transport_mode=stage_arr_mode,
+                            departure_transport_mode=stage_dep_mode,
                         )
                         if cand_check.valid:
-                            loc_s = to_destination_local(cand_s_utc, dest_tz)
-                            loc_e = to_destination_local(cand_e_utc, dest_tz)
+                            loc_s = to_destination_local(cand_s_utc, stage_tz)
+                            loc_e = to_destination_local(cand_e_utc, stage_tz)
                             same_hour_slot = SuggestedSlotSchema(
                                 start_at=cand_s_utc.isoformat(),
                                 end_at=cand_e_utc.isoformat(),
                                 local_date=loc_s.strftime("%Y-%m-%d"),
                                 local_start_time=loc_s.strftime("%H:%M"),
                                 local_end_time=loc_e.strftime("%H:%M"),
-                                timezone=dest_tz,
+                                timezone=stage_tz,
                                 label=f"{_format_date_fr(cand_day)} de {loc_s.strftime('%H:%M')} à {loc_e.strftime('%H:%M')}",
                             ).model_dump(mode="json")
                             sug_dicts = [
@@ -2941,6 +3053,10 @@ async def send_trip_chat_message(
                 proposed_action_dict = {
                     "action_type": act_type,
                     "item_id": item_id,
+                    "stage_id": target_stage.id if target_stage else None,
+                    "stage_order_index": target_stage.order_index if target_stage else None,
+                    "stage_city_name": target_stage.city_name if target_stage else destination.city_name,
+                    "stage_timezone": stage_tz,
                     "place_id": place_obj.id,
                     "place_name": place_obj.name,
                     "visit_date": v_date_str,
@@ -3024,6 +3140,8 @@ async def confirm_chat_proposed_action(
         db, trip_id, current_user.id, write=True
     )
     dest_tz = destination.timezone or "UTC"
+    stages = await ensure_trip_stages(db, trip)
+    stage_dest_ids = list({destination.id, *[s.destination_id for s in stages if s.destination_id]})
 
     msg = await db.scalar(
         select(ChatMessage).where(
@@ -3082,7 +3200,7 @@ async def confirm_chat_proposed_action(
         await db.delete(it_obj)
         msg.action_status = "CONFIRMED"
         await db.commit()
-        await _recompute_trip_day_transits(db, trip.id, dest_tz)
+        await _recompute_trip_day_transits(db, trip.id, dest_tz, stages=stages)
         return ChatActionDecisionResponse(
             message=_serialize_chat_message(msg),
             applied_change=True,
@@ -3092,7 +3210,7 @@ async def confirm_chat_proposed_action(
         )
 
     place = await db.scalar(
-        select(Place).where(Place.id == place_id, Place.destination_id == destination.id)
+        select(Place).where(Place.id == place_id, Place.destination_id.in_(stage_dest_ids))
     )
     if not place:
         raise HTTPException(status_code=404, detail="Lieu introuvable pour cette destination.")
@@ -3104,11 +3222,38 @@ async def confirm_chat_proposed_action(
     else:
         v_date = override_visit_date or date.fromisoformat(str(action["visit_date"]))
         v_time = override_local_start_time or str(action["local_start_time"])
+
+    target_stage, target_stage_idx = resolve_stage_for_visit(
+        stages,
+        visit_date=v_date,
+        local_start_time=v_time,
+        duration_minutes=dur_min,
+        place=place,
+        explicit_stage_id=str(action["stage_id"]) if (override_visit_date is None and action.get("stage_id")) else None,
+    )
+    stage_tz = target_stage.timezone if target_stage else dest_tz
+    stage_arr_utc = (
+        ensure_utc(target_stage.arrival_at)
+        if target_stage
+        else (ensure_utc(trip.arrival_at) if trip.arrival_at else None)
+    )
+    stage_dep_utc = (
+        ensure_utc(target_stage.departure_at)
+        if target_stage
+        else (ensure_utc(trip.departure_at) if trip.departure_at else None)
+    )
+    stage_arr_mode = target_stage.arrival_transport_mode if target_stage else None
+    stage_dep_mode = (
+        get_effective_departure_mode_for_stage(stages, target_stage_idx)
+        if target_stage
+        else None
+    )
+
     req_start_utc, req_end_utc = parse_local_slot_to_utc(
         visit_date=v_date,
         local_start_time_str=v_time,
         duration_minutes=dur_min,
-        timezone_name=dest_tz,
+        timezone_name=stage_tz,
     )
 
     existing_items, places_map = await _load_trip_items_with_places(db, trip.id)
@@ -3126,25 +3271,28 @@ async def confirm_chat_proposed_action(
         if target_existing_item is not None and act_type == "MOVE_VISIT":
             item_id = target_existing_item.id
 
-    snapshots = _build_snapshots(existing_items, places_map)
+    stage_items = _filter_items_for_stage_validation(existing_items, target_stage, stages)
+    snapshots = _build_snapshots(stage_items, places_map, stage_tz)
     if act_type == "MOVE_VISIT" and item_id:
         snapshots = [s for s in snapshots if s.item_id != item_id]
 
     val_res = _validate_slot(
         requested_start_utc=req_start_utc,
         duration_minutes=dur_min,
-        destination_timezone=dest_tz,
+        destination_timezone=stage_tz,
         place_id=place.id,
         place_name=place.name,
         place_latitude=place.latitude,
         place_longitude=place.longitude,
         place_opening_hours=place.opening_hours or {},
-        trip_arrival_utc=ensure_utc(trip.arrival_at) if trip.arrival_at else None,
-        trip_departure_utc=ensure_utc(trip.departure_at) if trip.departure_at else None,
+        trip_arrival_utc=stage_arr_utc,
+        trip_departure_utc=stage_dep_utc,
         existing_items=snapshots,
         transit_mode=t_mode,
         exclude_item_id=item_id if act_type == "MOVE_VISIT" else None,
         allow_duplicate_place=True if act_type == "MOVE_VISIT" else allow_dup,
+        arrival_transport_mode=stage_arr_mode,
+        departure_transport_mode=stage_dep_mode,
     )
     if not val_res.valid:
         raise HTTPException(
@@ -3164,6 +3312,8 @@ async def confirm_chat_proposed_action(
     if act_type == "MOVE_VISIT":
         if target_existing_item is None:
             raise HTTPException(status_code=404, detail="Visite à déplacer introuvable.")
+        if target_stage is not None:
+            target_existing_item.stage_id = target_stage.id
         target_existing_item.visit_date = v_date
         target_existing_item.start_at = req_start_utc
         target_existing_item.end_at = req_end_utc
@@ -3171,12 +3321,12 @@ async def confirm_chat_proposed_action(
         target_existing_item.transit_mode_to_next = t_mode
         msg.action_status = "CONFIRMED"
         await db.commit()
-        await _recompute_trip_day_transits(db, trip.id, dest_tz)
-        await _sync_item_with_google_calendar(db, target_existing_item, place, dest_tz, action="update")
+        await _recompute_trip_day_transits(db, trip.id, dest_tz, stages=stages)
+        await _sync_item_with_google_calendar(db, target_existing_item, place, stage_tz, action="update")
         return ChatActionDecisionResponse(
             message=_serialize_chat_message(msg),
             applied_change=True,
-            updated_item=_to_item_response(target_existing_item, place, dest_tz),
+            updated_item=_to_item_response(target_existing_item, place, stage_tz, stage=target_stage),
             deleted_item_id=None,
             detail_fr=(
                 f"Modification confirmée et appliquée : visite « {place.name} » "
@@ -3186,6 +3336,7 @@ async def confirm_chat_proposed_action(
 
     new_item = ItineraryItem(
         trip_id=trip.id,
+        stage_id=target_stage.id if target_stage is not None else None,
         place_id=place.id,
         visit_date=v_date,
         start_at=req_start_utc,
@@ -3204,19 +3355,20 @@ async def confirm_chat_proposed_action(
     msg.action_status = "CONFIRMED"
     await db.commit()
     await db.refresh(new_item)
-    await _recompute_trip_day_transits(db, trip.id, dest_tz)
-    await _sync_item_with_google_calendar(db, new_item, place, dest_tz, action="create")
+    await _recompute_trip_day_transits(db, trip.id, dest_tz, stages=stages)
+    await _sync_item_with_google_calendar(db, new_item, place, stage_tz, action="create")
 
     return ChatActionDecisionResponse(
         message=_serialize_chat_message(msg),
         applied_change=True,
-        updated_item=_to_item_response(new_item, place, dest_tz),
+        updated_item=_to_item_response(new_item, place, stage_tz, stage=target_stage),
         deleted_item_id=None,
         detail_fr=(
             f"Modification confirmée et appliquée : visite « {place.name} » "
             f"ajoutée le {_format_date_fr(v_date)} à {v_time}."
         ),
     )
+
 
 
 @router.post(

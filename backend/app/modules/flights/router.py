@@ -1,4 +1,4 @@
-from datetime import date, timezone
+from datetime import date, timedelta, timezone
 from decimal import Decimal
 import json
 import uuid
@@ -17,6 +17,7 @@ from app.modules.flights.schemas import (
     FlightBookingResponse,
     FlightOfferResponse,
 )
+from app.modules.trips.stages_service import ensure_trip_stages
 
 router = APIRouter(prefix="/flights", tags=["Flights"])
 
@@ -38,6 +39,7 @@ def _to_booking_response(
     return FlightBookingResponse(
         id=booking.id,
         trip_id=booking.trip_id,
+        stage_id=booking.stage_id,
         idempotency_key=booking.idempotency_key,
         idempotent_replay=idempotent_replay,
         pnr_reference=booking.pnr_reference,
@@ -329,8 +331,21 @@ async def book_flight_atomically(
             detail="Voyage introuvable ou accès non autorisé.",
         )
 
+    stages = await ensure_trip_stages(db, trip)
+    target_stage = None
+    if payload.stage_id:
+        target_stage = next((st for st in stages if st.id == payload.stage_id), None)
+        if target_stage is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Étape introuvable sur ce voyage.",
+            )
+    elif stages:
+        target_stage = stages[0]
+
+    target_dest_id = target_stage.destination_id if target_stage else trip.destination_id
     trip_dest = await db.scalar(
-        select(Destination).where(Destination.id == trip.destination_id)
+        select(Destination).where(Destination.id == target_dest_id)
     )
     effective_origin_iata = payload.origin_iata.upper()
     if trip_dest and trip_dest.iata_code:
@@ -460,6 +475,7 @@ async def book_flight_atomically(
         current_step = "budget_expense_added"
         budget_item = BudgetItem(
             trip_id=trip.id,
+            stage_id=target_stage.id if target_stage else None,
             category=BudgetCategory.FLIGHT.value,
             title=f"Vol A/R {payload.airline} ({payload.flight_number_outbound}/{payload.flight_number_inbound}) - PNR {pnr}",
             planned_amount=price_dec,
@@ -470,10 +486,29 @@ async def book_flight_atomically(
         await db.flush()
         steps["budget_expense_added"] = True
 
-        # Étape C : Mise à jour de la fenêtre stricte du séjour sur Trip (stockage UTC)
+        # Étape C : Mise à jour de la fenêtre stricte du séjour sur Trip et de l'étape cible (stockage UTC)
         current_step = "trip_dates_updated"
-        trip.arrival_at = arr_out_utc
-        trip.departure_at = dep_in_utc
+        if target_stage is not None:
+            target_stage.transport_unlocked = True
+            target_stage.transport_booking_ref = pnr
+            if len(stages) == 1:
+                from zoneinfo import ZoneInfo
+
+                st_tz = ZoneInfo(target_stage.timezone or "UTC")
+                arr_loc_d = arr_out_utc.astimezone(st_tz).date()
+                dep_loc_d = dep_in_utc.astimezone(st_tz).date()
+                if dep_loc_d <= arr_loc_d:
+                    dep_loc_d = arr_loc_d + timedelta(days=1)
+                target_stage.arrival_date = arr_loc_d
+                target_stage.departure_date = dep_loc_d
+                target_stage.nights = max(1, (dep_loc_d - arr_loc_d).days)
+                target_stage.arrival_at = arr_out_utc
+                target_stage.departure_at = dep_in_utc
+                trip.arrival_at = arr_out_utc
+                trip.departure_at = dep_in_utc
+        else:
+            trip.arrival_at = arr_out_utc
+            trip.departure_at = dep_in_utc
         trip.status = TripStatus.BOOKED.value
         steps["trip_dates_updated"] = True
 
@@ -481,6 +516,7 @@ async def book_flight_atomically(
         current_step = "booking_created"
         booking = FlightBooking(
             trip_id=trip.id,
+            stage_id=target_stage.id if target_stage else None,
             idempotency_key=payload.idempotency_key,
             pnr_reference=pnr,
             airline=payload.airline,

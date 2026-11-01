@@ -100,9 +100,17 @@ class Settings(BaseSettings):
     GEONAMES_DAILY_QUOTA: int = Field(default=20000, ge=1)
     GEONAMES_USER_HOURLY_QUOTA: int = Field(default=60, ge=1)
 
-    # --- Fenêtre de visite du séjour (tampons configurables après arrivée et avant départ) ---
+    # --- Fenêtre de visite du séjour et par étape (tampons configurables selon le mode de trajet) ---
     TRIP_ARRIVAL_BUFFER_HOURS: float = Field(default=2.0, ge=0.0)
     TRIP_DEPARTURE_BUFFER_HOURS: float = Field(default=3.0, ge=0.0)
+    STAGE_TRAIN_ARRIVAL_BUFFER_HOURS: float = Field(default=0.5, ge=0.0)
+    STAGE_TRAIN_DEPARTURE_BUFFER_HOURS: float = Field(default=1.0, ge=0.0)
+    STAGE_BUS_ARRIVAL_BUFFER_HOURS: float = Field(default=0.5, ge=0.0)
+    STAGE_BUS_DEPARTURE_BUFFER_HOURS: float = Field(default=1.0, ge=0.0)
+    STAGE_BOAT_ARRIVAL_BUFFER_HOURS: float = Field(default=1.0, ge=0.0)
+    STAGE_BOAT_DEPARTURE_BUFFER_HOURS: float = Field(default=1.5, ge=0.0)
+    STAGE_CAR_ARRIVAL_BUFFER_HOURS: float = Field(default=0.0, ge=0.0)
+    STAGE_CAR_DEPARTURE_BUFFER_HOURS: float = Field(default=0.0, ge=0.0)
 
     @property
     def cors_origins_list(self) -> list[str]:

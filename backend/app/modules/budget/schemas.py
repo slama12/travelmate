@@ -19,6 +19,7 @@ CATEGORY_INPUT_MAP: dict[str, str] = {
     "ACTIVITÉS": "ACTIVITY",
     "VISITE": "ACTIVITY",
     "MEAL": "MEAL",
+    "FOOD": "MEAL",
     "REPAS": "MEAL",
     "RESTAURANT": "MEAL",
     "NOURRITURE": "MEAL",
@@ -47,6 +48,14 @@ EXCHANGE_RATES_PER_EUR: dict[str, Decimal] = {
     "CAD": Decimal("1.48"),
     "MAD": Decimal("10.80"),
     "JPY": Decimal("162.00"),
+    "THB": Decimal("38.50"),
+    "SGD": Decimal("1.45"),
+    "AUD": Decimal("1.65"),
+    "BRL": Decimal("5.40"),
+    "MXN": Decimal("18.50"),
+    "AED": Decimal("3.97"),
+    "TRY": Decimal("35.00"),
+    "KRW": Decimal("1450.00"),
 }
 
 
@@ -92,12 +101,13 @@ def convert_currency_decimal(
 
 
 class BudgetExpenseCreateRequest(BaseModel):
-    """Formulaire d'ajout de dépense manuelle (strictement 4 champs maximum)."""
+    """Formulaire d'ajout de dépense manuelle (avec rattachement optionnel à une étape)."""
 
     amount: Decimal = Field(..., gt=Decimal("0.00"))
     category: str = Field(..., min_length=2, max_length=40)
     title: str = Field(..., min_length=2, max_length=255)
     currency: str = Field(default="EUR", min_length=3, max_length=3)
+    stage_id: str | None = None
 
     @field_validator("amount", mode="before")
     @classmethod
@@ -153,6 +163,9 @@ class BudgetExpenseItemResponse(BaseModel):
 
     id: str
     trip_id: str
+    stage_id: str | None = None
+    stage_order_index: int | None = None
+    stage_city_name: str | None = None
     category: str
     category_label_fr: str
     title: str
@@ -164,6 +177,28 @@ class BudgetExpenseItemResponse(BaseModel):
     is_committed: bool
     source_label_fr: str
     created_at_fr: str
+
+
+class BudgetStageBreakdownSchema(BaseModel):
+    stage_id: str
+    order_index: int
+    city_name: str
+    country_name: str
+    country: str = ""
+    nights: int
+    planned_amount: Decimal | None = None
+    spent_amount: Decimal
+    total_spent: Decimal = Decimal("0.00")
+    share_percent: Decimal
+    items_count: int
+    categories: list[BudgetCategoryBreakdownSchema] = Field(default_factory=list)
+    items: list[BudgetExpenseItemResponse] = Field(default_factory=list)
+
+    def model_post_init(self, __context: object) -> None:
+        if not self.country and self.country_name:
+            self.country = self.country_name
+        if self.total_spent == Decimal("0.00") and self.spent_amount != Decimal("0.00"):
+            self.total_spent = self.spent_amount
 
 
 class TripBudgetSummaryResponse(BaseModel):
@@ -179,6 +214,7 @@ class TripBudgetSummaryResponse(BaseModel):
     alert_level: str
     alert_message_fr: str | None = None
     categories: list[BudgetCategoryBreakdownSchema]
+    stages_breakdown: list[BudgetStageBreakdownSchema] = Field(default_factory=list)
     items: list[BudgetExpenseItemResponse]
     supported_currencies: list[str]
     exchange_rates_per_eur: dict[str, Decimal]

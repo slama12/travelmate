@@ -1,32 +1,177 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import or_, select
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from sqlalchemy import delete, or_, select
 
 from app.core.database import AsyncSession, get_db
+from app.core.itinerary_validator import ensure_utc, to_destination_local
 from app.core.rbac import (
     OWNER_ROLES,
     READ_ROLES,
     ROLE_LABELS_FR,
+    WRITE_ROLES,
     get_user_trip_role,
     normalize_member_role,
     require_trip_access,
 )
-from app.models.entities import Destination, Trip, TripMember, User
-from app.models.enums import InviteStatus, MemberRole, TripStatus
+from app.models.entities import (
+    BudgetItem,
+    Destination,
+    FlightBooking,
+    ItineraryItem,
+    Trip,
+    TripMember,
+    TripStage,
+    User,
+)
+from app.models.enums import (
+    BudgetCategory,
+    InviteStatus,
+    MemberRole,
+    StageArrivalTransportMode,
+    TripStatus,
+    normalize_stage_transport_mode,
+)
 from app.modules.auth.router import get_current_user
 from app.modules.trips.schemas import (
     TripCreateRequest,
     TripMemberResponse,
     TripMemberUpsertRequest,
     TripResponse,
+    TripStageBatchUpdateRequest,
+    TripStageConfirmTransportRequest,
+    TripStageInput,
+    TripStageReorderRequest,
+    TripStageResponse,
+)
+from app.modules.trips.stages_service import (
+    _default_stage_timestamps_utc,
+    build_stage_transport_details,
+    compute_stage_window_info,
+    ensure_trip_stages,
+    get_effective_departure_mode_for_stage,
+    resolve_stage_destination,
+    sync_trip_header_from_stages,
+    validate_stages_rules,
 )
 
 router = APIRouter(prefix="/trips", tags=["Séjours (Trips)"])
 
 
-def _serialize_trip(trip: Trip, role: str = "OWNER") -> TripResponse:
+def _serialize_stages_list(stages: list[TripStage]) -> list[TripStageResponse]:
+    ordered = sorted(stages, key=lambda s: s.order_index)
+    out: list[TripStageResponse] = []
+    for idx, st in enumerate(ordered):
+        win = compute_stage_window_info(ordered, idx)
+        item = TripStageResponse.model_validate(st)
+        item.departure_transport_mode = win["departure_transport_mode"]
+        item.arrival_buffer_hours = float(win["arrival_buffer_hours"])
+        item.departure_buffer_hours = float(win["departure_buffer_hours"])
+        item.visit_window_start_utc = win["visit_window_start_utc"]
+        item.visit_window_end_utc = win["visit_window_end_utc"]
+        item.visit_window_start_local = win["visit_window_start_local"]
+        item.visit_window_end_local = win["visit_window_end_local"]
+        item.gallery_unlocked = bool(st.transport_unlocked)
+        out.append(item)
+    return out
+
+
+async def _serialize_trip_async(
+    db: AsyncSession,
+    trip: Trip,
+    role: str = "OWNER",
+) -> TripResponse:
+    stages = await ensure_trip_stages(db, trip)
     resp = TripResponse.model_validate(trip)
     resp.current_user_role = role
+    resp.stages = _serialize_stages_list(stages)
+    resp.stages_count = len(resp.stages)
+    resp.is_multi_city = resp.stages_count > 1
     return resp
+
+
+async def _prepare_and_validate_stage_specs(
+    db: AsyncSession,
+    stage_inputs: list[TripStageInput],
+) -> list[dict[str, Any]]:
+    if not stage_inputs:
+        validate_stages_rules([])
+
+    specs: list[dict[str, Any]] = []
+    for idx, inp in enumerate(stage_inputs):
+        spec: dict[str, Any] = {
+            "destination_id": inp.destination_id,
+            "geoname_id": inp.geoname_id,
+            "city_name": inp.city_name,
+            "country_name": inp.country_name or "Monde",
+            "country_code_iso2": (inp.country_code_iso2 or "XX")[:2],
+            "timezone": inp.timezone,
+            "latitude": inp.latitude,
+            "longitude": inp.longitude,
+            "iata_code": inp.iata_code,
+            "arrival_date": inp.arrival_date,
+            "nights": inp.nights,
+            "departure_date": inp.departure_date,
+            "arrival_at": inp.arrival_at,
+            "departure_at": inp.departure_at,
+            "arrival_time_local": inp.arrival_time_local,
+            "departure_time_local": inp.departure_time_local,
+            "arrival_transport_mode": inp.arrival_transport_mode,
+            "departure_transport_mode": inp.departure_transport_mode,
+            "transport_unlocked": inp.transport_unlocked,
+            "transport_booking_ref": inp.transport_booking_ref,
+            "selected_place_ids": list(inp.selected_place_ids or []),
+            "planned_budget": inp.planned_budget,
+        }
+        # Si destination_id est fourni sans city_name, pré-charge la destination pour les messages et l'identité de ville
+        if spec["destination_id"] and not spec["city_name"]:
+            dest_row = await db.scalar(
+                select(Destination).where(Destination.id == str(spec["destination_id"]))
+            )
+            if not dest_row:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Destination introuvable.",
+                )
+            spec["city_name"] = dest_row.city_name
+            spec["country_name"] = dest_row.country_name
+            spec["country_code_iso2"] = dest_row.country_code_iso2
+            spec["geoname_id"] = dest_row.geoname_id
+            spec["timezone"] = spec["timezone"] or dest_row.timezone
+        specs.append(spec)
+
+    # Validation des règles métier (1..10 étapes, >= 1 nuit, consécutives sans trou ni chevauchement, pas 2x la même ville de suite)
+    validate_stages_rules(specs)
+
+    # Résolution complète des destinations GeoNames/DB et calcul des horodatages UTC dans le fuseau de chaque étape
+    for idx, spec in enumerate(specs):
+        dest = await resolve_stage_destination(db, spec)
+        tz_name = str(spec.get("timezone") or dest.timezone or "UTC")
+        dep_date, arr_utc, dep_utc = _default_stage_timestamps_utc(
+            arrival_date=spec["arrival_date"],
+            nights=int(spec["nights"]),
+            tz_name=tz_name,
+            explicit_arrival_at=spec.get("arrival_at"),
+            explicit_departure_at=spec.get("departure_at"),
+            arrival_time_local=spec.get("arrival_time_local"),
+            departure_time_local=spec.get("departure_time_local"),
+        )
+        spec["destination_id"] = dest.id
+        spec["geoname_id"] = spec.get("geoname_id") or dest.geoname_id
+        spec["city_name"] = dest.city_name
+        spec["country_name"] = dest.country_name
+        spec["country_code_iso2"] = (dest.country_code_iso2 or "XX")[:2]
+        spec["timezone"] = tz_name
+        spec["departure_date"] = dep_date
+        spec["arrival_at"] = arr_utc
+        spec["departure_at"] = dep_utc
+
+    # Re-vérifie l'absence de ville identique consécutive après résolution des destinations
+    validate_stages_rules(specs)
+    return specs
+
 
 
 @router.post("", response_model=TripResponse, status_code=status.HTTP_201_CREATED)
@@ -35,30 +180,90 @@ async def create_trip(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TripResponse:
-    dest = await db.scalar(select(Destination).where(Destination.id == payload.destination_id))
-    if not dest:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Destination introuvable.")
+    if payload.stages is not None:
+        specs = await _prepare_and_validate_stage_specs(db, payload.stages)
+        first_spec = specs[0]
+        last_spec = specs[-1]
+        dest = await db.scalar(select(Destination).where(Destination.id == first_spec["destination_id"]))
+        if not dest:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Destination introuvable.")
 
-    if payload.arrival_at and payload.departure_at and payload.departure_at <= payload.arrival_at:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="La date de départ doit être postérieure à la date d'arrivée.",
+        trip = Trip(
+            owner_id=current_user.id,
+            destination_id=dest.id,
+            title=payload.title,
+            travel_style=payload.travel_style.value,
+            total_budget_planned=payload.total_budget_planned,
+            currency=payload.currency.upper(),
+            preferences=payload.preferences,
+            arrival_at=first_spec["arrival_at"],
+            departure_at=last_spec["departure_at"],
+            status=TripStatus.DRAFT.value,
         )
+        db.add(trip)
+        await db.flush()
 
-    trip = Trip(
-        owner_id=current_user.id,
-        destination_id=dest.id,
-        title=payload.title,
-        travel_style=payload.travel_style.value,
-        total_budget_planned=payload.total_budget_planned,
-        currency=payload.currency.upper(),
-        preferences=payload.preferences,
-        arrival_at=payload.arrival_at,
-        departure_at=payload.departure_at,
-        status=TripStatus.DRAFT.value,
-    )
-    db.add(trip)
-    await db.flush()
+        for idx, spec in enumerate(specs):
+            arr_mode = spec["arrival_transport_mode"]
+            default_unlocked = arr_mode in (StageArrivalTransportMode.VOITURE.value,)
+            st = TripStage(
+                trip_id=trip.id,
+                order_index=idx + 1,
+                destination_id=spec["destination_id"],
+                geoname_id=spec["geoname_id"],
+                city_name=spec["city_name"],
+                country_name=spec["country_name"],
+                country_code_iso2=spec["country_code_iso2"],
+                arrival_date=spec["arrival_date"],
+                nights=int(spec["nights"]),
+                departure_date=spec["departure_date"],
+                arrival_at=spec["arrival_at"],
+                departure_at=spec["departure_at"],
+                timezone=spec["timezone"],
+                arrival_transport_mode=arr_mode,
+                departure_transport_mode=spec.get("departure_transport_mode"),
+                transport_unlocked=bool(
+                    spec["transport_unlocked"]
+                    if spec.get("transport_unlocked") is not None
+                    else default_unlocked
+                ),
+                transport_booking_ref=spec.get("transport_booking_ref"),
+                selected_place_ids=spec.get("selected_place_ids") or [],
+                planned_budget=spec.get("planned_budget"),
+            )
+            db.add(st)
+        await db.flush()
+    else:
+        if not payload.destination_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Veuillez préciser une destination ou une liste d'étapes.",
+            )
+        dest = await db.scalar(select(Destination).where(Destination.id == payload.destination_id))
+        if not dest:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Destination introuvable.")
+
+        if payload.arrival_at and payload.departure_at and payload.departure_at <= payload.arrival_at:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="La date de départ doit être postérieure à la date d'arrivée.",
+            )
+
+        trip = Trip(
+            owner_id=current_user.id,
+            destination_id=dest.id,
+            title=payload.title,
+            travel_style=payload.travel_style.value,
+            total_budget_planned=payload.total_budget_planned,
+            currency=payload.currency.upper(),
+            preferences=payload.preferences,
+            arrival_at=payload.arrival_at,
+            departure_at=payload.departure_at,
+            status=TripStatus.DRAFT.value,
+        )
+        db.add(trip)
+        await db.flush()
+        await ensure_trip_stages(db, trip)
 
     db.add(
         TripMember(
@@ -70,10 +275,11 @@ async def create_trip(
     )
 
     if current_user.email == "demo@travelmate.app" and payload.title.startswith("Séjour à "):
-        from datetime import date
         from app.core.security import get_envelope_cipher
-        from app.models.entities import BudgetItem, VaultDocument
-        from app.models.enums import BudgetCategory
+        from app.models.entities import VaultDocument
+
+        stages_now = await ensure_trip_stages(db, trip)
+        first_stage_id = stages_now[0].id if stages_now else None
 
         default_expenses = [
             (BudgetCategory.ACCOMMODATION.value, f"Hébergement sélectionné ({dest.city_name})", Decimal("660.00")),
@@ -85,6 +291,7 @@ async def create_trip(
             db.add(
                 BudgetItem(
                     trip_id=trip.id,
+                    stage_id=first_stage_id,
                     category=cat_code,
                     title=title_fr,
                     amount=amt_dec,
@@ -122,7 +329,7 @@ async def create_trip(
 
     await db.commit()
     await db.refresh(trip)
-    return _serialize_trip(trip, MemberRole.OWNER.value)
+    return await _serialize_trip_async(db, trip, MemberRole.OWNER.value)
 
 
 @router.get("", response_model=list[TripResponse])
@@ -147,7 +354,7 @@ async def list_my_trips(
     out: list[TripResponse] = []
     for t in trips:
         role = await get_user_trip_role(db, t, current_user.id) or MemberRole.VIEWER.value
-        out.append(_serialize_trip(t, role))
+        out.append(await _serialize_trip_async(db, t, role))
     return out
 
 
@@ -160,7 +367,519 @@ async def get_trip(
     trip, _dest, user_role = await require_trip_access(
         db, trip_id, current_user.id, allowed_roles=READ_ROLES
     )
-    return _serialize_trip(trip, user_role)
+    return await _serialize_trip_async(db, trip, user_role)
+
+
+# ==============================================================================
+# GESTION DES ÉTAPES MULTI-VILLES (Création, Lecture, Réordonnancement, Suppression)
+# ==============================================================================
+
+
+@router.get("/{trip_id}/stages", response_model=list[TripStageResponse])
+@router.get("/{trip_id}/steps", response_model=list[TripStageResponse], include_in_schema=False)
+async def list_trip_stages(
+    trip_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TripStageResponse]:
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=READ_ROLES
+    )
+    stages = await ensure_trip_stages(db, trip)
+    await db.commit()
+    return _serialize_stages_list(stages)
+
+
+@router.post(
+    "/{trip_id}/stages",
+    response_model=list[TripStageResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+@router.post(
+    "/{trip_id}/steps",
+    response_model=list[TripStageResponse],
+    status_code=status.HTTP_201_CREATED,
+    include_in_schema=False,
+)
+async def add_or_create_trip_stage(
+    trip_id: str,
+    payload: dict[str, Any] = Body(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TripStageResponse]:
+    """
+    Ajoute une nouvelle étape à la suite du voyage (ou remplace la liste si {"stages": [...]} est fourni),
+    en vérifiant toutes les règles métier (1..10 étapes, >=1 nuit, consécutives sans trou ni chevauchement,
+    pas deux fois la même ville à la suite) et le contrôle d'accès par rôle (WRITE_ROLES).
+    """
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
+    )
+    if "stages" in payload and isinstance(payload["stages"], list):
+        batch = TripStageBatchUpdateRequest.model_validate(payload)
+        return await replace_trip_stages(trip_id, batch, current_user, db)
+
+    stage_input = TripStageInput.model_validate(payload)
+    existing_stages = await ensure_trip_stages(db, trip)
+
+    combined_inputs: list[TripStageInput] = [
+        TripStageInput(
+            destination_id=st.destination_id,
+            geoname_id=st.geoname_id,
+            city_name=st.city_name,
+            country_name=st.country_name,
+            country_code_iso2=st.country_code_iso2,
+            timezone=st.timezone,
+            arrival_date=st.arrival_date,
+            nights=st.nights,
+            departure_date=st.departure_date,
+            arrival_at=st.arrival_at,
+            departure_at=st.departure_at,
+            arrival_transport_mode=st.arrival_transport_mode,
+            departure_transport_mode=st.departure_transport_mode,
+            transport_unlocked=st.transport_unlocked,
+            transport_booking_ref=st.transport_booking_ref,
+            selected_place_ids=list(st.selected_place_ids or []),
+            planned_budget=float(st.planned_budget) if st.planned_budget is not None else None,
+        )
+        for st in existing_stages
+    ]
+    combined_inputs.append(stage_input)
+
+    specs = await _prepare_and_validate_stage_specs(db, combined_inputs)
+    new_spec = specs[-1]
+    new_stage = TripStage(
+        trip_id=trip.id,
+        order_index=len(existing_stages) + 1,
+        destination_id=new_spec["destination_id"],
+        geoname_id=new_spec["geoname_id"],
+        city_name=new_spec["city_name"],
+        country_name=new_spec["country_name"],
+        country_code_iso2=new_spec["country_code_iso2"],
+        arrival_date=new_spec["arrival_date"],
+        nights=int(new_spec["nights"]),
+        departure_date=new_spec["departure_date"],
+        arrival_at=new_spec["arrival_at"],
+        departure_at=new_spec["departure_at"],
+        timezone=new_spec["timezone"],
+        arrival_transport_mode=new_spec["arrival_transport_mode"],
+        departure_transport_mode=new_spec.get("departure_transport_mode"),
+        transport_unlocked=bool(
+            new_spec["transport_unlocked"]
+            if new_spec.get("transport_unlocked") is not None
+            else (new_spec["arrival_transport_mode"] == StageArrivalTransportMode.VOITURE.value)
+        ),
+        transport_booking_ref=new_spec.get("transport_booking_ref"),
+        selected_place_ids=new_spec.get("selected_place_ids") or [],
+        planned_budget=new_spec.get("planned_budget"),
+    )
+    db.add(new_stage)
+    await db.flush()
+
+    all_stages = existing_stages + [new_stage]
+    sync_trip_header_from_stages(trip, all_stages)
+    await db.commit()
+    return _serialize_stages_list(all_stages)
+
+
+@router.put("/{trip_id}/stages", response_model=list[TripStageResponse])
+@router.put("/{trip_id}/steps", response_model=list[TripStageResponse], include_in_schema=False)
+async def replace_trip_stages(
+    trip_id: str,
+    payload: TripStageBatchUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TripStageResponse]:
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
+    )
+    specs = await _prepare_and_validate_stage_specs(db, payload.stages)
+
+    await db.execute(delete(TripStage).where(TripStage.trip_id == trip.id))
+    await db.flush()
+
+    created_stages: list[TripStage] = []
+    for idx, spec in enumerate(specs):
+        st = TripStage(
+            trip_id=trip.id,
+            order_index=idx + 1,
+            destination_id=spec["destination_id"],
+            geoname_id=spec["geoname_id"],
+            city_name=spec["city_name"],
+            country_name=spec["country_name"],
+            country_code_iso2=spec["country_code_iso2"],
+            arrival_date=spec["arrival_date"],
+            nights=int(spec["nights"]),
+            departure_date=spec["departure_date"],
+            arrival_at=spec["arrival_at"],
+            departure_at=spec["departure_at"],
+            timezone=spec["timezone"],
+            arrival_transport_mode=spec["arrival_transport_mode"],
+            departure_transport_mode=spec.get("departure_transport_mode"),
+            transport_unlocked=bool(
+                spec["transport_unlocked"]
+                if spec.get("transport_unlocked") is not None
+                else (spec["arrival_transport_mode"] == StageArrivalTransportMode.VOITURE.value)
+            ),
+            transport_booking_ref=spec.get("transport_booking_ref"),
+            selected_place_ids=spec.get("selected_place_ids") or [],
+            planned_budget=spec.get("planned_budget"),
+        )
+        db.add(st)
+        created_stages.append(st)
+
+    await db.flush()
+    sync_trip_header_from_stages(trip, created_stages)
+    await db.commit()
+    return _serialize_stages_list(created_stages)
+
+
+@router.put("/{trip_id}/stages/reorder", response_model=list[TripStageResponse])
+@router.patch("/{trip_id}/stages/reorder", response_model=list[TripStageResponse])
+@router.post("/{trip_id}/stages/reorder", response_model=list[TripStageResponse])
+@router.put("/{trip_id}/steps/reorder", response_model=list[TripStageResponse], include_in_schema=False)
+@router.patch("/{trip_id}/steps/reorder", response_model=list[TripStageResponse], include_in_schema=False)
+@router.post("/{trip_id}/steps/reorder", response_model=list[TripStageResponse], include_in_schema=False)
+async def reorder_trip_stages(
+    trip_id: str,
+    payload: TripStageReorderRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TripStageResponse]:
+    """
+    Réordonne les étapes d'un voyage, recalcule les dates consécutives sans trou ni chevauchement
+    à partir de la date de début du voyage (en préservant le nombre de nuits et le fuseau de chaque étape),
+    et vérifie qu'aucune ville ne se retrouve deux fois de suite.
+    """
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
+    )
+    existing_stages = await ensure_trip_stages(db, trip)
+    stage_by_id = {st.id: st for st in existing_stages}
+
+    requested_ids = payload.stage_ids or []
+    if len(requested_ids) != len(existing_stages) or set(requested_ids) != set(stage_by_id.keys()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason_code": "INVALID_STAGE_REORDER_IDS",
+                "message": "La liste des identifiants d'étapes à réordonner doit contenir exactement toutes les étapes du voyage.",
+            },
+        )
+
+    reordered_entities = [stage_by_id[sid] for sid in requested_ids]
+    initial_start_date = min(st.arrival_date for st in existing_stages)
+
+    reordered_specs: list[dict[str, Any]] = []
+    cursor_date = initial_start_date
+    for idx, st in enumerate(reordered_entities):
+        arr_date = cursor_date if payload.recalculate_dates else st.arrival_date
+        dep_date = arr_date + timedelta(days=st.nights)
+        cursor_date = dep_date
+        reordered_specs.append(
+            {
+                "stage_entity": st,
+                "destination_id": st.destination_id,
+                "geoname_id": st.geoname_id,
+                "city_name": st.city_name,
+                "country_name": st.country_name,
+                "country_code_iso2": st.country_code_iso2,
+                "timezone": st.timezone,
+                "arrival_date": arr_date,
+                "nights": st.nights,
+                "departure_date": dep_date,
+                "arrival_transport_mode": st.arrival_transport_mode,
+                "departure_transport_mode": st.departure_transport_mode,
+            }
+        )
+
+    validate_stages_rules(reordered_specs)
+
+    for idx, spec in enumerate(reordered_specs):
+        st = spec["stage_entity"]
+        old_arr_date = st.arrival_date
+        new_arr_date: date = spec["arrival_date"]
+        delta_days = (new_arr_date - old_arr_date).days
+
+        st.order_index = idx + 1
+        st.arrival_date = new_arr_date
+        st.departure_date = spec["departure_date"]
+        _, new_arr_utc, new_dep_utc = _default_stage_timestamps_utc(
+            arrival_date=new_arr_date,
+            nights=st.nights,
+            tz_name=st.timezone,
+        )
+        st.arrival_at = new_arr_utc
+        st.departure_at = new_dep_utc
+
+        # Décale également les visites existantes rattachées à cette étape pour qu'elles suivent la nouvelle date
+        if delta_days != 0:
+            stage_items = list(
+                (
+                    await db.scalars(
+                        select(ItineraryItem).where(
+                            ItineraryItem.trip_id == trip.id,
+                            ItineraryItem.stage_id == st.id,
+                        )
+                    )
+                ).all()
+            )
+            for item in stage_items:
+                item.visit_date = item.visit_date + timedelta(days=delta_days)
+                item.start_at = ensure_utc(item.start_at) + timedelta(days=delta_days)
+                item.end_at = ensure_utc(item.end_at) + timedelta(days=delta_days)
+
+    await db.flush()
+    sync_trip_header_from_stages(trip, reordered_entities)
+    await db.commit()
+    return _serialize_stages_list(reordered_entities)
+
+
+@router.delete("/{trip_id}/stages/{stage_id}", response_model=list[TripStageResponse])
+@router.delete(
+    "/{trip_id}/steps/{stage_id}",
+    response_model=list[TripStageResponse],
+    include_in_schema=False,
+)
+async def delete_trip_stage(
+    trip_id: str,
+    stage_id: str,
+    recalculate_dates: bool = Query(default=True),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[TripStageResponse]:
+    """
+    Supprime une étape d'un voyage, referme automatiquement le trou de dates en décalant les étapes
+    suivantes (si recalculate_dates=True), et vérifie qu'il reste au moins 1 étape et qu'aucune ville
+    ne se retrouve deux fois de suite.
+    """
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
+    )
+    existing_stages = await ensure_trip_stages(db, trip)
+    target = next((st for st in existing_stages if st.id == stage_id), None)
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Étape introuvable sur ce voyage.",
+        )
+
+    remaining = [st for st in existing_stages if st.id != stage_id]
+    if len(remaining) < 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "reason_code": "INVALID_STAGE_COUNT",
+                "message": "Un voyage doit comprendre entre 1 et 10 étapes : impossible de supprimer la seule étape restante.",
+            },
+        )
+
+    initial_start_date = existing_stages[0].arrival_date
+    cursor_date = initial_start_date
+    remaining_specs: list[dict[str, Any]] = []
+    for st in remaining:
+        arr_date = cursor_date if recalculate_dates else st.arrival_date
+        dep_date = arr_date + timedelta(days=st.nights)
+        cursor_date = dep_date
+        remaining_specs.append(
+            {
+                "stage_entity": st,
+                "destination_id": st.destination_id,
+                "geoname_id": st.geoname_id,
+                "city_name": st.city_name,
+                "country_name": st.country_name,
+                "country_code_iso2": st.country_code_iso2,
+                "timezone": st.timezone,
+                "arrival_date": arr_date,
+                "nights": st.nights,
+                "departure_date": dep_date,
+                "arrival_transport_mode": st.arrival_transport_mode,
+                "departure_transport_mode": st.departure_transport_mode,
+            }
+        )
+
+    validate_stages_rules(remaining_specs)
+
+    # Supprime les visites programmées sur l'étape supprimée
+    await db.execute(
+        delete(ItineraryItem).where(
+            ItineraryItem.trip_id == trip.id,
+            ItineraryItem.stage_id == target.id,
+        )
+    )
+    await db.delete(target)
+    await db.flush()
+
+    for idx, spec in enumerate(remaining_specs):
+        st = spec["stage_entity"]
+        old_arr_date = st.arrival_date
+        new_arr_date = spec["arrival_date"]
+        delta_days = (new_arr_date - old_arr_date).days
+
+        st.order_index = idx + 1
+        st.arrival_date = new_arr_date
+        st.departure_date = spec["departure_date"]
+        _, new_arr_utc, new_dep_utc = _default_stage_timestamps_utc(
+            arrival_date=new_arr_date,
+            nights=st.nights,
+            tz_name=st.timezone,
+        )
+        st.arrival_at = new_arr_utc
+        st.departure_at = new_dep_utc
+
+        if delta_days != 0:
+            stage_items = list(
+                (
+                    await db.scalars(
+                        select(ItineraryItem).where(
+                            ItineraryItem.trip_id == trip.id,
+                            ItineraryItem.stage_id == st.id,
+                        )
+                    )
+                ).all()
+            )
+            for item in stage_items:
+                item.visit_date = item.visit_date + timedelta(days=delta_days)
+                item.start_at = ensure_utc(item.start_at) + timedelta(days=delta_days)
+                item.end_at = ensure_utc(item.end_at) + timedelta(days=delta_days)
+
+    await db.flush()
+    sync_trip_header_from_stages(trip, remaining)
+    await db.commit()
+    return _serialize_stages_list(remaining)
+
+
+@router.get("/{trip_id}/transports")
+@router.get("/{trip_id}/stages/transports")
+@router.get("/{trip_id}/steps/transports", include_in_schema=False)
+async def list_trip_interstage_transports(
+    trip_id: str,
+    origin_iata: str = Query(default="CDG", min_length=3, max_length=3),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Retourne les offres et comparateurs de trajets pour chaque étape du voyage :
+    - Vols (VOL) : offres d'exemple basées sur la distance OurAirports avec bandeau "Offres d'exemple, prix indicatifs".
+    - Train, bus, bateau, voiture : liens de comparateurs externes sans aucun horaire ni compagnie inventés.
+    """
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=READ_ROLES
+    )
+    stages = await ensure_trip_stages(db, trip)
+    legs: list[dict[str, Any]] = []
+    for idx in range(len(stages)):
+        leg = await build_stage_transport_details(
+            db,
+            trip,
+            stages,
+            idx,
+            default_origin_iata=origin_iata.upper(),
+        )
+        legs.append(leg)
+    return {
+        "trip_id": trip.id,
+        "stages_count": len(stages),
+        "transports": legs,
+        "stages_transports": legs,
+    }
+
+
+@router.get("/{trip_id}/stages/{stage_id}/transports")
+@router.get("/{trip_id}/steps/{stage_id}/transports", include_in_schema=False)
+async def get_single_stage_transport_details(
+    trip_id: str,
+    stage_id: str,
+    origin_iata: str = Query(default="CDG", min_length=3, max_length=3),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=READ_ROLES
+    )
+    stages = await ensure_trip_stages(db, trip)
+    stage_idx = next((idx for idx, st in enumerate(stages) if st.id == stage_id), None)
+    if stage_idx is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Étape introuvable sur ce voyage.",
+        )
+    return await build_stage_transport_details(
+        db,
+        trip,
+        stages,
+        stage_idx,
+        default_origin_iata=origin_iata.upper(),
+    )
+
+
+@router.post("/{trip_id}/stages/{stage_id}/confirm-transport", response_model=TripStageResponse)
+@router.post("/{trip_id}/stages/{stage_id}/unlock-transport", response_model=TripStageResponse)
+@router.post(
+    "/{trip_id}/steps/{stage_id}/confirm-transport",
+    response_model=TripStageResponse,
+    include_in_schema=False,
+)
+async def confirm_stage_arrival_transport(
+    trip_id: str,
+    stage_id: str,
+    payload: TripStageConfirmTransportRequest = Body(default_factory=TripStageConfirmTransportRequest),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> TripStageResponse:
+    """
+    Valide le trajet d'arrivée d'une étape (après réservation de vol ou confirmation de billet
+    train/bus/bateau/voiture), ce qui débloque la galerie des lieux de cette étape uniquement.
+    """
+    trip, _dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
+    )
+    stages = await ensure_trip_stages(db, trip)
+    stage_idx = next((idx for idx, st in enumerate(stages) if st.id == stage_id), None)
+    if stage_idx is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Étape introuvable sur ce voyage.",
+        )
+    stage = stages[stage_idx]
+    if payload.transport_mode:
+        try:
+            stage.arrival_transport_mode = normalize_stage_transport_mode(payload.transport_mode)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"reason_code": "INVALID_TRANSPORT_MODE", "message": str(exc)},
+            ) from exc
+
+    stage.transport_unlocked = True
+    stage.transport_booking_ref = (
+        payload.booking_reference
+        or stage.transport_booking_ref
+        or f"{stage.arrival_transport_mode}-{stage.order_index}"
+    )
+
+    if payload.actual_cost is not None and payload.actual_cost > 0:
+        db.add(
+            BudgetItem(
+                trip_id=trip.id,
+                stage_id=stage.id,
+                category=BudgetCategory.TRANSPORT.value,
+                title=payload.title or f"Trajet d'arrivée ({stage.arrival_transport_mode}) — {stage.city_name}",
+                planned_amount=Decimal(str(payload.actual_cost)),
+                actual_amount=Decimal(str(payload.actual_cost)),
+                currency=(payload.currency or trip.currency or "EUR").upper(),
+            )
+        )
+
+    await db.commit()
+    await db.refresh(stage)
+    serialized = _serialize_stages_list(stages)
+    return serialized[stage_idx]
+
+
+# ==============================================================================
+# MEMBRES DU VOYAGE (RBAC)
+# ==============================================================================
 
 
 @router.get("/{trip_id}/members", response_model=list[TripMemberResponse])
@@ -308,4 +1027,3 @@ async def remove_trip_member(
     await db.delete(existing)
     await db.commit()
     return {"status": "deleted", "user_id": member_user_id}
-

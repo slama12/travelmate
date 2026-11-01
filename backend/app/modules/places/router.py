@@ -7,6 +7,7 @@ from app.core.redis import cache_client
 from app.core.seed import SEED_DESTINATIONS
 from app.core.database import AsyncSession, get_db
 from app.core.providers import CityNotSimulatedError, get_provider_registry
+from app.core.rbac import READ_ROLES, WRITE_ROLES, require_trip_access
 from app.models.entities import Destination, FlightBooking, Place, Trip, User, WishlistItem
 from app.modules.auth.router import get_current_user
 from app.modules.places.schemas import (
@@ -17,6 +18,7 @@ from app.modules.places.schemas import (
     WishlistToggleRequest,
     WishlistToggleResponse,
 )
+from app.modules.trips.stages_service import ensure_trip_stages
 
 from app.modules.places.world_place_photos_service import (
     format_photo_credit,
@@ -523,30 +525,49 @@ async def list_places_by_city(
 
 
 @router.get("/trip/{trip_id}/gallery", response_model=TripGalleryResponse)
+@router.get("/trip/{trip_id}/stages/{stage_id}/gallery", response_model=TripGalleryResponse)
+@router.get(
+    "/trip/{trip_id}/steps/{stage_id}/gallery",
+    response_model=TripGalleryResponse,
+    include_in_schema=False,
+)
 async def get_trip_places_gallery(
     trip_id: str,
+    stage_id: str | None = None,
     category: str | None = Query(default=None),
     radius_km: int = Query(default=DEFAULT_SEARCH_RADIUS_KM, ge=1, le=50),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TripGalleryResponse:
     """
-    Galerie des lieux d'une ville :
-    - Pour les 5 villes de démonstration : garde leurs 14 lieux (débloqués après le vol).
-    - Pour toutes les autres villes du monde (Étape 2) : charge et met en cache les lieux
-      depuis Wikivoyage + Wikipédia/Wikidata (+ Overpass optionnel).
+    Galerie des lieux d'une ville / d'une étape :
+    - Le déblocage de la galerie se fait par étape, après validation du trajet d'arrivée de cette étape.
+    - Pour un séjour mono-ville : garde le comportement existant (14 lieux pour les 5 villes de démo
+      débloqués après le vol ; villes du monde depuis Wikivoyage/Wikipédia/Wikidata).
     """
-    trip = await db.scalar(
-        select(Trip).where(Trip.id == trip_id, Trip.owner_id == current_user.id)
+    trip, _trip_dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=READ_ROLES
     )
-    if not trip:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Voyage introuvable.",
-        )
+    stages = await ensure_trip_stages(db, trip)
+    is_multi_stage = len(stages) > 1 or stage_id is not None
 
-    dest = await db.scalar(select(Destination).where(Destination.id == trip.destination_id))
-    city_name = dest.city_name if dest else "Destination"
+    if stage_id is not None:
+        target_stage = next((st for st in stages if st.id == stage_id), None)
+        if target_stage is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Étape introuvable sur ce voyage.",
+            )
+    else:
+        target_stage = stages[0] if stages else None
+
+    target_dest_id = target_stage.destination_id if target_stage else trip.destination_id
+    dest = await db.scalar(select(Destination).where(Destination.id == target_dest_id))
+    city_name = (
+        target_stage.city_name
+        if target_stage and target_stage.city_name
+        else (dest.city_name if dest else "Destination")
+    )
     registry = get_provider_registry()
 
     wish_rows = list(
@@ -557,9 +578,48 @@ async def get_trip_places_gallery(
         ).all()
     )
     wishlisted_ids = {w.place_id for w in wish_rows}
-    selected_ids = set(trip.selected_place_ids or [])
+    stage_selected_list = (
+        list(target_stage.selected_place_ids or [])
+        if (target_stage and target_stage.selected_place_ids)
+        else list(trip.selected_place_ids or [])
+    )
+    selected_ids = set(stage_selected_list)
+
+    bookings = list(
+        (
+            await db.scalars(
+                select(FlightBooking).where(FlightBooking.trip_id == trip.id)
+            )
+        ).all()
+    )
+    stage_bookings = (
+        [b for b in bookings if b.stage_id == target_stage.id]
+        if target_stage is not None
+        else bookings
+    )
 
     is_seed_city = city_name.strip().lower() in SEED_CITIES_LOWER
+
+    # En mode multi-étapes (ou quand stage_id est ciblé), le déblocage se fait strictement par étape
+    if is_multi_stage and target_stage is not None:
+        stage_unlocked = bool(target_stage.transport_unlocked or stage_bookings)
+        if not stage_unlocked:
+            mode_label = (target_stage.arrival_transport_mode or "VOL").lower()
+            return TripGalleryResponse(
+                trip_id=trip.id,
+                stage_id=target_stage.id,
+                order_index=target_stage.order_index,
+                city_name=city_name,
+                unlocked=False,
+                unlock_message=(
+                    f"Galerie de l'étape {target_stage.order_index} ({city_name}) verrouillée : "
+                    f"validez d'abord le trajet d'arrivée ({mode_label}) de cette étape pour débloquer ses lieux."
+                ),
+                provider_mode=registry.places.mode if is_seed_city else "wikivoyage_wikipedia",
+                cached_in_redis=False,
+                selected_place_ids=[],
+                places=[],
+            )
 
     if not is_seed_city and dest is not None:
         places, cached_in_redis, world_res = await ensure_destination_world_places(
@@ -573,6 +633,8 @@ async def get_trip_places_gallery(
         if world_res.outage_message and not places:
             return TripGalleryResponse(
                 trip_id=trip.id,
+                stage_id=target_stage.id if target_stage else None,
+                order_index=target_stage.order_index if target_stage else 1,
                 city_name=dest.city_name,
                 unlocked=True,
                 unlock_message=world_res.outage_message,
@@ -583,7 +645,7 @@ async def get_trip_places_gallery(
                 suggested_radius_km=None,
                 radius_km=radius_km,
                 outage_message=world_res.outage_message,
-                selected_place_ids=list(trip.selected_place_ids or []),
+                selected_place_ids=stage_selected_list,
                 places=[],
             )
 
@@ -593,6 +655,8 @@ async def get_trip_places_gallery(
         )
         return TripGalleryResponse(
             trip_id=trip.id,
+            stage_id=target_stage.id if target_stage else None,
+            order_index=target_stage.order_index if target_stage else 1,
             city_name=dest.city_name,
             unlocked=True,
             unlock_message=unlock_msg,
@@ -603,23 +667,21 @@ async def get_trip_places_gallery(
             suggested_radius_km=world_res.suggested_radius_km,
             radius_km=radius_km,
             outage_message=None,
-            selected_place_ids=list(trip.selected_place_ids or []),
+            selected_place_ids=stage_selected_list,
             places=[
                 _serialize_place(p, dest.city_name, wishlisted_ids, selected_ids)
                 for p in places
             ],
         )
 
-    bookings = list(
-        (
-            await db.scalars(
-                select(FlightBooking).where(FlightBooking.trip_id == trip.id)
-            )
-        ).all()
+    is_unlocked_seed = bool(
+        (target_stage and target_stage.transport_unlocked) or stage_bookings or (not is_multi_stage and bookings)
     )
-    if not bookings:
+    if not is_unlocked_seed:
         return TripGalleryResponse(
             trip_id=trip.id,
+            stage_id=target_stage.id if target_stage else None,
+            order_index=target_stage.order_index if target_stage else 1,
             city_name=city_name,
             unlocked=False,
             unlock_message=(
@@ -639,17 +701,28 @@ async def get_trip_places_gallery(
         radius_km=radius_km,
     )
 
+    ref_label = (
+        stage_bookings[0].pnr_reference
+        if stage_bookings
+        else (
+            bookings[0].pnr_reference
+            if bookings
+            else (target_stage.transport_booking_ref if target_stage else "CONFIRMÉ")
+        )
+    )
     return TripGalleryResponse(
         trip_id=trip.id,
+        stage_id=target_stage.id if target_stage else None,
+        order_index=target_stage.order_index if target_stage else 1,
         city_name=resolved_dest.city_name,
         unlocked=True,
         unlock_message=(
-            f"Galerie débloquée suite à votre réservation de vol (PNR {bookings[0].pnr_reference}). "
+            f"Galerie débloquée suite à votre trajet d'arrivée ({ref_label}). "
             f"Sélectionnez les lieux que vous souhaitez visiter à {resolved_dest.city_name}."
         ),
         provider_mode=provider_mode,
         cached_in_redis=cached_in_redis,
-        selected_place_ids=list(trip.selected_place_ids or []),
+        selected_place_ids=stage_selected_list,
         places=[
             _serialize_place(p, resolved_dest.city_name, wishlisted_ids, selected_ids)
             for p in places
@@ -664,16 +737,29 @@ async def select_place_for_trip(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> TripGalleryResponse:
-    trip = await db.scalar(
-        select(Trip).where(Trip.id == trip_id, Trip.owner_id == current_user.id)
+    trip, _trip_dest, _role = await require_trip_access(
+        db, trip_id, current_user.id, allowed_roles=WRITE_ROLES
     )
-    if not trip:
+    stages = await ensure_trip_stages(db, trip)
+    is_multi_stage = len(stages) > 1 or payload.stage_id is not None
+
+    place = await db.scalar(select(Place).where(Place.id == payload.place_id))
+    if not place:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Voyage introuvable.",
+            detail="Lieu introuvable.",
         )
 
-    dest = await db.scalar(select(Destination).where(Destination.id == trip.destination_id))
+    target_stage = None
+    if payload.stage_id:
+        target_stage = next((st for st in stages if st.id == payload.stage_id), None)
+    if target_stage is None:
+        target_stage = next((st for st in stages if st.destination_id == place.destination_id), None)
+    if target_stage is None and stages:
+        target_stage = stages[0]
+
+    target_dest_id = target_stage.destination_id if target_stage else trip.destination_id
+    dest = await db.scalar(select(Destination).where(Destination.id == target_dest_id))
     is_seed_city = bool(dest and dest.city_name.strip().lower() in SEED_CITIES_LOWER)
 
     bookings = list(
@@ -683,17 +769,20 @@ async def select_place_for_trip(
             )
         ).all()
     )
-    if is_seed_city and not bookings:
+    stage_bookings = (
+        [b for b in bookings if b.stage_id == target_stage.id]
+        if target_stage is not None
+        else bookings
+    )
+    stage_unlocked = bool(
+        (target_stage and target_stage.transport_unlocked)
+        or stage_bookings
+        or (not is_multi_stage and (bookings or not is_seed_city))
+    )
+    if not stage_unlocked:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Vous devez réserver votre billet d'avion avant de pouvoir sélectionner des lieux à visiter.",
-        )
-
-    place = await db.scalar(select(Place).where(Place.id == payload.place_id))
-    if not place:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Lieu introuvable.",
+            detail="Vous devez valider le trajet d'arrivée de cette étape avant de pouvoir sélectionner des lieux à visiter.",
         )
 
     current_selected = list(trip.selected_place_ids or [])
@@ -701,13 +790,22 @@ async def select_place_for_trip(
         current_selected.append(payload.place_id)
     elif not payload.selected and payload.place_id in current_selected:
         current_selected.remove(payload.place_id)
-
     trip.selected_place_ids = current_selected
+
+    if target_stage is not None:
+        st_selected = list(target_stage.selected_place_ids or [])
+        if payload.selected and payload.place_id not in st_selected:
+            st_selected.append(payload.place_id)
+        elif not payload.selected and payload.place_id in st_selected:
+            st_selected.remove(payload.place_id)
+        target_stage.selected_place_ids = st_selected
+
     await db.commit()
     await db.refresh(trip)
 
     return await get_trip_places_gallery(
         trip_id=trip.id,
+        stage_id=target_stage.id if (is_multi_stage and target_stage) else None,
         category=None,
         radius_km=DEFAULT_SEARCH_RADIUS_KM,
         current_user=current_user,

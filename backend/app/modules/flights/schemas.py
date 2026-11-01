@@ -43,6 +43,7 @@ class FlightOfferResponse(BaseModel):
 
 class FlightBookingRequest(BaseModel):
     trip_id: str
+    stage_id: str | None = None
     idempotency_key: str = Field(..., min_length=4, max_length=100)
     airline: str = Field(..., min_length=2, max_length=100)
     flight_number_outbound: str = Field(..., min_length=2, max_length=60)
@@ -81,6 +82,7 @@ class FlightBookingResponse(BaseModel):
 
     id: str
     trip_id: str
+    stage_id: str | None = None
     idempotency_key: str
     idempotent_replay: bool = False
     pnr_reference: str

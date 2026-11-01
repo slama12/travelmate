@@ -59,6 +59,8 @@ class CityPlacesResultResponse(BaseModel):
 
 class TripGalleryResponse(BaseModel):
     trip_id: str
+    stage_id: str | None = None
+    order_index: int | None = None
     city_name: str
     unlocked: bool
     unlock_message: str
@@ -75,6 +77,7 @@ class TripGalleryResponse(BaseModel):
 
 class TripPlaceSelectionRequest(BaseModel):
     place_id: str
+    stage_id: str | None = None
     selected: bool = True
 
 

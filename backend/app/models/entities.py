@@ -29,6 +29,7 @@ from app.models.enums import (
     InviteStatus,
     MemberRole,
     PlaceCategory,
+    StageArrivalTransportMode,
     TransitMode,
     TravelStyle,
     TripStatus,
@@ -125,6 +126,12 @@ class Trip(Base):
 
     owner: Mapped["User"] = relationship("User", back_populates="trips")
     destination: Mapped["Destination"] = relationship("Destination", back_populates="trips")
+    stages: Mapped[list["TripStage"]] = relationship(
+        "TripStage",
+        back_populates="trip",
+        order_by="TripStage.order_index",
+        cascade="all, delete-orphan",
+    )
     members: Mapped[list["TripMember"]] = relationship(
         "TripMember", back_populates="trip", cascade="all, delete-orphan"
     )
@@ -157,6 +164,50 @@ class Trip(Base):
     )
 
 
+class TripStage(Base):
+    __tablename__ = "trip_stages"
+    __table_args__ = (Index("ix_trip_stages_trip_order", "trip_id", "order_index"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
+    trip_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("trips.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    order_index: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    destination_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("destinations.id", ondelete="RESTRICT"), index=True, nullable=False
+    )
+    geoname_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    city_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    country_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    country_code_iso2: Mapped[str] = mapped_column(String(2), default="XX", nullable=False)
+    arrival_date: Mapped[date] = mapped_column(Date, index=True, nullable=False)
+    nights: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    departure_date: Mapped[date] = mapped_column(Date, index=True, nullable=False)
+    arrival_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    departure_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
+    arrival_transport_mode: Mapped[str] = mapped_column(
+        String(32), default=StageArrivalTransportMode.VOL.value, nullable=False
+    )
+    departure_transport_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    transport_unlocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    transport_booking_ref: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    selected_place_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    planned_budget: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+    trip: Mapped["Trip"] = relationship("Trip", back_populates="stages")
+    destination: Mapped["Destination"] = relationship("Destination")
+
+    @property
+    def country(self) -> str:
+        return self.country_name
+
+    @property
+    def budget_planned(self) -> float | None:
+        return self.planned_budget
+
+
 class TripMember(Base):
     __tablename__ = "trip_members"
 
@@ -183,6 +234,9 @@ class FlightBooking(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
     trip_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("trips.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    stage_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("trip_stages.id", ondelete="SET NULL"), index=True, nullable=True
     )
     idempotency_key: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
     pnr_reference: Mapped[str] = mapped_column(String(16), unique=True, index=True, nullable=False)
@@ -244,6 +298,9 @@ class AccommodationBooking(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
     trip_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("trips.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    stage_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("trip_stages.id", ondelete="SET NULL"), index=True, nullable=True
     )
     accommodation_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("accommodations.id", ondelete="RESTRICT"), nullable=False
@@ -314,6 +371,9 @@ class ItineraryItem(Base):
     trip_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("trips.id", ondelete="CASCADE"), index=True, nullable=False
     )
+    stage_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("trip_stages.id", ondelete="SET NULL"), index=True, nullable=True
+    )
     place_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("places.id", ondelete="RESTRICT"), index=True, nullable=False
     )
@@ -351,6 +411,9 @@ class BudgetItem(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid_str)
     trip_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("trips.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    stage_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("trip_stages.id", ondelete="SET NULL"), index=True, nullable=True
     )
     category: Mapped[str] = mapped_column(
         String(32), default=BudgetCategory.ACTIVITY.value, nullable=False

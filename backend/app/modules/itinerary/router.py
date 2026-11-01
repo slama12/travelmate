@@ -21,7 +21,7 @@ from app.core.itinerary_validator import (
 from app.core.providers import get_provider_registry
 from app.core.rbac import READ_ROLES, WRITE_ROLES, require_trip_access
 from app.core.route_optimizer import OptimizablePlaceItem, RouteOptimizer
-from app.models.entities import Destination, ItineraryItem, Place, Trip, User
+from app.models.entities import Destination, ItineraryItem, Place, Trip, TripStage, User
 from app.modules.auth.router import get_current_user
 from app.modules.itinerary.schemas import (
     ApplyOptimizationRequest,
@@ -31,6 +31,11 @@ from app.modules.itinerary.schemas import (
     OptimizeItineraryPreviewResponse,
     OptimizeItineraryRequest,
     TripItineraryScheduleResponse,
+)
+from app.modules.trips.stages_service import (
+    ensure_trip_stages,
+    get_effective_departure_mode_for_stage,
+    resolve_stage_for_visit,
 )
 
 router = APIRouter(prefix="/itinerary", tags=["Itinerary & Planning"])
@@ -71,7 +76,9 @@ async def _load_trip_items_with_places(
 
 
 def _build_snapshots(
-    items: list[ItineraryItem], places_map: dict[str, Place]
+    items: list[ItineraryItem],
+    places_map: dict[str, Place],
+    destination_tz: str | None = None,
 ) -> list[ScheduledVisitSnapshot]:
     snapshots: list[ScheduledVisitSnapshot] = []
     for item in items:
@@ -97,11 +104,12 @@ async def _recompute_trip_day_transits(
     db: AsyncSession,
     trip_id: str,
     destination_tz: str,
+    stages: list[TripStage] | None = None,
 ) -> tuple[list[ItineraryItem], dict[str, Place]]:
     """
     Recalcule l'ordre journalier (day_order_index) et les temps/distances de transport
-    entre les visites consécutives d'une même journée locale via le fournisseur d'itinéraires
-    hybride (temps réel ou estimé Haversine).
+    entre les visites consécutives d'une même journée locale et d'une même étape via le
+    fournisseur d'itinéraires hybride (temps réel ou estimé Haversine).
     Au-delà de 1,8 km en ville, un trajet laissé par défaut en marche ('WALKING') bascule
     automatiquement en transport urbain ('METRO') pour éviter des estimations irréalistes
     (ex. 63 min à pied sur 4,7 km à New York au lieu de 17 min en métro).
@@ -110,13 +118,18 @@ async def _recompute_trip_day_transits(
     items, places_map = await _load_trip_items_with_places(db, trip_id)
     items.sort(key=lambda x: ensure_utc(x.start_at))
 
-    by_local_day: dict[date, list[ItineraryItem]] = {}
-    for item in items:
-        loc_start = to_destination_local(ensure_utc(item.start_at), destination_tz)
-        item.visit_date = loc_start.date()
-        by_local_day.setdefault(loc_start.date(), []).append(item)
+    stage_by_id: dict[str, TripStage] = {st.id: st for st in (stages or [])}
 
-    for _day_date, day_items in by_local_day.items():
+    by_stage_local_day: dict[tuple[str, date], list[ItineraryItem]] = {}
+    for item in items:
+        st = stage_by_id.get(item.stage_id or "") if item.stage_id else None
+        item_tz = (st.timezone if st and st.timezone else destination_tz) or "UTC"
+        loc_start = to_destination_local(ensure_utc(item.start_at), item_tz)
+        item.visit_date = loc_start.date()
+        group_key = (item.stage_id or "", loc_start.date())
+        by_stage_local_day.setdefault(group_key, []).append(item)
+
+    for _group_key, day_items in by_stage_local_day.items():
         day_items.sort(key=lambda x: ensure_utc(x.start_at))
         for idx, item in enumerate(day_items):
             item.day_order_index = idx + 1
@@ -226,18 +239,23 @@ def _to_item_response(
     place: Place,
     destination_tz: str,
     *,
+    stage: TripStage | None = None,
     transit_from_prev_min: int = 0,
     transit_from_prev_m: int = 0,
 ) -> ItineraryItemResponse:
+    eff_tz = (stage.timezone if stage and stage.timezone else destination_tz) or "UTC"
     start_utc = ensure_utc(item.start_at)
     end_utc = ensure_utc(item.end_at)
-    loc_start = to_destination_local(start_utc, destination_tz)
-    loc_end = to_destination_local(end_utc, destination_tz)
+    loc_start = to_destination_local(start_utc, eff_tz)
+    loc_end = to_destination_local(end_utc, eff_tz)
     source = (getattr(item, "transit_time_source", None) or "ESTIMATED").upper()
     is_est = source != "REAL"
     return ItineraryItemResponse(
         id=item.id,
         trip_id=item.trip_id,
+        stage_id=stage.id if stage else item.stage_id,
+        stage_order_index=stage.order_index if stage else None,
+        stage_city_name=stage.city_name if stage else None,
         place_id=item.place_id,
         place_name=place.name,
         place_category=place.category,
@@ -252,7 +270,7 @@ def _to_item_response(
         local_visit_date=loc_start.strftime("%Y-%m-%d"),
         local_start_time=loc_start.strftime("%H:%M"),
         local_end_time=loc_end.strftime("%H:%M"),
-        destination_timezone=destination_tz,
+        destination_timezone=eff_tz,
         duration_minutes=item.duration_minutes,
         transit_mode_to_next=normalize_transit_mode(item.transit_mode_to_next),
         transit_duration_to_next_min=item.transit_duration_to_next_min,
@@ -297,6 +315,97 @@ def _resolve_requested_start_utc(
     )
 
 
+def _resolve_stage_context_for_visit(
+    *,
+    stages: list[TripStage],
+    trip: Trip,
+    default_tz: str,
+    place: Place,
+    visit_date: date | None = None,
+    start_at: datetime | None = None,
+    stage_id: str | None = None,
+) -> tuple[TripStage | None, int, str, datetime | None, datetime | None, str | None, str | None]:
+    """
+    Détermine l'étape (TripStage), son fuseau horaire, ses bornes UTC d'arrivée/départ
+    et ses modes de transport d'arrivée et de départ pour valider une visite.
+    """
+    if not stages:
+        return None, 0, default_tz, trip.arrival_at, trip.departure_at, "VOL", "VOL"
+
+    if len(stages) == 1:
+        st0 = stages[0]
+        tz0 = st0.timezone or default_tz or "UTC"
+        # Pour un séjour mono-ville sans vol réservé (trip.arrival_at is None),
+        # conserve le comportement d'origine (trip.arrival_at / trip.departure_at).
+        arr_utc = trip.arrival_at if trip.arrival_at is not None else None
+        dep_utc = trip.departure_at if trip.departure_at is not None else None
+        arr_mode = st0.arrival_transport_mode or "VOL"
+        dep_mode = get_effective_departure_mode_for_stage(stages, 0)
+        return st0, 0, tz0, arr_utc, dep_utc, arr_mode, dep_mode
+
+    # Multi-étapes : résolution par stage_id explicite, lieu + date, ou date / horodatage
+    target_stage, stage_idx = resolve_stage_for_visit(
+        stages,
+        visit_date=visit_date,
+        start_at_utc=ensure_utc(start_at) if start_at is not None else None,
+        place=place,
+        stage_id=stage_id,
+    )
+    # Si stage_id n'est pas fourni et que le lieu appartient uniquement à une autre étape du voyage,
+    # on rattache la validation à l'étape de la ville du lieu (ce qui refusera proprement une date hors étape).
+    if stage_id is None and target_stage is not None and place.destination_id != target_stage.destination_id:
+        matching_place_stages = [
+            (idx, st) for idx, st in enumerate(stages) if st.destination_id == place.destination_id
+        ]
+        if len(matching_place_stages) == 1:
+            stage_idx, target_stage = matching_place_stages[0]
+
+    assert target_stage is not None
+    stage_tz = target_stage.timezone or default_tz or "UTC"
+    arr_mode = target_stage.arrival_transport_mode or "VOL"
+    dep_mode = get_effective_departure_mode_for_stage(stages, stage_idx)
+    return (
+        target_stage,
+        stage_idx,
+        stage_tz,
+        target_stage.arrival_at,
+        target_stage.departure_at,
+        arr_mode,
+        dep_mode,
+    )
+
+
+def _filter_items_for_stage_validation(
+    existing_items: list[ItineraryItem],
+    arg2: dict[str, Place] | TripStage | None,
+    arg3: list[TripStage],
+    arg4: TripStage | None = None,
+) -> list[ItineraryItem]:
+    if isinstance(arg2, dict):
+        places_map: dict[str, Place] = arg2
+        stages = arg3
+        target_stage = arg4
+    else:
+        places_map = {}
+        target_stage = arg2
+        stages = arg3
+
+    if len(stages) <= 1 or target_stage is None:
+        return existing_items
+    filtered: list[ItineraryItem] = []
+    for it in existing_items:
+        if it.stage_id == target_stage.id:
+            filtered.append(it)
+        elif it.stage_id is None:
+            p = places_map.get(it.place_id)
+            if p and p.destination_id == target_stage.destination_id:
+                filtered.append(it)
+            elif not places_map:
+                if ensure_utc(target_stage.arrival_at) <= ensure_utc(it.start_at) <= ensure_utc(target_stage.departure_at):
+                    filtered.append(it)
+    return filtered
+
+
 @router.get("/trip/{trip_id}", response_model=TripItineraryScheduleResponse)
 async def get_trip_itinerary(
     trip_id: str,
@@ -306,13 +415,22 @@ async def get_trip_itinerary(
     registry = get_provider_registry()
     trip, destination = await _load_trip_and_destination(db, trip_id, current_user.id)
     dest_tz = destination.timezone or "UTC"
-    items, places_map = await _recompute_trip_day_transits(db, trip.id, dest_tz)
+    stages = await ensure_trip_stages(db, trip)
+    stage_by_id = {st.id: st for st in stages}
+    first_stage = stages[0] if stages else None
+
+    items, places_map = await _recompute_trip_day_transits(db, trip.id, dest_tz, stages=stages)
 
     responses: list[ItineraryItemResponse] = []
     days_grouped: dict[str, list[ItineraryItemResponse]] = {}
 
-    # Prépare toutes les journées du séjour si les dates de vol sont connues
-    if trip.arrival_at and trip.departure_at:
+    if len(stages) > 1:
+        for st in stages:
+            cur_d = st.arrival_date
+            while cur_d <= st.departure_date:
+                days_grouped.setdefault(cur_d.isoformat(), [])
+                cur_d += timedelta(days=1)
+    elif trip.arrival_at and trip.departure_at:
         loc_arr = to_destination_local(ensure_utc(trip.arrival_at), dest_tz)
         loc_dep = to_destination_local(ensure_utc(trip.departure_at), dest_tz)
         cur_d = loc_arr.date()
@@ -320,28 +438,32 @@ async def get_trip_itinerary(
             days_grouped[cur_d.isoformat()] = []
             cur_d += timedelta(days=1)
 
-    prev_by_day: dict[str, tuple[ItineraryItem, Place]] = {}
+    prev_by_stage_day: dict[tuple[str, str], tuple[ItineraryItem, Place]] = {}
     for item in items:
         place = places_map.get(item.place_id)
         if not place:
             continue
-        loc_day_str = to_destination_local(ensure_utc(item.start_at), dest_tz).strftime("%Y-%m-%d")
+        item_stage = stage_by_id.get(item.stage_id or "") if item.stage_id else first_stage
+        item_tz = (item_stage.timezone if item_stage and item_stage.timezone else dest_tz) or "UTC"
+        loc_day_str = to_destination_local(ensure_utc(item.start_at), item_tz).strftime("%Y-%m-%d")
+        stage_day_key = (item_stage.id if item_stage else "", loc_day_str)
         from_prev_min = 0
         from_prev_m = 0
-        if loc_day_str in prev_by_day:
-            prev_item, _prev_place = prev_by_day[loc_day_str]
+        if stage_day_key in prev_by_stage_day:
+            prev_item, _prev_place = prev_by_stage_day[stage_day_key]
             from_prev_min = prev_item.transit_duration_to_next_min
             from_prev_m = prev_item.transit_distance_meters
         resp_item = _to_item_response(
             item,
             place,
             dest_tz,
+            stage=item_stage,
             transit_from_prev_min=from_prev_min,
             transit_from_prev_m=from_prev_m,
         )
         responses.append(resp_item)
         days_grouped.setdefault(loc_day_str, []).append(resp_item)
-        prev_by_day[loc_day_str] = (item, place)
+        prev_by_stage_day[stage_day_key] = (item, place)
 
     total_transit_min = sum(i.transit_duration_to_next_min for i in items)
     total_dist_m = sum(i.transit_distance_meters for i in items)
@@ -356,7 +478,10 @@ async def get_trip_itinerary(
         else None
     )
     dep_local_str = (
-        to_destination_local(ensure_utc(trip.departure_at), dest_tz).isoformat()
+        to_destination_local(
+            ensure_utc(trip.departure_at),
+            stages[-1].timezone if stages else dest_tz,
+        ).isoformat()
         if trip.departure_at
         else None
     )
@@ -381,24 +506,33 @@ async def get_trip_itinerary(
 
 
 @router.post("/items", response_model=ItineraryItemResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/trip/{trip_id}/items", response_model=ItineraryItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_itinerary_item(
     payload: ItineraryItemCreateRequest,
+    trip_id: str | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ItineraryItemResponse:
     """
     Planifie une nouvelle visite :
     1. Utilise la durée conseillée du lieu par défaut si duration_minutes n'est pas fourni.
-    2. Valide la visite via ItineraryValidationEngine (fenêtre séjour, chevauchement,
-       temps de trajet WALKING/METRO/CAR, horaires d'ouverture dans le fuseau de la destination).
+    2. Résout l'étape du voyage correspondante (par stage_id, lieu et/ou date de visite).
+    3. Valide la visite via ItineraryValidationEngine avec la fenêtre de visite, les tampons
+       de transport (vol, train, bus, bateau, voiture) et le fuseau horaire de l'étape.
        En cas de refus, renvoie 422 avec un message clair en français et 2 à 3 créneaux libres suggérés.
-    3. Stocke les horaires en UTC et synchronise avec Google Calendar (avec statut 'PENDING_SYNC'
-       et nouvelle tentative en cas d'échec Calendar, sans annuler la visite).
+    4. Stocke les horaires en UTC et synchronise avec Google Calendar.
     """
+    resolved_trip_id = payload.trip_id or trip_id
+    if not resolved_trip_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="L'identifiant du voyage (trip_id) est requis.",
+        )
     trip, destination = await _load_trip_and_destination(
-        db, payload.trip_id, current_user.id, write=True
+        db, resolved_trip_id, current_user.id, write=True
     )
     dest_tz = destination.timezone or "UTC"
+    stages = await ensure_trip_stages(db, trip)
 
     place = await db.scalar(select(Place).where(Place.id == payload.place_id))
     if not place:
@@ -407,6 +541,24 @@ async def create_itinerary_item(
             detail="Lieu à visiter introuvable.",
         )
 
+    (
+        target_stage,
+        _stage_idx,
+        stage_tz,
+        stage_arr_utc,
+        stage_dep_utc,
+        arr_mode,
+        dep_mode,
+    ) = _resolve_stage_context_for_visit(
+        stages=stages,
+        trip=trip,
+        default_tz=dest_tz,
+        place=place,
+        visit_date=payload.visit_date,
+        start_at=payload.start_at,
+        stage_id=payload.stage_id,
+    )
+
     duration_min = payload.duration_minutes or place.recommended_duration_min or 120
     norm_mode = normalize_transit_mode(payload.transit_mode)
     start_utc = _resolve_requested_start_utc(
@@ -414,12 +566,15 @@ async def create_itinerary_item(
         local_start_time=payload.local_start_time,
         start_at=payload.start_at,
         duration_minutes=duration_min,
-        destination_tz=dest_tz,
+        destination_tz=stage_tz,
     )
     end_utc = start_utc + timedelta(minutes=duration_min)
 
     existing_items, places_map = await _load_trip_items_with_places(db, trip.id)
-    snapshots = _build_snapshots(existing_items, places_map)
+    stage_existing_items = _filter_items_for_stage_validation(
+        existing_items, places_map, stages, target_stage
+    )
+    snapshots = _build_snapshots(stage_existing_items, places_map)
 
     notes_lower = (payload.notes or "").lower()
     explicit_second_time = bool(
@@ -430,9 +585,9 @@ async def create_itinerary_item(
         )
     )
     validation = ItineraryValidationEngine.validate_visit(
-        trip_arrival_utc=trip.arrival_at,
-        trip_departure_utc=trip.departure_at,
-        destination_tz_name=dest_tz,
+        trip_arrival_utc=stage_arr_utc,
+        trip_departure_utc=stage_dep_utc,
+        destination_tz_name=stage_tz,
         place_id=place.id,
         place_name=place.name,
         place_lat=place.latitude,
@@ -443,6 +598,8 @@ async def create_itinerary_item(
         transit_mode=norm_mode,
         existing_visits=snapshots,
         allow_duplicate_place=explicit_second_time,
+        arrival_transport_mode=arr_mode,
+        departure_transport_mode=dep_mode,
     )
     if not validation.valid:
         raise HTTPException(
@@ -450,9 +607,10 @@ async def create_itinerary_item(
             detail=validation.to_error_payload(),
         )
 
-    loc_start = to_destination_local(start_utc, dest_tz)
+    loc_start = to_destination_local(start_utc, stage_tz)
     new_item = ItineraryItem(
         trip_id=trip.id,
+        stage_id=target_stage.id if target_stage else None,
         place_id=place.id,
         visit_date=loc_start.date(),
         start_at=start_utc,
@@ -470,15 +628,14 @@ async def create_itinerary_item(
     await db.commit()
     await db.refresh(new_item)
 
-    await _recompute_trip_day_transits(db, trip.id, dest_tz)
+    await _recompute_trip_day_transits(db, trip.id, dest_tz, stages=stages)
     await db.refresh(new_item)
 
-    # Synchronisation Google Calendar post-commit avec retry automatique
     await _sync_item_with_google_calendar(
         db=db,
         item=new_item,
         place=place,
-        destination_tz=dest_tz,
+        destination_tz=stage_tz,
         action="create",
         max_attempts=2,
     )
@@ -487,6 +644,7 @@ async def create_itinerary_item(
         new_item,
         place,
         dest_tz,
+        stage=target_stage,
         transit_from_prev_min=validation.transit_from_previous_min,
         transit_from_prev_m=validation.transit_from_previous_m,
     )
@@ -502,7 +660,7 @@ async def update_or_move_itinerary_item(
     """
     Déplace (glisser-déposer) ou modifie une visite existante.
     Chaque modification repasse intégralement par le moteur de validation (ItineraryValidationEngine)
-    et synchronise la mise à jour avec Google Calendar.
+    avec la fenêtre et le fuseau de l'étape concernée, et synchronise la mise à jour avec Google Calendar.
     """
     item = await db.scalar(select(ItineraryItem).where(ItineraryItem.id == item_id))
     if not item:
@@ -515,6 +673,7 @@ async def update_or_move_itinerary_item(
         db, item.trip_id, current_user.id, write=True
     )
     dest_tz = destination.timezone or "UTC"
+    stages = await ensure_trip_stages(db, trip)
     place = await db.scalar(select(Place).where(Place.id == item.place_id))
     if not place:
         raise HTTPException(
@@ -525,7 +684,25 @@ async def update_or_move_itinerary_item(
     duration_min = payload.duration_minutes or item.duration_minutes
     norm_mode = normalize_transit_mode(payload.transit_mode or item.transit_mode_to_next)
 
-    current_loc_start = to_destination_local(ensure_utc(item.start_at), dest_tz)
+    (
+        target_stage,
+        _stage_idx,
+        stage_tz,
+        stage_arr_utc,
+        stage_dep_utc,
+        arr_mode,
+        dep_mode,
+    ) = _resolve_stage_context_for_visit(
+        stages=stages,
+        trip=trip,
+        default_tz=dest_tz,
+        place=place,
+        visit_date=payload.visit_date,
+        start_at=payload.start_at or item.start_at,
+        stage_id=payload.stage_id or item.stage_id,
+    )
+
+    current_loc_start = to_destination_local(ensure_utc(item.start_at), stage_tz)
     if payload.start_at is not None:
         start_utc = ensure_utc(payload.start_at)
     elif payload.visit_date is not None or payload.local_start_time is not None:
@@ -535,7 +712,7 @@ async def update_or_move_itinerary_item(
             visit_date=target_date,
             local_start_time_str=target_time,
             duration_minutes=duration_min,
-            timezone_name=dest_tz,
+            timezone_name=stage_tz,
         )
     else:
         start_utc = ensure_utc(item.start_at)
@@ -543,12 +720,15 @@ async def update_or_move_itinerary_item(
     end_utc = start_utc + timedelta(minutes=duration_min)
 
     existing_items, places_map = await _load_trip_items_with_places(db, trip.id)
-    snapshots = _build_snapshots(existing_items, places_map)
+    stage_existing_items = _filter_items_for_stage_validation(
+        existing_items, places_map, stages, target_stage
+    )
+    snapshots = _build_snapshots(stage_existing_items, places_map)
 
     validation = ItineraryValidationEngine.validate_visit(
-        trip_arrival_utc=trip.arrival_at,
-        trip_departure_utc=trip.departure_at,
-        destination_tz_name=dest_tz,
+        trip_arrival_utc=stage_arr_utc,
+        trip_departure_utc=stage_dep_utc,
+        destination_tz_name=stage_tz,
         place_id=place.id,
         place_name=place.name,
         place_lat=place.latitude,
@@ -559,6 +739,8 @@ async def update_or_move_itinerary_item(
         transit_mode=norm_mode,
         existing_visits=snapshots,
         exclude_item_id=item.id,
+        arrival_transport_mode=arr_mode,
+        departure_transport_mode=dep_mode,
     )
     if not validation.valid:
         raise HTTPException(
@@ -566,7 +748,9 @@ async def update_or_move_itinerary_item(
             detail=validation.to_error_payload(),
         )
 
-    loc_start = to_destination_local(start_utc, dest_tz)
+    loc_start = to_destination_local(start_utc, stage_tz)
+    if target_stage is not None:
+        item.stage_id = target_stage.id
     item.visit_date = loc_start.date()
     item.start_at = start_utc
     item.end_at = end_utc
@@ -576,14 +760,14 @@ async def update_or_move_itinerary_item(
         item.notes = payload.notes
 
     await db.commit()
-    await _recompute_trip_day_transits(db, trip.id, dest_tz)
+    await _recompute_trip_day_transits(db, trip.id, dest_tz, stages=stages)
     await db.refresh(item)
 
     await _sync_item_with_google_calendar(
         db=db,
         item=item,
         place=place,
-        destination_tz=dest_tz,
+        destination_tz=stage_tz,
         action="update",
         max_attempts=2,
     )
@@ -592,6 +776,7 @@ async def update_or_move_itinerary_item(
         item,
         place,
         dest_tz,
+        stage=target_stage,
         transit_from_prev_min=validation.transit_from_previous_min,
         transit_from_prev_m=validation.transit_from_previous_m,
     )
