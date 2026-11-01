@@ -65,13 +65,15 @@ class DestinationResolveRequest(BaseModel):
                 if lat_val is not None:
                     out["latitude"] = float(lat_val)
             if out.get("longitude") is None:
-                lng_val = coords.get("longitude", coords.get("lng"))
+                lng_val = coords.get("longitude", coords.get("lng", coords.get("lon")))
                 if lng_val is not None:
                     out["longitude"] = float(lng_val)
         if out.get("latitude") is None and out.get("lat") is not None:
             out["latitude"] = float(out["lat"])
-        if out.get("longitude") is None and out.get("lng") is not None:
-            out["longitude"] = float(out["lng"])
+        if out.get("longitude") is None:
+            raw_lon = out.get("lng") if out.get("lng") is not None else out.get("lon")
+            if raw_lon is not None:
+                out["longitude"] = float(raw_lon)
 
         # fuseau_horaire / timezone (dict ou str) -> timezone
         tz_raw = out.get("fuseau_horaire") or out.get("timezone")

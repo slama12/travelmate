@@ -1585,7 +1585,23 @@ async def search_world_cities_geonames(
             fallback_cities=[],
         )
 
-    # 1. Vérification du cache Redis par requête normalisée (minuscules, sans accents)
+    # 1. Vérification de la présence de la clé GeoNames (GEONAMES_USERNAME)
+    username = (settings.GEONAMES_USERNAME or "").strip()
+    if not username:
+        return GeoNamesSearchResponse(
+            query=raw_query,
+            normalized_query=norm_q,
+            available=False,
+            fallback=True,
+            cached=False,
+            quota_exceeded=False,
+            reason="missing_api_key",
+            message="Recherche de villes indisponible (clé GeoNames absente). Repli sur les 5 destinations populaires.",
+            results=fallback_seed,
+            fallback_cities=all_seed,
+        )
+
+    # 2. Vérification du cache Redis par requête normalisée (minuscules, sans accents)
     cache_key = f"geonames:search:v2:{norm_q}"
     cached_payload = await cache_client.get_json(cache_key)
     if cached_payload and isinstance(cached_payload.get("results"), list):
@@ -1612,22 +1628,6 @@ async def search_world_cities_geonames(
             message=None,
             results=cached_results,
             fallback_cities=[],
-        )
-
-    # 2. Vérification de la présence de la clé GeoNames (GEONAMES_USERNAME)
-    username = (settings.GEONAMES_USERNAME or "").strip()
-    if not username:
-        return GeoNamesSearchResponse(
-            query=raw_query,
-            normalized_query=norm_q,
-            available=False,
-            fallback=True,
-            cached=False,
-            quota_exceeded=False,
-            reason="missing_api_key",
-            message="Recherche de villes indisponible (clé GeoNames absente). Repli sur les 5 destinations populaires.",
-            results=fallback_seed,
-            fallback_cities=all_seed,
         )
 
     # 3. Vérification des quotas gratuits (1000/heure, 20000/jour, et limite par utilisateur)

@@ -45,3 +45,19 @@ class AccommodationSearchResponse(BaseModel):
     amenities: list[str] = Field(default_factory=list)
     booking_redirect_url: str
     nearby_restaurants: list[NearbyRestaurantResponse] = Field(default_factory=list)
+    external_entity_id: str | None = None
+    wikidata_id: str | None = None
+    photo_file_title: str | None = None
+    photo_author: str | None = None
+    photo_license: str | None = None
+    photo_commons_url: str | None = None
+    photo_source: str = "none"
+    photo_credit_text: str | None = None
+    accommodation_subtype: str = "hôtel"
+    is_illustration: bool = False
+    illustration_label: str | None = None
+    price_label: str = "Prix indicatif"
+    gamme_label: str = "Standard"
+    has_precise_coords: bool = True
+    booking_url: str | None = None
+    airbnb_url: str | None = None

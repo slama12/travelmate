@@ -148,8 +148,14 @@ async def search_flights(
     travel_style: str = Query(default="STANDARD"),
     db: AsyncSession = Depends(get_db),
 ) -> list[FlightOfferResponse]:
+    from app.core.airports import are_airport_codes_equivalent
+
     orig = origin_iata.upper()
-    if destination_iata is not None and orig == destination_iata.upper() and trip_id is None:
+    if (
+        destination_iata is not None
+        and are_airport_codes_equivalent(orig, destination_iata.upper())
+        and trip_id is None
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Les aéroports de départ et d'arrivée doivent être distincts.",
@@ -179,7 +185,9 @@ async def search_flights(
                 detail="Destination du séjour introuvable.",
             )
         trip_dest_iata = resolved_dest.iata_code.upper()
-        if destination_iata is not None and destination_iata.upper() != trip_dest_iata:
+        if destination_iata is not None and not are_airport_codes_equivalent(
+            destination_iata.upper(), trip_dest_iata
+        ):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
@@ -209,7 +217,7 @@ async def search_flights(
                 trip_dest = await db.scalar(
                     select(Destination).where(Destination.id == active_trip.destination_id)
                 )
-                if trip_dest and trip_dest.iata_code.upper() != orig:
+                if trip_dest and not are_airport_codes_equivalent(trip_dest.iata_code.upper(), orig):
                     resolved_dest = trip_dest
                     effective_dest_iata = trip_dest.iata_code.upper()
 
@@ -219,7 +227,7 @@ async def search_flights(
                     select(Destination).where(Destination.iata_code == effective_dest_iata)
                 )
 
-    if orig == effective_dest_iata:
+    if are_airport_codes_equivalent(orig, effective_dest_iata):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Les aéroports de départ et d'arrivée doivent être distincts.",
@@ -236,7 +244,7 @@ async def search_flights(
     results: list[FlightOfferResponse] = []
     for offer in raw_offers:
         offer_dest_iata = str(offer.get("destination_iata", effective_dest_iata)).upper()
-        if offer_dest_iata != effective_dest_iata:
+        if not are_airport_codes_equivalent(offer_dest_iata, effective_dest_iata):
             continue
         price_raw = offer.get("price_amount", offer.get("price_eur", "0.00"))
         price_dec = Decimal(str(price_raw)).quantize(Decimal("0.01"))
@@ -248,12 +256,14 @@ async def search_flights(
         results.append(
             FlightOfferResponse(
                 offer_id=offer["offer_id"],
-                airline_code=offer["airline_code"],
+                airline_code=str(offer.get("airline_code", "")),
                 airline_name=offer["airline_name"],
                 flight_number_outbound=offer["flight_number_outbound"],
                 flight_number_inbound=offer["flight_number_inbound"],
                 origin_iata=orig,
                 destination_iata=effective_dest_iata,
+                origin_city_code=offer.get("origin_city_code"),
+                destination_city_code=offer.get("destination_city_code"),
                 destination_city=city_label,
                 departure_outbound_at=offer["departure_outbound_at"],
                 arrival_outbound_at=offer["arrival_outbound_at"],
@@ -264,6 +274,18 @@ async def search_flights(
                 price_eur=float(price_dec),
                 currency=offer.get("currency", "EUR"),
                 mode=offer.get("mode", registry.flights.mode),
+                is_example_offer=bool(offer.get("is_example_offer", False)),
+                offer_badge=str(offer.get("offer_badge", "Offre d'exemple")),
+                price_label=str(offer.get("price_label", "Prix indicatif")),
+                banner_text=str(offer.get("banner_text", "Offres d'exemple, prix indicatifs")),
+                distance_km=offer.get("distance_km"),
+                duration_outbound_minutes=offer.get("duration_outbound_minutes"),
+                duration_inbound_minutes=offer.get("duration_inbound_minutes"),
+                stops=int(offer.get("stops", 0)),
+                stopover_hub_iata=offer.get("stopover_hub_iata"),
+                stopover_hub_city=offer.get("stopover_hub_city"),
+                stopover_label=str(offer.get("stopover_label", "Direct")),
+                comparator_urls=dict(offer.get("comparator_urls") or {}),
             )
         )
 
@@ -271,9 +293,7 @@ async def search_flights(
         city_label_msg = resolved_dest.city_name if resolved_dest else effective_dest_iata
         response.headers["X-Simulation-Covered"] = "false"
         response.headers["X-Simulation-Message"] = (
-            f"Les vols restent simulés : la ville de {city_label_msg} ({effective_dest_iata}) "
-            "n'est pas couverte en simulation. Seules les 5 villes du seed (Paris, Tokyo, Rome, "
-            "New York, Marrakech) disposent de vols simulés."
+            f"Offres d'exemple indisponibles pour {city_label_msg} ({effective_dest_iata})."
         )
     else:
         response.headers["X-Simulation-Covered"] = "true"
@@ -298,6 +318,8 @@ async def book_flight_atomically(
     3. APRÈS le commit : envoie l'e-mail de confirmation via l'adaptateur Gmail
        avec nouvelle tentative automatique en cas d'échec, sans jamais annuler la réservation.
     """
+    from app.core.airports import are_airport_codes_equivalent
+
     trip = await db.scalar(
         select(Trip).where(Trip.id == payload.trip_id, Trip.owner_id == current_user.id)
     )
@@ -313,7 +335,7 @@ async def book_flight_atomically(
     effective_origin_iata = payload.origin_iata.upper()
     if trip_dest and trip_dest.iata_code:
         expected_dest_iata = trip_dest.iata_code.upper()
-        if payload.destination_iata.upper() != expected_dest_iata:
+        if not are_airport_codes_equivalent(payload.destination_iata.upper(), expected_dest_iata):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(

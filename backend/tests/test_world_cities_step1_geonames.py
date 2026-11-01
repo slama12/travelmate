@@ -450,7 +450,7 @@ async def test_create_world_city_without_duplicate_and_non_seed_gallery_flights_
     assert gallery["places"][0]["source_attribution"] == "Données Wikivoyage / Wikipédia (CC BY-SA 4.0)"
     assert "Les lieux de cette ville arrivent bientôt" not in gallery["unlock_message"]
 
-    # 6. Vols simulés pour Lisbonne -> aucun vol inventé + message clair dans l'en-tête
+    # 6. Vols pour Lisbonne -> offres d'exemple calculées sur la distance OurAirports, sans compagnie ni numéro de vol inventés
     flights_resp = await client.get(
         "/api/v1/flights/search",
         params={
@@ -461,19 +461,29 @@ async def test_create_world_city_without_duplicate_and_non_seed_gallery_flights_
         },
     )
     assert flights_resp.status_code == 200
-    assert flights_resp.json() == []
-    assert flights_resp.headers.get("X-Simulation-Covered") == "false"
-    assert "n'est pas couverte en simulation" in flights_resp.headers.get("X-Simulation-Message", "")
+    lis_flights = flights_resp.json()
+    assert len(lis_flights) == 3
+    for fl in lis_flights:
+        assert fl["is_example_offer"] is True
+        assert fl["offer_badge"] == "Offre d'exemple"
+        assert fl["airline_name"] == "Offre d'exemple"
+        assert fl["airline_code"] == ""
+        assert fl["price_label"] == "Prix indicatif"
+        assert fl["banner_text"] == "Offres d'exemple, prix indicatifs"
 
-    # 7. Hébergements simulés pour Lisbonne -> aucun hébergement inventé + message clair
+    # 7. Hébergements pour Lisbonne -> section "Se loger" de Wikivoyage (gamme Économique / Standard / Luxe, Prix indicatif, Booking & Airbnb)
     acc_resp = await client.get(
         "/api/v1/accommodations/search",
         params={"trip_id": trip["id"]},
     )
     assert acc_resp.status_code == 200
-    assert acc_resp.json() == []
-    assert acc_resp.headers.get("X-Simulation-Covered") == "false"
-    assert "n'est pas couverte en simulation" in acc_resp.headers.get("X-Simulation-Message", "")
+    lis_accs = acc_resp.json()
+    assert len(lis_accs) >= 3
+    assert {a["gamme_label"] for a in lis_accs}.issubset({"Économique", "Standard", "Luxe"})
+    for acc_item in lis_accs:
+        assert acc_item["price_label"] == "Prix indicatif"
+        assert "booking.com" in acc_item["booking_url"]
+        assert "airbnb.fr" in acc_item["airbnb_url"]
 
 
 @pytest.mark.asyncio

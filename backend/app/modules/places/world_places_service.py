@@ -1597,9 +1597,499 @@ class WorldPlacesService:
                 districts_followed=list(self.last_districts_followed),
             )
 
+    def parse_wikivoyage_sleep_listings(
+        self,
+        wikitext: str,
+        *,
+        page_title: str,
+        lang: str,
+        city_lat: float,
+        city_lon: float,
+    ) -> list[NormalizedWorldAccommodation]:
+        """
+        Extrait la section « Se loger » / « Sleep » d'une page Wikivoyage :
+        nom, adresse, coordonnées, gamme Économique / Standard / Luxe, prix indicatif,
+        type d'hébergement (hôtel, appartement, riad) et liens Booking / Airbnb.
+        """
+        if not wikitext or not wikitext.strip():
+            return []
+
+        normalized_lines = [
+            line.lstrip() if line.lstrip().startswith(("=", "*", "{", "[")) else line
+            for line in wikitext.splitlines()
+        ]
+        wikicode = mwparserfromhell.parse("\n".join(normalized_lines))
+        in_sleep_section = False
+        current_tier = TravelStyle.STANDARD.value
+        extracted: list[NormalizedWorldAccommodation] = []
+        city_clean = page_title.split("/")[0].replace("_", " ").strip()
+        district_label = (
+            page_title.split("/", 1)[1].replace("_", " ").strip()
+            if "/" in page_title
+            else city_clean
+        )
+
+        for node in wikicode.nodes:
+            if isinstance(node, mwparserfromhell.nodes.Heading):
+                heading_title = clean_wikitext_value(str(node.title))
+                level = int(getattr(node, "level", 2))
+                sec_kind = self._section_kind_from_heading(heading_title)
+                if sec_kind == "se loger":
+                    in_sleep_section = True
+                    current_tier = TravelStyle.STANDARD.value
+                elif level <= 2 and sec_kind != "se loger":
+                    in_sleep_section = False
+                elif in_sleep_section:
+                    norm_h = normalize_place_text(heading_title)
+                    if any(
+                        tok in norm_h
+                        for tok in (
+                            "bon marche",
+                            "petit budget",
+                            "petits budgets",
+                            "economique",
+                            "budget",
+                            "auberge",
+                            "camping",
+                            "pas cher",
+                            "deux etoiles",
+                            "2 etoiles",
+                            "une etoile",
+                            "1 etoile",
+                        )
+                    ):
+                        current_tier = TravelStyle.ECONOMIC.value
+                    elif any(
+                        tok in norm_h
+                        for tok in (
+                            "luxe",
+                            "grand luxe",
+                            "chic",
+                            "splurge",
+                            "haut de gamme",
+                            "palace",
+                            "quatre etoiles",
+                            "4 etoiles",
+                            "cinq etoiles",
+                            "5 etoiles",
+                        )
+                    ):
+                        current_tier = TravelStyle.LUXURY.value
+                    elif any(
+                        tok in norm_h
+                        for tok in (
+                            "prix moyen",
+                            "moyen",
+                            "mid range",
+                            "midrange",
+                            "standard",
+                            "confort",
+                            "intermediaire",
+                            "trois etoiles",
+                            "3 etoiles",
+                        )
+                    ):
+                        current_tier = TravelStyle.STANDARD.value
+                continue
+
+            templates: list[mwparserfromhell.nodes.Template] = []
+            if isinstance(node, mwparserfromhell.nodes.Template):
+                templates = [node]
+            else:
+                try:
+                    templates = mwparserfromhell.parse(str(node)).filter_templates(recursive=True)
+                except Exception:
+                    templates = []
+
+            for tpl in templates:
+                raw_tpl_name = clean_wikitext_value(str(tpl.name)).lower()
+                tpl_name = re.sub(r"\s+", " ", raw_tpl_name).strip()
+                if tpl_name not in WIKIVOYAGE_LISTING_TEMPLATES:
+                    continue
+
+                if not in_sleep_section:
+                    continue
+
+                nom = self._get_template_param(tpl, "nom", "name")
+                pos1 = self._get_template_param(tpl, "1")
+                pos2 = self._get_template_param(tpl, "2")
+                if not nom:
+                    if pos1.lower() in WIKIVOYAGE_LISTING_TEMPLATES and pos2:
+                        nom = pos2
+                    else:
+                        nom = pos1
+                if not nom:
+                    continue
+
+                adresse = self._get_template_param(tpl, "adresse", "address", "directions")
+                prix_raw = self._get_template_param(tpl, "prix", "price")
+                description_raw = self._get_template_param(tpl, "description", "content")
+                site_web = self._get_template_param(tpl, "url", "site", "website", "web")
+                wikidata_id = self._get_template_param(tpl, "wikidata")
+                lat_raw = self._get_template_param(tpl, "lat", "latitude")
+                lon_raw = self._get_template_param(tpl, "long", "lon", "lng", "longitude")
+
+                lat_val: float | None = None
+                lon_val: float | None = None
+                try:
+                    if lat_raw and lon_raw:
+                        lat_val = float(lat_raw.replace(",", "."))
+                        lon_val = float(lon_raw.replace(",", "."))
+                except ValueError:
+                    lat_val = None
+                    lon_val = None
+
+                has_precise_coords = lat_val is not None and lon_val is not None
+                if has_precise_coords:
+                    dist_from_city_km = haversine_distance_km(city_lat, city_lon, lat_val, lon_val)
+                    if dist_from_city_km > 15.0:
+                        continue
+                else:
+                    lat_val = city_lat
+                    lon_val = city_lon
+
+                tier = current_tier
+                _, est_cost, parsed_tier = parse_price_text(prix_raw)
+                combined_text = f"{nom} {description_raw} {adresse}".lower()
+
+                if current_tier != TravelStyle.STANDARD.value:
+                    tier = current_tier
+                elif est_cost > 15:
+                    if est_cost <= 115:
+                        tier = TravelStyle.ECONOMIC.value
+                    elif est_cost >= 250:
+                        tier = TravelStyle.LUXURY.value
+                    else:
+                        tier = TravelStyle.STANDARD.value
+                elif parsed_tier != TravelStyle.STANDARD.value:
+                    tier = parsed_tier
+                elif any(k in combined_text for k in ("hostel", "auberge", "backpacker", "budget")):
+                    tier = TravelStyle.ECONOMIC.value
+                elif any(k in combined_text for k in ("palace", "5 étoiles", "5*", "luxury", "luxe", "grand hotel")):
+                    tier = TravelStyle.LUXURY.value
+
+                if est_cost > 15:
+                    indicative_price = round(float(est_cost), 2)
+                else:
+                    indicative_price = {
+                        TravelStyle.ECONOMIC.value: 90.0,
+                        TravelStyle.STANDARD.value: 160.0,
+                        TravelStyle.LUXURY.value: 350.0,
+                    }.get(tier, 150.0)
+
+                if "riad" in combined_text or "dar " in combined_text:
+                    subtype = "riad"
+                    acc_type = "AIRBNB"
+                elif any(
+                    k in combined_text
+                    for k in (
+                        "appartement",
+                        "apartment",
+                        "appart",
+                        "studio",
+                        "loft",
+                        "airbnb",
+                        "résidence",
+                        "residence",
+                        "gîte",
+                        "guesthouse",
+                        "chambre d'hôtes",
+                    )
+                ):
+                    subtype = "appartement"
+                    acc_type = "AIRBNB"
+                else:
+                    subtype = "hôtel"
+                    acc_type = "HOTEL"
+
+                gamme_label = {
+                    TravelStyle.ECONOMIC.value: "Économique",
+                    TravelStyle.STANDARD.value: "Standard",
+                    TravelStyle.LUXURY.value: "Luxe",
+                }.get(tier, "Standard")
+
+                booking_url, airbnb_url = build_accommodation_booking_urls(
+                    name=nom,
+                    city_name=city_clean,
+                    latitude=lat_val if has_precise_coords else None,
+                    longitude=lon_val if has_precise_coords else None,
+                )
+                redirect_url = site_web if (site_web and site_web.startswith("http")) else booking_url
+                norm_qid = wikidata_id.upper() if (wikidata_id and wikidata_id.upper().startswith("Q")) else None
+
+                extracted.append(
+                    NormalizedWorldAccommodation(
+                        name=nom,
+                        type=acc_type,
+                        accommodation_subtype=subtype,
+                        neighborhood=district_label,
+                        address=adresse or "",
+                        latitude=lat_val,
+                        longitude=lon_val,
+                        has_precise_coords=has_precise_coords,
+                        price_per_night=indicative_price,
+                        luxury_tier=tier,
+                        gamme_label=gamme_label,
+                        rating=4.6 if tier == TravelStyle.STANDARD.value else (4.8 if tier == TravelStyle.LUXURY.value else 4.4),
+                        photos=[],
+                        amenities=["Se loger Wikivoyage", f"Gamme {gamme_label}", "Prix indicatif"],
+                        source_provider=f"wikivoyage_{lang}",
+                        booking_redirect_url=redirect_url,
+                        booking_url=booking_url,
+                        airbnb_url=airbnb_url,
+                        is_illustration=True,
+                        illustration_label="Illustration",
+                        price_label="Prix indicatif",
+                        external_entity_id=norm_qid,
+                    )
+                )
+
+        return extracted
+
+    async def fetch_city_accommodations(
+        self,
+        *,
+        city_name: str,
+        city_lat: float,
+        city_lon: float,
+        allow_network: bool = True,
+    ) -> list[NormalizedWorldAccommodation]:
+        """
+        Récupère les hébergements de la section « Se loger » de Wikivoyage (fr puis en)
+        pour une ville du monde.
+        Si Wikivoyage ne retourne rien (ou si le réseau est désactivé), retourne uniquement
+        les 3 cartes génériques (« Hôtel de gamme Économique/Standard/Luxe à <ville> »),
+        sans nom d'établissement, adresse ni coordonnées inventés.
+        """
+        candidates: list[NormalizedWorldAccommodation] = []
+        if allow_network:
+            try:
+                async with httpx.AsyncClient(
+                    transport=self._http_transport,
+                    headers={"User-Agent": WORLD_PLACES_USER_AGENT},
+                    timeout=10.0,
+                ) as client:
+                    for lang in ("fr", "en"):
+                        try:
+                            resolved_title, main_wikitext, _ = await self._fetch_wikivoyage_page(
+                                client,
+                                lang=lang,
+                                page_title=city_name,
+                            )
+                            if main_wikitext:
+                                parsed = self.parse_wikivoyage_sleep_listings(
+                                    main_wikitext,
+                                    page_title=resolved_title or city_name,
+                                    lang=lang,
+                                    city_lat=city_lat,
+                                    city_lon=city_lon,
+                                )
+                                candidates.extend(parsed)
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        if not candidates:
+            candidates = build_curated_or_fallback_world_accommodations(
+                city_name=city_name,
+                city_lat=city_lat,
+                city_lon=city_lon,
+            )
+
+        deduped: list[NormalizedWorldAccommodation] = []
+        seen_names: set[str] = set()
+        for item in candidates:
+            key = normalize_place_text(item.name)
+            if not key or key in seen_names:
+                continue
+            seen_names.add(key)
+            deduped.append(item)
+            if len(deduped) >= 10:
+                break
+        return deduped
+
+
+@dataclass
+class NormalizedWorldAccommodation:
+    name: str
+    type: str
+    accommodation_subtype: str
+    neighborhood: str
+    address: str
+    latitude: float
+    longitude: float
+    price_per_night: float
+    luxury_tier: str
+    gamme_label: str
+    rating: float
+    has_precise_coords: bool = True
+    photos: list[str] = field(default_factory=list)
+    amenities: list[str] = field(default_factory=list)
+    source_provider: str = "wikivoyage_fr"
+    booking_redirect_url: str = ""
+    booking_url: str = ""
+    airbnb_url: str = ""
+    is_illustration: bool = True
+    illustration_label: str = "Illustration"
+    price_label: str = "Prix indicatif"
+    external_entity_id: str | None = None
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+def build_accommodation_booking_urls(
+    *,
+    name: str,
+    city_name: str,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    is_generic: bool = False,
+) -> tuple[str, str]:
+    """Construit les liens de réservation externes Booking.com et Airbnb."""
+    city_clean = city_name.strip()
+    if is_generic or name.strip().startswith("Hôtel de gamme "):
+        booking_url = f"https://www.booking.com/searchresults.fr.html?ss={quote(city_clean)}"
+        airbnb_url = f"https://www.airbnb.fr/s/{quote(city_clean)}/homes"
+        return booking_url, airbnb_url
+
+    search_query = f"{name} {city_clean}".strip()
+    if latitude is not None and longitude is not None:
+        booking_url = (
+            f"https://www.booking.com/searchresults.fr.html"
+            f"?ss={quote(search_query)}&latitude={latitude:.5f}&longitude={longitude:.5f}"
+        )
+        airbnb_url = (
+            f"https://www.airbnb.fr/s/{quote(city_clean)}/homes"
+            f"?lat={latitude:.5f}&lng={longitude:.5f}&query={quote(search_query)}"
+        )
+    else:
+        booking_url = f"https://www.booking.com/searchresults.fr.html?ss={quote(search_query)}"
+        airbnb_url = f"https://www.airbnb.fr/s/{quote(city_clean)}/homes?query={quote(search_query)}"
+    return booking_url, airbnb_url
+
+
+def build_curated_or_fallback_world_accommodations(
+    *,
+    city_name: str,
+    city_lat: float,
+    city_lon: float,
+) -> list[NormalizedWorldAccommodation]:
+    """
+    Repli quand Wikivoyage ne retourne aucun hébergement dans « Se loger » :
+    aucun nom d'établissement, adresse ou coordonnées inventés — uniquement 3 cartes
+    génériques (« Hôtel de gamme Économique/Standard/Luxe à <ville> »), sans marqueur
+    précis sur la carte (`has_precise_coords=False`), étiquetées « Illustration »,
+    avec les boutons Booking et Airbnb.
+    """
+    city_clean = city_name.strip() or "cette ville"
+    generic_tiers = [
+        (
+            f"Hôtel de gamme Économique à {city_clean}",
+            TravelStyle.ECONOMIC.value,
+            "Économique",
+            85.0,
+        ),
+        (
+            f"Hôtel de gamme Standard à {city_clean}",
+            TravelStyle.STANDARD.value,
+            "Standard",
+            150.0,
+        ),
+        (
+            f"Hôtel de gamme Luxe à {city_clean}",
+            TravelStyle.LUXURY.value,
+            "Luxe",
+            320.0,
+        ),
+    ]
+    results: list[NormalizedWorldAccommodation] = []
+    for name, tier_v, gamme_v, price_v in generic_tiers:
+        b_url, a_url = build_accommodation_booking_urls(
+            name=name,
+            city_name=city_clean,
+            is_generic=True,
+        )
+        results.append(
+            NormalizedWorldAccommodation(
+                name=name,
+                type="HOTEL",
+                accommodation_subtype="hôtel",
+                neighborhood=city_clean,
+                address="",
+                latitude=city_lat,
+                longitude=city_lon,
+                has_precise_coords=False,
+                price_per_night=price_v,
+                luxury_tier=tier_v,
+                gamme_label=gamme_v,
+                rating=0.0,
+                photos=[],
+                amenities=[f"Gamme {gamme_v}", "Prix indicatif"],
+                source_provider="generic_fallback",
+                booking_redirect_url=b_url,
+                booking_url=b_url,
+                airbnb_url=a_url,
+                is_illustration=True,
+                illustration_label="Illustration",
+                price_label="Prix indicatif",
+            )
+        )
+    return results
+
 
 world_places_service = WorldPlacesService()
 
 
 def get_world_places_service() -> WorldPlacesService:
     return world_places_service
+
+
+def parse_wikivoyage_sleep_listings(
+    wikitext: str,
+    *,
+    page_title: str | None = None,
+    city_name: str | None = None,
+    country_name: str | None = None,
+    lang: str = "fr",
+    city_lat: float | None = None,
+    city_lon: float | None = None,
+    center_lat: float | None = None,
+    center_lon: float | None = None,
+) -> list[NormalizedWorldAccommodation]:
+    effective_title = page_title or city_name or "Ville"
+    effective_lat = city_lat if city_lat is not None else (center_lat if center_lat is not None else 48.8566)
+    effective_lon = city_lon if city_lon is not None else (center_lon if center_lon is not None else 2.3522)
+    return world_places_service.parse_wikivoyage_sleep_listings(
+        wikitext,
+        page_title=effective_title,
+        lang=lang,
+        city_lat=effective_lat,
+        city_lon=effective_lon,
+    )
+
+
+async def fetch_city_accommodations(
+    *,
+    city_name: str,
+    country_name: str | None = None,
+    city_lat: float | None = None,
+    city_lon: float | None = None,
+    center_lat: float | None = None,
+    center_lon: float | None = None,
+    allow_network: bool = True,
+) -> list[NormalizedWorldAccommodation]:
+    effective_lat = city_lat if city_lat is not None else (center_lat if center_lat is not None else 48.8566)
+    effective_lon = city_lon if city_lon is not None else (center_lon if center_lon is not None else 2.3522)
+    return await world_places_service.fetch_city_accommodations(
+        city_name=city_name,
+        city_lat=effective_lat,
+        city_lon=effective_lon,
+        allow_network=allow_network,
+    )
+
+

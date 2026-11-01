@@ -130,6 +130,22 @@ export interface AccommodationItem {
   luxury_tier: string;
   rating: number;
   photos: string[];
+  photo_status?: string | null;
+  photo_file_title?: string | null;
+  photo_author?: string | null;
+  photo_license?: string | null;
+  photo_commons_url?: string | null;
+  photo_source?: string | null;
+  photo_credit_text?: string | null;
+  wikidata_id?: string | null;
+  accommodation_subtype?: "hotel" | "appartement" | "riad" | string;
+  is_illustration?: boolean;
+  illustration_label?: string;
+  price_label?: string;
+  gamme_label?: string;
+  has_precise_coords?: boolean;
+  booking_url?: string | null;
+  airbnb_url?: string | null;
   amenities: string[];
   booking_redirect_url: string;
   nearby_restaurants: NearbyRestaurant[];
@@ -1103,11 +1119,6 @@ export interface TravelerPreferences {
 }
 
 
-const FALLBACK_HOTEL_IMAGE =
-  "https://images.unsplash.com/photo-1566073771259-6a8506099945?auto=format&fit=crop&w=900&q=80";
-const FALLBACK_PLACE_IMAGE =
-  "https://images.unsplash.com/photo-1539020140153-e479b8c22e70?auto=format&fit=crop&w=900&q=80";
-
 export function formatDayPillHuman(dateStr: string, index: number): string {
   try {
     const formatted = format(parseISO(dateStr), "EEE d MMM", { locale: fr }).toLowerCase();
@@ -1189,6 +1200,80 @@ function NeutralPlaceCategoryIllustration({
   );
 }
 
+export function accommodationSubtypeLabelFr(acc: {
+  accommodation_subtype?: string | null;
+  type?: string | null;
+  name?: string | null;
+}): string {
+  const sub = String(acc.accommodation_subtype || "").toLowerCase();
+  const nameLower = String(acc.name || "").toLowerCase();
+  if (sub === "riad" || nameLower.includes("riad") || nameLower.includes("dar ")) {
+    return "Riad";
+  }
+  if (
+    sub === "appartement" ||
+    String(acc.type || "").toUpperCase() === "AIRBNB" ||
+    nameLower.includes("appartement") ||
+    nameLower.includes("loft") ||
+    nameLower.includes("maison")
+  ) {
+    return "Appartement";
+  }
+  return "Hôtel";
+}
+
+export function gammeLabelFr(acc: {
+  gamme_label?: string | null;
+  luxury_tier?: string | null;
+}): string {
+  if (acc.gamme_label && acc.gamme_label.trim()) {
+    return acc.gamme_label.trim();
+  }
+  const tier = String(acc.luxury_tier || "").toUpperCase();
+  if (tier === "ECO" || tier === "ECONOMIQUE") return "Économique";
+  if (tier === "LUXE" || tier === "LUXURY") return "Luxe";
+  return "Standard";
+}
+
+function AccommodationTypeIllustration({
+  acc,
+  testId,
+}: {
+  acc: AccommodationItem;
+  testId?: string;
+}) {
+  const subtypeFr = accommodationSubtypeLabelFr(acc);
+  const labelText = acc.illustration_label || "Illustration";
+  let toneClasses = "bg-stone-100 text-stone-800";
+  if (subtypeFr === "Riad") {
+    toneClasses = "bg-amber-50/90 text-amber-900";
+  } else if (subtypeFr === "Appartement") {
+    toneClasses = "bg-emerald-50/90 text-emerald-900";
+  }
+
+  return (
+    <div
+      data-testid={testId}
+      className={`h-full w-full flex flex-col items-center justify-center p-5 text-center select-none ${toneClasses}`}
+    >
+      <div className="mb-2">
+        <span
+          data-testid="acc-illustration-badge"
+          className="inline-flex items-center rounded-full border border-current/20 bg-white/90 px-2.5 py-0.5 text-xs font-semibold shadow-sm"
+        >
+          {labelText}
+        </span>
+      </div>
+      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white/85 shadow-sm mb-2">
+        <Building2 className="h-6 w-6" aria-hidden="true" />
+      </div>
+      <span className="text-caption font-semibold">
+        Type d&apos;hébergement : {subtypeFr}
+      </span>
+    </div>
+  );
+}
+
 export function normalizeSchedulePayload(raw: any): TripItinerarySchedule {
   const rawDays = raw?.days || {};
   const normalizedDays: ItineraryDayGroup[] = Array.isArray(rawDays)
@@ -1254,10 +1339,10 @@ export function buildTripDayDates(
 
 /* ============================================================================
  * 1. ÉCRAN HÉBERGEMENT (/accommodations)
- *    - Liste de cartes avec photo à gauche + carte à droite (bascule Liste / Carte sur mobile)
+ *    - Liste de cartes avec photo Commons ou Illustration à gauche + carte à droite
  *    - Zone issue du voyage (aucune coordonnée à saisir)
  *    - Filtres repliables (budget, type)
- *    - Fiche avec restaurants proches
+ *    - Prix indicatif + gamme Économique / Standard / Luxe + boutons Booking & Airbnb
  * ========================================================================== */
 export function AccommodationsScreen({
   apiBase,
@@ -1295,12 +1380,47 @@ export function AccommodationsScreen({
     selectedAccommodation?.id || ""
   );
   const [detailModalAcc, setDetailModalAcc] = useState<AccommodationItem | null>(null);
+  const [brokenPhotoIds, setBrokenPhotoIds] = useState<Record<string, boolean>>({});
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const leafletMapRef = useRef<any>(null);
   const leafletLayerGroupRef = useRef<any>(null);
 
   const cityLabel = destination?.city_name || "votre destination";
+  const checkinIso = (
+    departureDate ||
+    (trip?.arrival_at ? trip.arrival_at.slice(0, 10) : "2026-11-10")
+  ).slice(0, 10);
+  const checkoutIso = (
+    returnDate ||
+    (trip?.departure_at ? trip.departure_at.slice(0, 10) : "2026-11-17")
+  ).slice(0, 10);
+  const adultsCount = Math.max(
+    1,
+    parseInt(String(travelers || "2").replace(/[^0-9]/g, ""), 10) || 2
+  );
+
+  function getAccBookingUrl(acc: AccommodationItem): string {
+    if (acc.booking_url) return acc.booking_url;
+    if (acc.booking_redirect_url && acc.booking_redirect_url.includes("booking.com")) {
+      return acc.booking_redirect_url;
+    }
+    const q = `${acc.name} ${cityLabel}`.trim();
+    return `https://www.booking.com/searchresults.fr.html?ss=${encodeURIComponent(
+      q
+    )}&checkin=${encodeURIComponent(checkinIso)}&checkout=${encodeURIComponent(
+      checkoutIso
+    )}&group_adults=${adultsCount}&no_rooms=1`;
+  }
+
+  function getAccAirbnbUrl(acc: AccommodationItem): string {
+    if (acc.airbnb_url) return acc.airbnb_url;
+    return `https://www.airbnb.fr/s/${encodeURIComponent(
+      cityLabel
+    )}/homes?checkin=${encodeURIComponent(checkinIso)}&checkout=${encodeURIComponent(
+      checkoutIso
+    )}&adults=${adultsCount}`;
+  }
 
   async function loadAccommodations() {
     setLoading(true);
@@ -1309,6 +1429,9 @@ export function AccommodationsScreen({
       const params = new URLSearchParams({
         radius_km: "12",
         restaurant_radius_km: "5",
+        checkin: checkinIso,
+        checkout: checkoutIso,
+        adults: String(adultsCount),
       });
       if (trip?.id) {
         params.set("trip_id", trip.id);
@@ -1348,6 +1471,7 @@ export function AccommodationsScreen({
   }
 
   useEffect(() => {
+    if (!trip?.id && !destination?.id) return;
     loadAccommodations();
   }, [trip?.id, destination?.id, accTypeFilter, maxBudget]);
 
@@ -1388,6 +1512,13 @@ export function AccommodationsScreen({
     layerGroup.clearLayers();
 
     for (const acc of accommodations) {
+      if (
+        acc.has_precise_coords === false ||
+        acc.source_provider === "generic_fallback" ||
+        acc.name.startsWith("Hôtel de gamme ")
+      ) {
+        continue;
+      }
       const isFocused = acc.id === focusedAccommodation?.id;
       const marker = L.circleMarker([acc.latitude, acc.longitude], {
         radius: isFocused ? 10 : 8,
@@ -1397,8 +1528,12 @@ export function AccommodationsScreen({
         fillOpacity: 0.9,
       }).addTo(layerGroup);
 
+      const gamme = gammeLabelFr(acc);
+      const priceLabel = acc.price_label || "Prix indicatif";
       marker.bindPopup(
-        `<strong>${acc.name}</strong><br/>${Math.round(Number(acc.price_per_night))} € / nuit`
+        `<strong>${acc.name}</strong><br/>${gamme} • ${priceLabel} : ~${Math.round(
+          Number(acc.price_per_night)
+        )} € / nuit`
       );
       marker.on("click", () => setFocusedAccId(acc.id));
 
@@ -1442,7 +1577,7 @@ export function AccommodationsScreen({
           </Badge>
           <h1 className="text-h1 text-ink">Hébergements à {cityLabel}</h1>
           <p className="text-body text-ink-secondary mt-1">
-            Hôtels et logements situés au cœur de {cityLabel}, avec les bonnes tables accessibles à pied.
+            Adresses pour se loger au cœur de {cityLabel} (gammes Économique, Standard et Luxe), avec réservation directe sur Booking ou Airbnb.
           </p>
         </div>
 
@@ -1508,33 +1643,33 @@ export function AccommodationsScreen({
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 items-end">
             <div>
               <label className="block text-caption font-medium text-ink-secondary mb-1">
-                Type d'hébergement
+                Type d&apos;hébergement
               </label>
               <Select
                 value={accTypeFilter}
                 onValueChange={setAccTypeFilter}
                 ariaLabel="Type d'hébergement"
                 options={[
-                  { value: "ALL", label: "Hôtels & Airbnb" },
+                  { value: "ALL", label: "Hôtels, Appartements & Riads" },
                   { value: "HOTEL", label: "Hôtels uniquement" },
-                  { value: "AIRBNB", label: "Appartements & Riads (Airbnb)" },
+                  { value: "AIRBNB", label: "Appartements & Riads" },
                 ]}
               />
             </div>
 
             <div>
               <label className="block text-caption font-medium text-ink-secondary mb-1">
-                Budget maximum par nuit
+                Budget indicatif par nuit
               </label>
               <Select
                 value={maxBudget}
                 onValueChange={setMaxBudget}
                 ariaLabel="Budget maximum par nuit"
                 options={[
-                  { value: "2000", label: "Tous les budgets" },
-                  { value: "180", label: "Jusqu'à 180 € / nuit" },
-                  { value: "300", label: "Jusqu'à 300 € / nuit" },
-                  { value: "500", label: "Jusqu'à 500 € / nuit" },
+                  { value: "2000", label: "Toutes les gammes" },
+                  { value: "180", label: "Économique (jusqu'à 180 €)" },
+                  { value: "300", label: "Standard (jusqu'à 300 €)" },
+                  { value: "500", label: "Jusqu'à 500 €" },
                 ]}
               />
             </div>
@@ -1564,7 +1699,7 @@ export function AccommodationsScreen({
 
       {/* Disposition principale : Liste de cartes à gauche + Carte à droite */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-        {/* Colonne gauche : Liste de cartes avec photo à gauche */}
+        {/* Colonne gauche : Liste de cartes */}
         <div
           className={`lg:col-span-7 space-y-4 ${
             mobileView === "map" ? "hidden lg:block" : "block"
@@ -1594,18 +1729,6 @@ export function AccommodationsScreen({
                   )
               );
               const targetCity = destination?.city_name || "votre destination";
-              const checkinIso = (
-                departureDate ||
-                (trip?.arrival_at ? trip.arrival_at.slice(0, 10) : "2026-11-10")
-              ).slice(0, 10);
-              const checkoutIso = (
-                returnDate ||
-                (trip?.departure_at ? trip.departure_at.slice(0, 10) : "2026-11-17")
-              ).slice(0, 10);
-              const adultsCount = Math.max(
-                1,
-                parseInt(String(travelers || "2").replace(/[^0-9]/g, ""), 10) || 2
-              );
               const bookingUrl = `https://www.booking.com/searchresults.fr.html?ss=${encodeURIComponent(
                 targetCity
               )}&checkin=${encodeURIComponent(checkinIso)}&checkout=${encodeURIComponent(
@@ -1630,58 +1753,56 @@ export function AccommodationsScreen({
                   </h2>
                   <p className="text-body text-ink-secondary max-w-lg mx-auto">
                     {isCustomWorldCity
-                      ? `Consultez directement les offres disponibles à ${targetCity} du ${checkinIso} au ${checkoutIso} pour ${adultsCount} voyageur${
+                      ? `Consultez directement les offres disponibles à ${targetCity} pour ${adultsCount} voyageur${
                           adultsCount > 1 ? "s" : ""
                         }, ou poursuivez l'organisation de votre séjour.`
-                      : "Essayez d'élargir votre budget ou d'afficher à la fois les hôtels et les logements Airbnb."}
+                      : "Essayez d'élargir votre budget ou d'afficher à la fois les hôtels et les logements."}
                   </p>
 
-                  {isCustomWorldCity && (
-                    <div className="pt-2 flex flex-col items-center gap-3">
-                      <div className="inline-flex flex-wrap items-center justify-center gap-2">
-                        <a
-                          href={bookingUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          data-testid="accommodations-search-primary-btn"
-                          className="inline-flex items-center justify-center gap-2 rounded-control px-5 py-2.5 text-sm font-semibold bg-accent text-white hover:bg-accent-hover shadow-subtle transition-colors"
-                        >
-                          <span>{`Rechercher un hébergement à ${targetCity}`}</span>
-                          <span aria-hidden="true">↗</span>
-                        </a>
-                      </div>
-
-                      <div
-                        className="inline-flex flex-wrap items-center justify-center gap-2 rounded-control border border-border bg-canvas-subtle px-3 py-1.5 text-xs"
-                        role="group"
-                        aria-label="Choisir une plateforme d'hébergement"
-                        data-testid="accommodations-compare-menu"
+                  <div className="pt-2 flex flex-col items-center gap-3">
+                    <div className="inline-flex flex-wrap items-center justify-center gap-2">
+                      <a
+                        href={bookingUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        data-testid="accommodations-search-primary-btn"
+                        className="inline-flex items-center justify-center gap-2 rounded-control px-5 py-2.5 text-sm font-semibold bg-accent text-white hover:bg-accent-hover shadow-subtle transition-colors"
                       >
-                        <span className="text-ink-muted font-medium">Ouvrir sur :</span>
-                        <a
-                          href={bookingUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          data-testid="accommodations-compare-booking"
-                          className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
-                        >
-                          Booking ↗
-                        </a>
-                        <span className="text-border" aria-hidden="true">
-                          •
-                        </span>
-                        <a
-                          href={airbnbUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          data-testid="accommodations-compare-airbnb"
-                          className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
-                        >
-                          Airbnb ↗
-                        </a>
-                      </div>
+                        <span>{`Rechercher un hébergement à ${targetCity}`}</span>
+                        <span aria-hidden="true">↗</span>
+                      </a>
                     </div>
-                  )}
+
+                    <div
+                      className="inline-flex flex-wrap items-center justify-center gap-2 rounded-control border border-border bg-canvas-subtle px-3 py-1.5 text-xs"
+                      role="group"
+                      aria-label="Choisir une plateforme d'hébergement"
+                      data-testid="accommodations-compare-menu"
+                    >
+                      <span className="text-ink-muted font-medium">Réserver sur :</span>
+                      <a
+                        href={bookingUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        data-testid="accommodations-compare-booking"
+                        className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
+                      >
+                        Booking ↗
+                      </a>
+                      <span className="text-border" aria-hidden="true">
+                        •
+                      </span>
+                      <a
+                        href={airbnbUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        data-testid="accommodations-compare-airbnb"
+                        className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
+                      >
+                        Airbnb ↗
+                      </a>
+                    </div>
+                  </div>
 
                   <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
                     <Button
@@ -1721,10 +1842,20 @@ export function AccommodationsScreen({
             accommodations.map((acc, idx) => {
               const isSelected = selectedAccommodation?.id === acc.id;
               const isFocused = focusedAccommodation?.id === acc.id;
-              const coverPhoto =
-                acc.photos?.[0] ||
-                destination?.hero_image_url ||
-                FALLBACK_HOTEL_IMAGE;
+              const hasRealCommonsPhoto = Boolean(
+                acc.photos?.[0] && !acc.is_illustration && !brokenPhotoIds[acc.id]
+              );
+              const coverPhoto = hasRealCommonsPhoto ? acc.photos[0] : "";
+              const photoCreditText =
+                acc.photo_credit_text ||
+                (acc.photo_author && acc.photo_license
+                  ? `Photo : ${acc.photo_author} • ${acc.photo_license}`
+                  : null);
+              const subtypeFr = accommodationSubtypeLabelFr(acc);
+              const gammeFr = gammeLabelFr(acc);
+              const priceLabelText = acc.price_label || "Prix indicatif";
+              const bookingHref = getAccBookingUrl(acc);
+              const airbnbHref = getAccAirbnbUrl(acc);
 
               return (
                 <Card
@@ -1738,27 +1869,73 @@ export function AccommodationsScreen({
                   }`}
                 >
                   <div className="flex flex-col sm:flex-row">
-                    {/* Photo à gauche */}
-                    <div className="sm:w-56 shrink-0 aspect-[4/3] sm:aspect-auto bg-canvas-subtle relative overflow-hidden">
-                      <img
-                        src={coverPhoto}
-                        alt={acc.name}
-                        width={320}
-                        height={240}
-                        loading="eager"
-                        referrerPolicy="no-referrer"
-                        onError={(e) => {
-                          e.currentTarget.src = FALLBACK_HOTEL_IMAGE;
-                        }}
-                        className="h-full w-full object-cover"
-                      />
-                      <div className="absolute top-3 left-3">
-                        <Badge
-                          variant={acc.type === "HOTEL" ? "brand" : "default"}
-                          className="bg-white/95 text-ink shadow-sm"
-                        >
-                          {acc.type === "HOTEL" ? "Hôtel" : "Airbnb"}
-                        </Badge>
+                    {/* Photo Commons ou carte Illustration à gauche */}
+                    <div className="sm:w-60 shrink-0 flex flex-col bg-canvas-subtle border-b sm:border-b-0 sm:border-r border-border/60">
+                      <div className="relative aspect-[4/3] sm:flex-1 overflow-hidden">
+                        {hasRealCommonsPhoto ? (
+                          <img
+                            src={coverPhoto}
+                            alt={acc.name}
+                            width={320}
+                            height={240}
+                            loading="eager"
+                            referrerPolicy="no-referrer"
+                            data-testid={`acc-photo-img-${idx}`}
+                            onError={() => {
+                              setBrokenPhotoIds((prev) => ({
+                                ...prev,
+                                [acc.id]: true,
+                              }));
+                            }}
+                            className="h-full w-full object-cover"
+                          />
+                        ) : (
+                          <AccommodationTypeIllustration
+                            acc={acc}
+                            testId={`acc-illustration-${idx}`}
+                          />
+                        )}
+                        <div className="absolute top-3 left-3 flex flex-wrap gap-1.5">
+                          <Badge
+                            variant={acc.type === "HOTEL" ? "brand" : "default"}
+                            className="bg-white/95 text-ink shadow-sm"
+                          >
+                            {subtypeFr}
+                          </Badge>
+                          <Badge
+                            className="bg-white/95 text-brand-800 shadow-sm"
+                            data-testid={`acc-gamme-${idx}`}
+                          >
+                            {gammeFr}
+                          </Badge>
+                        </div>
+                      </div>
+
+                      {/* Bandeau crédit photo Commons ou mention Illustration */}
+                      <div
+                        className="px-3 py-1.5 bg-canvas-subtle/90 border-t border-border/60 text-caption text-ink-muted"
+                        data-testid={`acc-photo-credit-${idx}`}
+                      >
+                        {hasRealCommonsPhoto && photoCreditText ? (
+                          acc.photo_commons_url ? (
+                            <a
+                              href={acc.photo_commons_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              data-testid={`acc-photo-credit-link-${idx}`}
+                              className="block truncate underline decoration-border hover:text-brand-700 transition-colors"
+                            >
+                              {photoCreditText}
+                            </a>
+                          ) : (
+                            <span className="block truncate">{photoCreditText}</span>
+                          )
+                        ) : (
+                          <span className="block truncate">
+                            {acc.illustration_label || "Illustration"} — {subtypeFr}
+                          </span>
+                        )}
                       </div>
                     </div>
 
@@ -1768,18 +1945,25 @@ export function AccommodationsScreen({
                         <div className="flex items-center justify-between gap-2 text-caption text-ink-muted">
                           <span className="inline-flex items-center gap-1">
                             <MapPin className="h-3.5 w-3.5 text-brand-700" />
-                            {acc.neighborhood} • à {acc.distance_from_center_km} km du centre
+                            {acc.has_precise_coords === false ||
+                            acc.source_provider === "generic_fallback"
+                              ? acc.neighborhood
+                              : `${acc.neighborhood} • à ${acc.distance_from_center_km} km du centre`}
                           </span>
-                          <span className="inline-flex items-center gap-1 font-semibold text-ink">
-                            <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" />
-                            {acc.rating.toFixed(1)}
-                          </span>
+                          {acc.rating > 0 && (
+                            <span className="inline-flex items-center gap-1 font-semibold text-ink">
+                              <Star className="h-3.5 w-3.5 fill-amber-400 text-amber-500" />
+                              {acc.rating.toFixed(1)}
+                            </span>
+                          )}
                         </div>
 
                         <h2 className="text-h2 text-ink mt-1">{acc.name}</h2>
-                        <p className="text-caption text-ink-secondary mt-0.5">
-                          {acc.address}
-                        </p>
+                        {acc.address ? (
+                          <p className="text-caption text-ink-secondary mt-0.5">
+                            {acc.address}
+                          </p>
+                        ) : null}
 
                         {/* Aperçu des restaurants proches */}
                         {acc.nearby_restaurants.length > 0 && (
@@ -1793,40 +1977,79 @@ export function AccommodationsScreen({
                         )}
                       </div>
 
-                      <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-border">
-                        <div>
-                          <span className="text-h2 font-bold text-ink">
-                            {Math.round(Number(acc.price_per_night))} €
+                      <div className="space-y-3 pt-3 border-t border-border">
+                        <div className="flex flex-wrap items-baseline justify-between gap-2">
+                          <div>
+                            <span
+                              className="text-caption font-semibold text-brand-800 mr-1.5"
+                              data-testid={`acc-price-label-${idx}`}
+                            >
+                              {priceLabelText} :
+                            </span>
+                            <span className="text-h2 font-bold text-ink">
+                              ~{Math.round(Number(acc.price_per_night))} €
+                            </span>
+                            <span className="text-caption text-ink-muted"> / nuit</span>
+                          </div>
+                          <span className="text-caption text-ink-muted">
+                            Gamme {gammeFr}
                           </span>
-                          <span className="text-caption text-ink-muted"> / nuit</span>
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <Button
-                            type="button"
-                            variant="secondary"
-                            size="sm"
-                            data-testid={`acc-detail-btn-${idx}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setDetailModalAcc(acc);
-                            }}
-                          >
-                            Fiche & restaurants
-                          </Button>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          {/* Boutons Booking et Airbnb pour réserver */}
+                          <div className="inline-flex flex-wrap items-center gap-2">
+                            <a
+                              href={bookingHref}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              data-testid={`acc-booking-btn-${idx}`}
+                              className="inline-flex items-center gap-1 rounded-control border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-brand-800 hover:bg-brand-50 transition-colors"
+                            >
+                              <span>Booking</span>
+                              <span aria-hidden="true">↗</span>
+                            </a>
+                            <a
+                              href={airbnbHref}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              data-testid={`acc-airbnb-btn-${idx}`}
+                              className="inline-flex items-center gap-1 rounded-control border border-border bg-canvas-subtle px-3 py-1.5 text-caption font-semibold text-brand-800 hover:bg-brand-50 transition-colors"
+                            >
+                              <span>Airbnb</span>
+                              <span aria-hidden="true">↗</span>
+                            </a>
+                          </div>
 
-                          <Button
-                            type="button"
-                            variant={isSelected ? "secondary" : "primary"}
-                            size="sm"
-                            data-testid={`acc-choose-btn-${idx}`}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleChooseAccommodation(acc);
-                            }}
-                          >
-                            {isSelected ? "Sélectionné ✓" : "Choisir"}
-                          </Button>
+                          <div className="flex items-center gap-2">
+                            <Button
+                              type="button"
+                              variant="secondary"
+                              size="sm"
+                              data-testid={`acc-detail-btn-${idx}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDetailModalAcc(acc);
+                              }}
+                            >
+                              {"Fiche & restaurants"}
+                            </Button>
+
+                            <Button
+                              type="button"
+                              variant={isSelected ? "secondary" : "primary"}
+                              size="sm"
+                              data-testid={`acc-choose-btn-${idx}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleChooseAccommodation(acc);
+                              }}
+                            >
+                              {isSelected ? "Sélectionné ✓" : "Choisir"}
+                            </Button>
+                          </div>
                         </div>
                       </div>
                     </div>
@@ -1869,6 +2092,7 @@ export function AccommodationsScreen({
                   </div>
                   <div className="text-caption text-ink-secondary">
                     {focusedAccommodation.neighborhood} •{" "}
+                    {gammeLabelFr(focusedAccommodation)} •{" "}
                     {focusedAccommodation.nearby_restaurants.length} tables à proximité
                   </div>
                 </div>
@@ -1902,37 +2126,92 @@ export function AccommodationsScreen({
       >
         {detailModalAcc && (
           <div className="space-y-5" data-testid="accommodation-detail-modal">
-            <div className="aspect-[16/9] w-full overflow-hidden rounded-card bg-canvas-subtle">
-              <img
-                src={
-                  detailModalAcc.photos?.[0] ||
-                  destination?.hero_image_url ||
-                  FALLBACK_HOTEL_IMAGE
-                }
-                alt={detailModalAcc.name}
-                width={640}
-                height={360}
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  e.currentTarget.src = FALLBACK_HOTEL_IMAGE;
-                }}
-                className="h-full w-full object-cover"
-              />
+            <div className="overflow-hidden rounded-card bg-canvas-subtle border border-border/60">
+              <div className="aspect-[16/9] w-full overflow-hidden bg-canvas-subtle">
+                {detailModalAcc.photos?.[0] &&
+                !detailModalAcc.is_illustration &&
+                !brokenPhotoIds[detailModalAcc.id] ? (
+                  <img
+                    src={detailModalAcc.photos[0]}
+                    alt={detailModalAcc.name}
+                    width={640}
+                    height={360}
+                    referrerPolicy="no-referrer"
+                    onError={() => {
+                      setBrokenPhotoIds((prev) => ({
+                        ...prev,
+                        [detailModalAcc.id]: true,
+                      }));
+                    }}
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <AccommodationTypeIllustration
+                    acc={detailModalAcc}
+                    testId="modal-acc-illustration"
+                  />
+                )}
+              </div>
+              {detailModalAcc.photo_credit_text && (
+                <div className="px-4 py-2 bg-canvas-subtle/80 border-t border-border/60 text-caption text-ink-muted">
+                  {detailModalAcc.photo_commons_url ? (
+                    <a
+                      href={detailModalAcc.photo_commons_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="underline decoration-border hover:text-brand-700"
+                    >
+                      {detailModalAcc.photo_credit_text}
+                    </a>
+                  ) : (
+                    <span>{detailModalAcc.photo_credit_text}</span>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap gap-2">
                 <Badge variant="brand">
-                  {detailModalAcc.type === "HOTEL" ? "Hôtel" : "Airbnb"}
+                  {accommodationSubtypeLabelFr(detailModalAcc)}
                 </Badge>
+                <Badge>{gammeLabelFr(detailModalAcc)}</Badge>
                 {detailModalAcc.amenities.map((am) => (
                   <Badge key={am}>{am}</Badge>
                 ))}
               </div>
-              <div className="text-h2 font-bold text-ink">
-                {Math.round(Number(detailModalAcc.price_per_night))} €{" "}
+              <div className="text-right">
+                <span className="text-caption font-semibold text-brand-800 mr-1.5">
+                  {detailModalAcc.price_label || "Prix indicatif"} :
+                </span>
+                <span className="text-h2 font-bold text-ink">
+                  ~{Math.round(Number(detailModalAcc.price_per_night))} €{" "}
+                </span>
                 <span className="text-caption font-normal text-ink-muted">/ nuit</span>
               </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <a
+                href={getAccBookingUrl(detailModalAcc)}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="modal-acc-booking-btn"
+                className="inline-flex items-center gap-1.5 rounded-control border border-border bg-canvas-subtle px-3.5 py-2 text-caption font-semibold text-brand-800 hover:bg-brand-50 transition-colors"
+              >
+                <span>Réserver sur Booking</span>
+                <span aria-hidden="true">↗</span>
+              </a>
+              <a
+                href={getAccAirbnbUrl(detailModalAcc)}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="modal-acc-airbnb-btn"
+                className="inline-flex items-center gap-1.5 rounded-control border border-border bg-canvas-subtle px-3.5 py-2 text-caption font-semibold text-brand-800 hover:bg-brand-50 transition-colors"
+              >
+                <span>Réserver sur Airbnb</span>
+                <span aria-hidden="true">↗</span>
+              </a>
             </div>
 
             {/* Liste des restaurants proches */}
@@ -7120,7 +7399,7 @@ export function MyTripSummaryScreen({
               </span>
               {activeAccommodation && (
                 <Badge variant="brand">
-                  {activeAccommodation.type === "HOTEL" ? "Hôtel" : "Airbnb"}
+                  {accommodationSubtypeLabelFr(activeAccommodation)}
                 </Badge>
               )}
             </div>
@@ -7132,6 +7411,7 @@ export function MyTripSummaryScreen({
                 </div>
                 <div className="text-caption text-ink-secondary">
                   {activeAccommodation.neighborhood} •{" "}
+                  {activeAccommodation.price_label || "Prix indicatif"} : ~
                   {Math.round(Number(activeAccommodation.price_per_night))} € / nuit
                 </div>
                 <div className="text-caption text-brand-700 font-medium">

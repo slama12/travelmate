@@ -4,15 +4,19 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.core.airports import are_airport_codes_equivalent
+
 
 class FlightOfferResponse(BaseModel):
     offer_id: str
-    airline_code: str
+    airline_code: str = ""
     airline_name: str
     flight_number_outbound: str
     flight_number_inbound: str
     origin_iata: str
     destination_iata: str
+    origin_city_code: str | None = None
+    destination_city_code: str | None = None
     destination_city: str
     departure_outbound_at: datetime
     arrival_outbound_at: datetime
@@ -23,14 +27,26 @@ class FlightOfferResponse(BaseModel):
     price_eur: float
     currency: str = "EUR"
     mode: str
+    is_example_offer: bool = False
+    offer_badge: str = "Offre d'exemple"
+    price_label: str = "Prix indicatif"
+    banner_text: str = "Offres d'exemple, prix indicatifs"
+    distance_km: float | None = None
+    duration_outbound_minutes: int | None = None
+    duration_inbound_minutes: int | None = None
+    stops: int = 0
+    stopover_hub_iata: str | None = None
+    stopover_hub_city: str | None = None
+    stopover_label: str = "Direct"
+    comparator_urls: dict[str, str] = Field(default_factory=dict)
 
 
 class FlightBookingRequest(BaseModel):
     trip_id: str
     idempotency_key: str = Field(..., min_length=4, max_length=100)
     airline: str = Field(..., min_length=2, max_length=100)
-    flight_number_outbound: str = Field(..., min_length=2, max_length=20)
-    flight_number_inbound: str = Field(..., min_length=2, max_length=20)
+    flight_number_outbound: str = Field(..., min_length=2, max_length=60)
+    flight_number_inbound: str = Field(..., min_length=2, max_length=60)
     origin_iata: str = Field(..., min_length=3, max_length=3)
     destination_iata: str = Field(..., min_length=3, max_length=3)
     departure_outbound_at: datetime
@@ -45,7 +61,7 @@ class FlightBookingRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_dates_and_airports(self) -> "FlightBookingRequest":
-        if self.origin_iata.upper() == self.destination_iata.upper():
+        if are_airport_codes_equivalent(self.origin_iata, self.destination_iata):
             raise ValueError("Les aéroports de départ et d'arrivée doivent être distincts.")
         if self.arrival_outbound_at <= self.departure_outbound_at:
             raise ValueError("L'arrivée du vol aller doit être strictement postérieure au départ aller.")

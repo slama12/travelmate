@@ -1473,7 +1473,7 @@ def verify_seed_demo_photos_integrity(
                 or not author
                 or not normalize_and_validate_free_license(lic)
                 or not commons_url.startswith("https://commons.wikimedia.org/wiki/File:")
-                or source not in ("wikidata_p18", "wikipedia_pageimages")
+                or source not in ("wikidata_p18", "wikipedia_pageimages", "wikipedia_pageimage")
                 or is_forbidden_image_title_or_type(file_title)[0]
             ):
                 missing_credits.append(
@@ -1503,6 +1503,93 @@ def verify_seed_demo_photos_integrity(
                     }
                 )
 
+        for acc in dest.get("accommodations", []):
+            acc_name = str(acc.get("name") or "")
+            acc_label = f"{city} :: [ACC] {acc_name}"
+            acc_photos = acc.get("photos") or []
+            if not acc_photos:
+                if not acc.get("is_illustration") or acc.get("illustration_label") != "Illustration":
+                    mismatched_places.append(
+                        {"place": acc_label, "reason": "hebergement_sans_photo_doit_etre_illustration"}
+                    )
+                continue
+
+            if len(acc_photos) != 1:
+                mismatched_places.append({"place": acc_label, "reason": "multiple_accommodation_photos"})
+
+            acc_url = str(acc_photos[0] or "").strip()
+            acc_file_title = str(acc.get("photo_file_title") or "").strip()
+            acc_author = str(acc.get("photo_author") or "").strip()
+            acc_lic = str(acc.get("photo_license") or "").strip()
+            acc_commons_url = str(acc.get("photo_commons_url") or "").strip()
+            acc_source = str(acc.get("photo_source") or "").strip()
+            acc_qid = str(acc.get("external_entity_id") or "").strip()
+
+            if "unsplash.com" in acc_url.lower():
+                unsplash_urls.append({"place": acc_label, "url": acc_url})
+
+            if acc_url in seen_urls_city:
+                duplicate_urls.append(
+                    {"city": city, "url": acc_url, "first_place": seen_urls_city[acc_url], "second_place": acc_label}
+                )
+            else:
+                seen_urls_city[acc_url] = acc_label
+
+            if acc_url in seen_urls_global:
+                duplicate_urls.append(
+                    {"city": "global", "url": acc_url, "first_place": seen_urls_global[acc_url], "second_place": acc_label}
+                )
+            else:
+                seen_urls_global[acc_url] = acc_label
+
+            norm_acc_title = normalize_commons_file_title(acc_file_title).lower() if acc_file_title else ""
+            if norm_acc_title:
+                if norm_acc_title in seen_titles_global:
+                    duplicate_file_titles.append(
+                        {
+                            "file_title": acc_file_title,
+                            "first_place": seen_titles_global[norm_acc_title],
+                            "second_place": acc_label,
+                        }
+                    )
+                else:
+                    seen_titles_global[norm_acc_title] = acc_label
+
+            if (
+                not acc_file_title
+                or not acc_author
+                or not normalize_and_validate_free_license(acc_lic)
+                or not acc_commons_url.startswith("https://commons.wikimedia.org/wiki/File:")
+                or acc_source not in ("wikidata_p18", "wikipedia_pageimages", "wikipedia_pageimage")
+                or is_forbidden_image_title_or_type(acc_file_title)[0]
+            ):
+                missing_credits.append(
+                    {
+                        "place": acc_label,
+                        "photo_file_title": acc_file_title,
+                        "photo_author": acc_author,
+                        "photo_license": acc_lic,
+                        "photo_commons_url": acc_commons_url,
+                        "photo_source": acc_source,
+                    }
+                )
+
+            acc_corr = verify_place_photo_correspondence(
+                place_name=acc_name,
+                photo_file_title=acc_file_title,
+                external_place_id=acc_qid,
+                opening_hours={"_wikidata_id": acc_qid, "_aliases": acc.get("_aliases", [])},
+            )
+            if not acc_corr["matches"]:
+                mismatched_places.append(
+                    {
+                        "place": acc_label,
+                        "photo_file_title": acc_file_title,
+                        "external_place_id": acc_qid,
+                        "detail": acc_corr,
+                    }
+                )
+
     is_valid = (
         len(unsplash_urls) == 0
         and len(duplicate_urls) == 0
@@ -1511,8 +1598,20 @@ def verify_seed_demo_photos_integrity(
         and len(missing_credits) == 0
     )
 
+    errors = (
+        unsplash_urls
+        + duplicate_urls
+        + duplicate_file_titles
+        + mismatched_places
+        + missing_credits
+    )
     return {
         "is_valid": is_valid,
+        "valid": is_valid,
+        "errors": errors,
+        "unsplash_count": len(unsplash_urls),
+        "duplicate_url_count": len(duplicate_urls),
+        "duplicate_title_count": len(duplicate_file_titles),
         "demo_cities_count": len(destinations),
         "total_demo_places": total_places,
         "places_with_photo": places_with_photo,

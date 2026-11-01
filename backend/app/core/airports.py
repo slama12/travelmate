@@ -65,6 +65,143 @@ def load_ourairports_catalog(csv_path: Path = OURAIRPORTS_CSV_PATH) -> tuple[Air
 # Catalogue chargé localement depuis backend/data/ourairports_iata.csv (aucun téléchargement réseau)
 OURAIRPORTS_CATALOG: tuple[AirportRecord, ...] = load_ourairports_catalog()
 
+AIRPORTS_BY_IATA: dict[str, AirportRecord] = {
+    rec.iata_code.upper(): rec for rec in OURAIRPORTS_CATALOG
+}
+
+# Codes de ville multi-aéroports utilisés par les comparateurs (Google Flights, Kayak, Skyscanner)
+METRO_CITY_CODES: dict[str, dict[str, object]] = {
+    "MIL": {
+        "city_name": "Milan",
+        "primary_iata": "MXP",
+        "airports": ("MXP", "LIN", "BGY"),
+        "aliases": ("milan", "milano"),
+        "country_code": "IT",
+    },
+    "LON": {
+        "city_name": "Londres",
+        "primary_iata": "LHR",
+        "airports": ("LHR", "LGW", "STN", "LTN", "LCY"),
+        "aliases": ("londres", "london"),
+        "country_code": "GB",
+    },
+    "PAR": {
+        "city_name": "Paris",
+        "primary_iata": "CDG",
+        "airports": ("CDG", "ORY", "BVA"),
+        "aliases": ("paris",),
+        "country_code": "FR",
+    },
+    "NYC": {
+        "city_name": "New York",
+        "primary_iata": "JFK",
+        "airports": ("JFK", "EWR", "LGA"),
+        "aliases": ("new york", "new york city"),
+        "country_code": "US",
+    },
+    "TYO": {
+        "city_name": "Tokyo",
+        "primary_iata": "HND",
+        "airports": ("HND", "NRT"),
+        "aliases": ("tokyo",),
+        "country_code": "JP",
+    },
+    "ROM": {
+        "city_name": "Rome",
+        "primary_iata": "FCO",
+        "airports": ("FCO", "CIA"),
+        "aliases": ("rome", "roma"),
+        "country_code": "IT",
+    },
+}
+
+AIRPORT_TO_METRO_CODE: dict[str, str] = {}
+CITY_ALIAS_TO_METRO_CODE: dict[str, str] = {}
+for _metro_code, _info in METRO_CITY_CODES.items():
+    AIRPORT_TO_METRO_CODE[_metro_code] = _metro_code
+    for _ap in _info["airports"]:  # type: ignore[attr-defined]
+        AIRPORT_TO_METRO_CODE[str(_ap).upper()] = _metro_code
+    for _alias in _info["aliases"]:  # type: ignore[attr-defined]
+        CITY_ALIAS_TO_METRO_CODE[str(_alias).lower()] = _metro_code
+
+
+def get_city_comparator_code(iata_or_code: str | None, city_name: str | None = None) -> str:
+    """Retourne le code de ville normalisé pour les comparateurs (ex: MIL, LON, PAR, NYC)
+    ou le code IATA de l'aéroport (ex: MIR, SYD, LYS, LIS)."""
+    raw_code = (iata_or_code or "").strip().upper()
+    raw_city = (city_name or "").strip().lower()
+    if raw_city in CITY_ALIAS_TO_METRO_CODE:
+        return CITY_ALIAS_TO_METRO_CODE[raw_city]
+    if raw_code in AIRPORT_TO_METRO_CODE:
+        return AIRPORT_TO_METRO_CODE[raw_code]
+    return raw_code or "PAR"
+
+
+def resolve_airport_record(code_or_city: str | None) -> AirportRecord | None:
+    """Résout un code IATA d'aéroport (CDG, MIR, SYD, LYS), un code de ville (MIL, LON, PAR, NYC)
+    ou un nom de ville depuis le catalogue OurAirports local."""
+    raw = (code_or_city or "").strip()
+    if not raw:
+        return None
+    up = raw.upper()
+    if up in AIRPORTS_BY_IATA:
+        return AIRPORTS_BY_IATA[up]
+    if up in METRO_CITY_CODES:
+        primary_iata = str(METRO_CITY_CODES[up]["primary_iata"])
+        return AIRPORTS_BY_IATA.get(primary_iata)
+    low = raw.lower()
+    if low in CITY_ALIAS_TO_METRO_CODE:
+        metro = CITY_ALIAS_TO_METRO_CODE[low]
+        primary_iata = str(METRO_CITY_CODES[metro]["primary_iata"])
+        return AIRPORTS_BY_IATA.get(primary_iata)
+    for rec in OURAIRPORTS_CATALOG:
+        if rec.municipality.strip().lower() == low:
+            return rec
+    return None
+
+
+def are_airport_codes_equivalent(code_a: str | None, code_b: str | None) -> bool:
+    """Vérifie si deux codes désignent le même aéroport ou la même agglomération (ex: MIL et MXP/LIN, PAR et CDG)."""
+    a = (code_a or "").strip().upper()
+    b = (code_b or "").strip().upper()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    metro_a = AIRPORT_TO_METRO_CODE.get(a, a)
+    metro_b = AIRPORT_TO_METRO_CODE.get(b, b)
+    return metro_a == metro_b
+
+
+def build_flight_comparator_urls(
+    origin_code: str,
+    destination_code: str,
+    departure_date: str,
+    return_date: str,
+    origin_city: str | None = None,
+    destination_city: str | None = None,
+) -> dict[str, str]:
+    """Construit les URLs vers Google Flights, Kayak et Skyscanner avec les codes de ville (MIL, LON, PAR, NYC)."""
+    orig_comp = get_city_comparator_code(origin_code, origin_city)
+    dest_comp = get_city_comparator_code(destination_code, destination_city)
+    dep_str = str(departure_date)[:10]
+    ret_str = str(return_date)[:10]
+    return {
+        "origin_code": orig_comp,
+        "destination_code": dest_comp,
+        "origin_city_code": orig_comp,
+        "destination_city_code": dest_comp,
+        "google_flights": (
+            f"https://www.google.com/travel/flights?hl=fr&curr=EUR"
+            f"&q=Vols+{orig_comp}+{dest_comp}+{dep_str}+{ret_str}"
+        ),
+        "kayak": f"https://www.kayak.fr/flights/{orig_comp}-{dest_comp}/{dep_str}/{ret_str}",
+        "skyscanner": (
+            f"https://www.skyscanner.fr/transport/vols/"
+            f"{orig_comp.lower()}/{dest_comp.lower()}/{dep_str}/{ret_str}/"
+        ),
+    }
+
 
 def haversine_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Calcule la distance orthodromique en kilomètres entre deux coordonnées GPS."""
@@ -129,15 +266,29 @@ def find_nearest_airport(
     rounded_km = round(chosen_dist, 1)
     within_100km = chosen_dist <= 100.0
 
+    city_code = get_city_comparator_code(
+        chosen_airport.iata_code,
+        city_name or chosen_airport.municipality,
+    )
+    # Pour Milan (MXP/LIN/BGY), le code de ville attendu est MIL
+    effective_iata = (
+        "MIL"
+        if chosen_airport.iata_code in {"MXP", "LIN", "BGY"}
+        and (city_name or chosen_airport.municipality).strip().lower() in {"milan", "milano"}
+        else chosen_airport.iata_code
+    )
+
     if within_100km:
-        display_label = f"{chosen_airport.municipality} ({chosen_airport.iata_code})"
+        display_label = f"{chosen_airport.municipality} ({effective_iata})"
     else:
         display_label = (
-            f"{chosen_airport.municipality} ({chosen_airport.iata_code} — à {round(chosen_dist)} km)"
+            f"{chosen_airport.municipality} ({effective_iata} — à {round(chosen_dist)} km)"
         )
 
     return {
-        "iata_code": chosen_airport.iata_code,
+        "iata_code": effective_iata,
+        "city_code": city_code,
+        "primary_airport_iata": chosen_airport.iata_code,
         "airport_name": chosen_airport.name,
         "municipality": chosen_airport.municipality,
         "country_code": chosen_airport.country_code,

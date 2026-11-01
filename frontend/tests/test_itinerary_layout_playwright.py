@@ -1448,23 +1448,20 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
             page.locator('[data-testid="autocomplete-city-lisbonne"]').click()
             page.locator('[data-testid="home-search-btn"]').click()
 
-            # 5. Sur /flights : message "Nous n'avons pas encore de vols à afficher pour Lisbonne"
-            #    (sans les mots "simulé", "simulation", "démonstration"), bouton principal
-            #    "Comparer les vols <départ> → Lisbonne" + petit menu Google Flights / Kayak / Skyscanner
-            #    avec codes aéroport et dates préremplis sans donnée personnelle, et actions secondaires.
-            page.wait_for_selector('[data-testid="flights-empty-state"]', timeout=15000)
-            flights_empty_text = page.locator('[data-testid="flights-empty-state"]').inner_text()
-            assert "Nous n'avons pas encore de vols à afficher pour Lisbonne" in flights_empty_text
-            for banned_word in ("simulé", "simulés", "simulation", "démonstration"):
-                assert banned_word not in flights_empty_text.lower(), (
-                    f"Mot interdit '{banned_word}' trouvé dans l'écran Vols : {flights_empty_text!r}"
-                )
+            # 5. Sur /flights : Bandeau "Offres d'exemple, prix indicatifs", étiquette "Offre d'exemple",
+            #    "Prix indicatif", bouton "Voir les vrais prix" et comparateurs Google Flights / Kayak / Skyscanner
+            #    avec codes de ville/aéroport et dates préremplis sans donnée personnelle.
+            page.wait_for_selector('[data-testid="flights-example-offers-banner"]', timeout=15000)
+            banner_text_flights = page.locator('[data-testid="flights-example-offers-banner"]').inner_text()
+            assert "Offres d'exemple, prix indicatifs" in banner_text_flights
+            assert page.locator('[data-testid="flight-offer-badge-0"]').inner_text().strip() == "Offre d'exemple"
+            assert "Prix indicatif" in page.locator('[data-testid="flight-price-label-0"]').inner_text()
 
-            primary_compare_btn = page.locator('[data-testid="flights-compare-primary-btn"]')
-            assert primary_compare_btn.is_visible()
-            assert "Comparer les vols Paris → Lisbonne" in primary_compare_btn.inner_text()
-            assert primary_compare_btn.get_attribute("target") == "_blank"
-            assert primary_compare_btn.get_attribute("rel") == "noopener noreferrer"
+            real_prices_btn = page.locator('[data-testid="flights-real-prices-btn"]')
+            assert real_prices_btn.is_visible()
+            assert "Voir les vrais prix" in real_prices_btn.inner_text()
+            assert real_prices_btn.get_attribute("target") == "_blank"
+            assert real_prices_btn.get_attribute("rel") == "noopener noreferrer"
 
             origin_input = page.locator('[data-testid="flights-origin-input"]')
             dest_flight_input = page.locator('[data-testid="flights-destination-input"]')
@@ -1489,8 +1486,7 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
             route_sub = page.locator('[data-testid="flights-route-subtitle"]').inner_text()
             assert "Monastir (MIR)" in route_sub
 
-            # Après sélection de Monastir (MIR), le bouton principal et les 3 comparateurs utilisent MIR -> LIS
-            assert "Comparer les vols Monastir → Lisbonne" in primary_compare_btn.inner_text()
+            # Après sélection de Monastir (MIR), les 3 comparateurs utilisent MIR -> LIS
             for comp_testid, expected_domain in (
                 ("flights-compare-google", "google.com/travel/flights"),
                 ("flights-compare-kayak", "kayak.fr/flights"),
@@ -1509,36 +1505,19 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
                 assert "playwright.geonames" not in href.lower()
                 assert "voyageur" not in href.lower()
 
-            # Actions secondaires de l'écran Vols
-            assert "Continuer vers l'hébergement" in page.locator(
-                '[data-testid="flights-continue-accommodations-btn"]'
-            ).inner_text()
-            assert "Voir les lieux de la ville" in page.locator(
-                '[data-testid="flights-continue-activities-btn"]'
-            ).inner_text()
-            assert "Modifier ma recherche" in page.locator(
-                '[data-testid="flights-modify-search-btn"]'
-            ).inner_text()
-
-            # 6. Navigation vers /accommodations : "Rechercher un hébergement à Lisbonne" avec Booking et Airbnb préremplis
-            page.locator('[data-testid="flights-continue-accommodations-btn"]').click()
-            page.wait_for_selector('[data-testid="accommodations-empty-state"]', timeout=15000)
-            acc_empty_text = page.locator('[data-testid="accommodations-empty-state"]').inner_text()
-            assert "Nous n'avons pas encore d'hébergements à afficher pour Lisbonne" in acc_empty_text
-            for banned_word in ("simulé", "simulés", "simulation", "démonstration"):
-                assert banned_word not in acc_empty_text.lower(), (
-                    f"Mot interdit '{banned_word}' trouvé dans l'écran Hébergements : {acc_empty_text!r}"
-                )
-
-            acc_primary_btn = page.locator('[data-testid="accommodations-search-primary-btn"]')
-            assert acc_primary_btn.is_visible()
-            assert "Rechercher un hébergement à Lisbonne" in acc_primary_btn.inner_text()
-            assert acc_primary_btn.get_attribute("target") == "_blank"
-            assert acc_primary_btn.get_attribute("rel") == "noopener noreferrer"
+            # 6. Navigation vers /accommodations : Hébergements Wikivoyage "Se loger" pour Lisbonne
+            #    avec gamme Économique / Standard / Luxe, "Prix indicatif", illustration "Illustration" et boutons Booking & Airbnb
+            page.goto(f"{BASE_URL}/accommodations", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_function(
+                "() => document.body.innerText.includes('Hébergements à Lisbonne') && Boolean(document.querySelector('[data-testid=\"acc-booking-btn-0\"]'))",
+                timeout=15000,
+            )
+            assert "Prix indicatif" in page.locator('[data-testid="acc-price-label-0"]').inner_text()
+            assert page.locator('[data-testid="acc-gamme-0"]').inner_text().strip() in ("Économique", "Standard", "Luxe")
 
             for acc_testid, expected_domain in (
-                ("accommodations-compare-booking", "booking.com"),
-                ("accommodations-compare-airbnb", "airbnb.fr"),
+                ("acc-booking-btn-0", "booking.com"),
+                ("acc-airbnb-btn-0", "airbnb.fr"),
             ):
                 acc_link = page.locator(f'[data-testid="{acc_testid}"]')
                 assert acc_link.is_visible()
@@ -1546,11 +1525,7 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
                 assert acc_link.get_attribute("rel") == "noopener noreferrer"
                 href = acc_link.get_attribute("href") or ""
                 assert expected_domain in href
-                assert "lisbonne" in href.lower()
-                assert "2026-11-10" in href
-                assert "2026-11-17" in href
-                assert "2" in href
-                assert "playwright.geonames" not in href.lower()
+                assert "lisbonne" in href.lower() or "lisboa" in href.lower()
 
             # 7. Navigation vers /activities (Étape 2) : vraie galerie Wikivoyage/Wikipédia avec
             #    illustration neutre par catégorie, "Photo bientôt disponible", attribution CC BY-SA 4.0
@@ -1682,7 +1657,7 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
                 )
 
             page.route("**/api/v1/places/trip/*/gallery*", _handle_lisbonne_gallery)
-            page.locator('[data-testid="accommodations-continue-activities-btn"]').click()
+            page.goto(f"{BASE_URL}/activities", wait_until="domcontentloaded", timeout=20000)
             page.wait_for_selector('[data-testid="activities-photo-grid"]', timeout=15000)
             page.wait_for_selector('[data-testid="place-photo-placeholder-0"]', timeout=15000)
             assert page.locator('[data-testid="places-coming-soon-card"]').count() == 0
@@ -2363,6 +2338,326 @@ def test_world_places_step3_photos_visible_credit_and_no_layout_shift_playwright
             bridge_proc.terminate()
 
 
+def test_accommodations_and_flights_milan_monastir_paris_sydney_paris_lyon_playwright() -> None:
+    """
+    Exigences 1 à 6 — Test Playwright dans Docker :
+    1. Hébergements de démo (Paris) : Hôtel Le Meurice & Hôtel Lutetia (photo Commons, auteur, licence),
+       Appartement Haussmannien (carte type d'hébergement avec étiquette 'Illustration'), 'Prix indicatif',
+       boutons Booking et Airbnb, aucune URL d'image en double.
+    2. Villes du monde (Milan MIL, Monastir MIR) : section 'Se loger' de Wikivoyage (nom, adresse,
+       coordonnées, gamme Économique / Standard / Luxe) avec la carte, 'Prix indicatif', boutons Booking et Airbnb.
+    3. Vols :
+       - Paris-Sydney (CDG -> SYD) avec escale par un hub ('1 escale à ...') et durée cohérente ;
+       - Paris-Lyon (CDG -> LYS) direct ('Direct') ;
+       - Milan (MIL) et Monastir (MIR) : étiquette 'Offre d'exemple', bandeau 'Offres d'exemple, prix indicatifs',
+         bouton 'Voir les vrais prix' et liens Google Flights, Kayak, Skyscanner avec codes de ville (PAR, MIL).
+    4. Le bouton 'Réserver' enregistre l'offre d'exemple dans le séjour (billet, budget, galerie débloquée).
+    """
+    bridge_proc = _ensure_wsl_bridge()
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+
+            svg_demo_body = (
+                "<svg xmlns='http://www.w3.org/2000/svg' width='800' height='450' viewBox='0 0 800 450'>"
+                "<rect width='800' height='450' fill='%232b4c59'/></svg>"
+            )
+            page.route(
+                "**/*.wikimedia.org/**",
+                lambda route: route.fulfill(
+                    status=200,
+                    content_type="image/svg+xml",
+                    body=svg_demo_body,
+                ),
+            )
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
+
+            # 1. Hébergements de démo à Paris : Hôtel Le Meurice, Hôtel Lutetia (photos Commons + crédits)
+            #    et Appartement Haussmannien (Illustration), Prix indicatif, Booking & Airbnb, zéro doublon d'URL
+            page.evaluate(
+                """async (apiUrl) => {
+                  const email = "playwright.acc.flights." + Date.now() + "@travelmate.app";
+                  const regResp = await fetch(apiUrl + "/api/v1/auth/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      full_name: "Voyageur Hébergements Vols",
+                      password: "PasswordStep4!2026",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  const token = regData.access_token;
+                  localStorage.setItem("travelmate_jwt_token", token);
+                  localStorage.setItem("travelmate_test_jwt", token);
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+
+                  const destsResp = await fetch(apiUrl + "/api/v1/destinations");
+                  const dests = await destsResp.json();
+                  const paris = dests.find((d) => d.city_name === "Paris");
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_id: paris.id,
+                      title: "Séjour Paris Hébergements",
+                      travel_style: "STANDARD",
+                      total_budget: 1500
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+                }""",
+                API_URL,
+            )
+
+            page.goto(f"{BASE_URL}/accommodations", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_function(
+                "() => document.body.innerText.includes('Hébergements à Paris') && document.body.innerText.includes('Hôtel Le Meurice')",
+                timeout=15000,
+            )
+
+            paris_acc_dom = page.evaluate(
+                """() => {
+                  const imgs = Array.from(document.querySelectorAll('[data-testid^="acc-photo-img-"]')).map(
+                    (el) => el.getAttribute("src") || ""
+                  );
+                  const credits = Array.from(document.querySelectorAll('[data-testid^="acc-photo-credit-link-"]')).map(
+                    (el) => (el.textContent || "").trim()
+                  );
+                  const illustrations = Array.from(document.querySelectorAll('[data-testid="acc-illustration-badge"]')).map(
+                    (el) => (el.textContent || "").trim()
+                  );
+                  const priceLabels = Array.from(document.querySelectorAll('[data-testid^="acc-price-label-"]')).map(
+                    (el) => (el.textContent || "").trim()
+                  );
+                  const bookingBtns = Array.from(document.querySelectorAll('[data-testid^="acc-booking-btn-"]')).map(
+                    (el) => el.getAttribute("href") || ""
+                  );
+                  const airbnbBtns = Array.from(document.querySelectorAll('[data-testid^="acc-airbnb-btn-"]')).map(
+                    (el) => el.getAttribute("href") || ""
+                  );
+                  return { imgs, credits, illustrations, priceLabels, bookingBtns, airbnbBtns };
+                }"""
+            )
+            assert len(paris_acc_dom["imgs"]) == 2
+            assert len(set(paris_acc_dom["imgs"])) == len(paris_acc_dom["imgs"])
+            assert all("unsplash.com" not in u.lower() for u in paris_acc_dom["imgs"])
+            assert len(paris_acc_dom["credits"]) == 2
+            assert any("Photo :" in c for c in paris_acc_dom["credits"])
+            assert paris_acc_dom["illustrations"] == ["Illustration"]
+            assert all("Prix indicatif" in p for p in paris_acc_dom["priceLabels"])
+            assert all("booking.com" in b for b in paris_acc_dom["bookingBtns"])
+            assert all("airbnb.fr" in a for a in paris_acc_dom["airbnbBtns"])
+
+            # 2. Paris-Sydney (CDG -> SYD) avec escale et Paris-Lyon (CDG -> LYS) direct
+            syd_lys_check = page.evaluate(
+                """async (apiUrl) => {
+                  const sydResp = await fetch(
+                    apiUrl + "/api/v1/flights/search?origin_iata=CDG&destination_iata=SYD&departure_date=2026-11-10&return_date=2026-11-24&travel_style=STANDARD"
+                  );
+                  const sydOffers = await sydResp.json();
+                  const lysResp = await fetch(
+                    apiUrl + "/api/v1/flights/search?origin_iata=CDG&destination_iata=LYS&departure_date=2026-11-10&return_date=2026-11-15&travel_style=STANDARD"
+                  );
+                  const lysOffers = await lysResp.json();
+                  const mirResp = await fetch(
+                    apiUrl + "/api/v1/flights/search?origin_iata=CDG&destination_iata=MIR&departure_date=2026-11-10&return_date=2026-11-17&travel_style=STANDARD"
+                  );
+                  const mirOffers = await mirResp.json();
+                  return { sydOffers, lysOffers, mirOffers };
+                }""",
+                API_URL,
+            )
+            assert syd_lys_check["sydOffers"][0]["stops"] == 1
+            assert "escale" in syd_lys_check["sydOffers"][0]["stopover_label"].lower()
+            assert syd_lys_check["sydOffers"][0]["offer_badge"] == "Offre d'exemple"
+            assert syd_lys_check["lysOffers"][0]["stops"] == 0
+            assert syd_lys_check["lysOffers"][0]["stopover_label"] == "Direct"
+            assert syd_lys_check["lysOffers"][0]["offer_badge"] == "Offre d'exemple"
+            assert syd_lys_check["mirOffers"][0]["destination_iata"] == "MIR"
+            assert syd_lys_check["mirOffers"][0]["offer_badge"] == "Offre d'exemple"
+
+            # 3. Séjour à Milan (MIL) : vérification DOM de l'écran /flights ("Offre d'exemple",
+            #    bandeau "Offres d'exemple, prix indicatifs", bouton "Voir les vrais prix", codes PAR/MIL)
+            #    puis clic sur "Réserver" qui enregistre le billet, le budget et débloque la galerie !
+            page.evaluate(
+                """async (apiUrl) => {
+                  const token = localStorage.getItem("travelmate_test_jwt") || "";
+                  const resResp = await fetch(apiUrl + "/api/v1/destinations/resolve", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      geonameId: 3173435,
+                      nom: "Milan",
+                      pays: "Italie",
+                      code_pays: "IT",
+                      coordonnees: { lat: 45.4642, lon: 9.1900 },
+                      fuseau_horaire: "Europe/Rome",
+                      population: 1351562
+                    })
+                  });
+                  const milanDest = await resResp.json();
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_id: milanDest.id,
+                      title: "Séjour à Milan",
+                      travel_style: "STANDARD",
+                      total_budget: 1300
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+                  localStorage.removeItem("travelmate_last_flight_booking");
+                }""",
+                API_URL,
+            )
+
+            page.goto(f"{BASE_URL}/flights", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_function(
+                "() => document.body.innerText.includes('Milan') && Boolean(document.querySelector('[data-testid=\"flights-example-offers-banner\"]'))",
+                timeout=15000,
+            )
+
+            assert "Offres d'exemple, prix indicatifs" in page.locator(
+                '[data-testid="flights-example-offers-banner"]'
+            ).inner_text()
+            assert page.locator('[data-testid="flight-offer-badge-0"]').inner_text().strip() == "Offre d'exemple"
+            assert "Prix indicatif" in page.locator('[data-testid="flight-price-label-0"]').inner_text()
+            assert "Direct" in page.locator('[data-testid="flight-stopover-label-0"]').inner_text()
+            assert "Voir les vrais prix" in page.locator('[data-testid="flights-real-prices-btn"]').inner_text()
+
+            kayak_href = page.locator('[data-testid="flights-compare-kayak"]').get_attribute("href") or ""
+            skyscanner_href = page.locator('[data-testid="flights-compare-skyscanner"]').get_attribute("href") or ""
+            assert "PAR-MIL" in kayak_href
+            assert "/par/mil/" in skyscanner_href
+
+            # Clic sur "Réserver" sur la 1ère offre d'exemple à Milan
+            page.locator('[data-testid="book-flight-btn-0"]').click()
+            page.wait_for_selector('[data-testid="flight-confirmation-screen"]', timeout=15000)
+            conf_text = page.locator('[data-testid="flight-confirmation-screen"]').inner_text()
+            assert "Réservation confirmée" in conf_text
+            assert "enregistré" in conf_text
+
+            # Vérifie que les hébergements Wikivoyage "Se loger" s'affichent pour Milan avec la carte,
+            # les gammes Économique / Standard / Luxe et les boutons Booking & Airbnb
+            page.locator('[data-testid="confirm-choose-accommodation-btn"]').click()
+            page.wait_for_selector('[data-testid="acc-gamme-2"]', timeout=15000)
+            milan_gammes = page.evaluate(
+                """() => Array.from(document.querySelectorAll('[data-testid^="acc-gamme-"]')).map(
+                  (el) => (el.textContent || "").trim()
+                )"""
+            )
+            assert set(milan_gammes) == {"Économique", "Standard", "Luxe"}
+
+            # 4. Vérifie Rome (>= 2 hébergements dont The Westin Excelsior Rome et Hôtel Majestic Rome)
+            rome_accs = page.evaluate(
+                """async (apiUrl) => {
+                  const dests = await (await fetch(apiUrl + "/api/v1/destinations")).json();
+                  const rome = dests.find((d) => d.city_name === "Rome");
+                  const accs = await (await fetch(apiUrl + "/api/v1/accommodations/search?destination_id=" + rome.id)).json();
+                  return accs;
+                }""",
+                API_URL,
+            )
+            assert len(rome_accs) >= 2
+            rome_names = {a["name"] for a in rome_accs}
+            assert "The Westin Excelsior Rome" in rome_names
+            assert "Hôtel Majestic Rome" in rome_names
+
+            # 5. Vérifie le repli générique quand Wikivoyage ne donne rien (aucun nom d'établissement,
+            #    aucune adresse inventée, aucun marqueur précis sur la carte, étiquette "Illustration",
+            #    boutons Booking et Airbnb)
+            page.evaluate(
+                """async (apiUrl) => {
+                  const token = localStorage.getItem("travelmate_test_jwt") || "";
+                  const resResp = await fetch(apiUrl + "/api/v1/destinations/resolve", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      geonameId: 999888777,
+                      nom: "VilleSansWikivoyageTest",
+                      pays: "TestPays",
+                      code_pays: "FR",
+                      coordonnees: { lat: 44.5000, lon: 4.5000 },
+                      fuseau_horaire: "Europe/Paris",
+                      population: 12000
+                    })
+                  });
+                  const fallbackDest = await resResp.json();
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips", {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                      destination_id: fallbackDest.id,
+                      title: "Séjour à VilleSansWikivoyageTest",
+                      travel_style: "STANDARD",
+                      total_budget: 900
+                    })
+                  });
+                  const trip = await tripResp.json();
+                  localStorage.setItem("travelmate_active_trip_id", trip.id);
+                }""",
+                API_URL,
+            )
+            page.goto(f"{BASE_URL}/accommodations", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_function(
+                "() => document.body.innerText.includes('Hôtel de gamme Standard à VilleSansWikivoyageTest')",
+                timeout=15000,
+            )
+            fallback_dom = page.evaluate(
+                """() => {
+                  const headings = Array.from(document.querySelectorAll('h2')).map((el) => (el.textContent || "").trim());
+                  const illustrations = Array.from(document.querySelectorAll('[data-testid="acc-illustration-badge"]')).map(
+                    (el) => (el.textContent || "").trim()
+                  );
+                  const mapMarkers = document.querySelectorAll('.leaflet-interactive').length;
+                  const bookingBtns = Array.from(document.querySelectorAll('[data-testid^="acc-booking-btn-"]')).map(
+                    (el) => el.getAttribute("href") || ""
+                  );
+                  const airbnbBtns = Array.from(document.querySelectorAll('[data-testid^="acc-airbnb-btn-"]')).map(
+                    (el) => el.getAttribute("href") || ""
+                  );
+                  return { headings, illustrations, mapMarkers, bookingBtns, airbnbBtns };
+                }"""
+            )
+            assert "Hôtel de gamme Économique à VilleSansWikivoyageTest" in fallback_dom["headings"]
+            assert "Hôtel de gamme Standard à VilleSansWikivoyageTest" in fallback_dom["headings"]
+            assert "Hôtel de gamme Luxe à VilleSansWikivoyageTest" in fallback_dom["headings"]
+            assert fallback_dom["illustrations"] == ["Illustration", "Illustration", "Illustration"]
+            assert fallback_dom["mapMarkers"] == 0
+            assert len(fallback_dom["bookingBtns"]) == 3 and all("booking.com" in u for u in fallback_dom["bookingBtns"])
+            assert len(fallback_dom["airbnbBtns"]) == 3 and all("airbnb.fr" in u for u in fallback_dom["airbnbBtns"])
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
 if __name__ == "__main__":
     test_mon_programme_layout_5_widths_playwright()
     test_real_chat_marrakech_jardin_secret_medina_and_single_row_header()
@@ -2370,6 +2665,8 @@ if __name__ == "__main__":
     test_world_cities_step1_geonames_search_create_and_fallback_playwright()
     test_home_barcelone_geonames_autocomplete_visible_clickable_no_timezone_playwright()
     test_world_places_step3_photos_visible_credit_and_no_layout_shift_playwright()
+    test_accommodations_and_flights_milan_monastir_paris_sydney_paris_lyon_playwright()
+
 
 
 

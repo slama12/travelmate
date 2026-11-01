@@ -16,7 +16,11 @@ class HybridCacheClient:
         settings = get_settings()
         self.redis_url = redis_url or settings.REDIS_URL
         self._redis_available: bool | None = None
-        self._client = aioredis.from_url(
+        self._loop_id: int | None = None
+        self._client = self._create_client()
+
+    def _create_client(self) -> Any:
+        return aioredis.from_url(
             self.redis_url,
             encoding="utf-8",
             decode_responses=True,
@@ -24,7 +28,18 @@ class HybridCacheClient:
             socket_timeout=0.3,
         )
 
+    def _ensure_loop(self) -> None:
+        try:
+            loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            return
+        if self._loop_id != loop_id:
+            self._loop_id = loop_id
+            self._redis_available = None
+            self._client = self._create_client()
+
     async def set_value(self, key: str, value: str, ex: int = 3600) -> str:
+        self._ensure_loop()
         if self._redis_available is False:
             _MEMORY_CACHE[key] = value
             return "memory_fallback"
@@ -38,6 +53,7 @@ class HybridCacheClient:
             return "memory_fallback"
 
     async def get_value(self, key: str) -> str | None:
+        self._ensure_loop()
         if self._redis_available is False:
             return _MEMORY_CACHE.get(key)
         try:
@@ -76,6 +92,7 @@ class HybridCacheClient:
         return next_val
 
     async def clear_prefix(self, prefix: str) -> None:
+        self._ensure_loop()
         for k in list(_MEMORY_CACHE.keys()):
             if k.startswith(prefix):
                 _MEMORY_CACHE.pop(k, None)

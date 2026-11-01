@@ -188,6 +188,308 @@ class SimulatedCalendarProvider(BaseCalendarProvider):
         }
 
 
+from app.core.airports import (
+    AIRPORTS_BY_IATA,
+    AirportRecord,
+    build_flight_comparator_urls,
+    get_city_comparator_code,
+    resolve_airport_record,
+)
+
+DEMO_CITY_METRO_CODES: set[str] = {"PAR", "TYO", "ROM", "NYC", "RAK"}
+
+# Liaisons directes réelles vérifiées vers/entre les 5 villes de démo
+VERIFIED_DEMO_DIRECT_ROUTES: dict[tuple[str, str], dict[str, Any]] = {
+    ("PAR", "TYO"): {
+        "city": "Tokyo",
+        "airlines": [("AF", "Air France"), ("NH", "All Nippon Airways"), ("JL", "Japan Airlines")],
+        "base_price_eur": Decimal("780.00"),
+        "duration_hours": 13,
+    },
+    ("TYO", "PAR"): {
+        "city": "Paris",
+        "airlines": [("AF", "Air France"), ("NH", "All Nippon Airways"), ("JL", "Japan Airlines")],
+        "base_price_eur": Decimal("780.00"),
+        "duration_hours": 13,
+    },
+    ("PAR", "ROM"): {
+        "city": "Rome",
+        "airlines": [("AF", "Air France"), ("AZ", "ITA Airways"), ("TO", "Transavia")],
+        "base_price_eur": Decimal("145.00"),
+        "duration_hours": 2,
+    },
+    ("ROM", "PAR"): {
+        "city": "Paris",
+        "airlines": [("AF", "Air France"), ("AZ", "ITA Airways"), ("TO", "Transavia")],
+        "base_price_eur": Decimal("145.00"),
+        "duration_hours": 2,
+    },
+    ("PAR", "NYC"): {
+        "city": "New York",
+        "airlines": [("AF", "Air France"), ("DL", "Delta Air Lines"), ("AA", "American Airlines")],
+        "base_price_eur": Decimal("540.00"),
+        "duration_hours": 8,
+    },
+    ("NYC", "PAR"): {
+        "city": "Paris",
+        "airlines": [("AF", "Air France"), ("DL", "Delta Air Lines"), ("AA", "American Airlines")],
+        "base_price_eur": Decimal("540.00"),
+        "duration_hours": 8,
+    },
+    ("PAR", "RAK"): {
+        "city": "Marrakech",
+        "airlines": [("AT", "Royal Air Maroc"), ("AF", "Air France"), ("TO", "Transavia")],
+        "base_price_eur": Decimal("165.00"),
+        "duration_hours": 3,
+    },
+    ("RAK", "PAR"): {
+        "city": "Paris",
+        "airlines": [("AT", "Royal Air Maroc"), ("AF", "Air France"), ("TO", "Transavia")],
+        "base_price_eur": Decimal("165.00"),
+        "duration_hours": 3,
+    },
+    ("LON", "PAR"): {
+        "city": "Paris",
+        "airlines": [("AF", "Air France"), ("BA", "British Airways")],
+        "base_price_eur": Decimal("130.00"),
+        "duration_hours": 2,
+    },
+    ("FRA", "PAR"): {
+        "city": "Paris",
+        "airlines": [("AF", "Air France"), ("LH", "Lufthansa")],
+        "base_price_eur": Decimal("130.00"),
+        "duration_hours": 2,
+    },
+    ("NYC", "TYO"): {
+        "city": "Tokyo",
+        "airlines": [("JL", "Japan Airlines"), ("NH", "All Nippon Airways")],
+        "base_price_eur": Decimal("890.00"),
+        "duration_hours": 14,
+    },
+    ("TYO", "NYC"): {
+        "city": "New York",
+        "airlines": [("JL", "Japan Airlines"), ("NH", "All Nippon Airways")],
+        "base_price_eur": Decimal("890.00"),
+        "duration_hours": 14,
+    },
+    ("ROM", "NYC"): {
+        "city": "New York",
+        "airlines": [("AZ", "ITA Airways"), ("DL", "Delta Air Lines")],
+        "base_price_eur": Decimal("580.00"),
+        "duration_hours": 9,
+    },
+    ("NYC", "ROM"): {
+        "city": "Rome",
+        "airlines": [("AZ", "ITA Airways"), ("DL", "Delta Air Lines")],
+        "base_price_eur": Decimal("580.00"),
+        "duration_hours": 9,
+    },
+    ("ROM", "TYO"): {
+        "city": "Tokyo",
+        "airlines": [("AZ", "ITA Airways")],
+        "base_price_eur": Decimal("820.00"),
+        "duration_hours": 13,
+    },
+    ("TYO", "ROM"): {
+        "city": "Rome",
+        "airlines": [("AZ", "ITA Airways")],
+        "base_price_eur": Decimal("820.00"),
+        "duration_hours": 13,
+    },
+    ("ROM", "RAK"): {
+        "city": "Marrakech",
+        "airlines": [("AT", "Royal Air Maroc")],
+        "base_price_eur": Decimal("185.00"),
+        "duration_hours": 3,
+    },
+    ("RAK", "ROM"): {
+        "city": "Rome",
+        "airlines": [("AT", "Royal Air Maroc")],
+        "base_price_eur": Decimal("185.00"),
+        "duration_hours": 3,
+    },
+}
+
+INTERCONTINENTAL_HUB_IATAS: tuple[str, ...] = (
+    "SIN",
+    "DXB",
+    "DOH",
+    "IST",
+    "FRA",
+    "AMS",
+    "LHR",
+    "MAD",
+    "JFK",
+    "ATL",
+)
+
+
+def _select_stopover_hubs(orig: AirportRecord, dest: AirportRecord) -> list[AirportRecord]:
+    """Sélectionne les hubs d'escale OurAirports les plus cohérents géographiquement."""
+    candidates: list[tuple[float, AirportRecord]] = []
+    orig_metro = get_city_comparator_code(orig.iata_code, orig.municipality)
+    dest_metro = get_city_comparator_code(dest.iata_code, dest.municipality)
+    direct_km = haversine_distance_km(orig.latitude, orig.longitude, dest.latitude, dest.longitude)
+    min_leg_km = max(600.0, direct_km * 0.20)
+    for hub_iata in INTERCONTINENTAL_HUB_IATAS:
+        hub = AIRPORTS_BY_IATA.get(hub_iata)
+        if hub is None:
+            continue
+        hub_metro = get_city_comparator_code(hub.iata_code, hub.municipality)
+        if hub_metro in {orig_metro, dest_metro}:
+            continue
+        leg1 = haversine_distance_km(orig.latitude, orig.longitude, hub.latitude, hub.longitude)
+        leg2 = haversine_distance_km(hub.latitude, hub.longitude, dest.latitude, dest.longitude)
+        if leg1 < min_leg_km or leg2 < min_leg_km:
+            continue
+        score = (leg1 + leg2) + 0.25 * abs(leg1 - leg2)
+        candidates.append((score, hub))
+    candidates.sort(key=lambda item: item[0])
+    if candidates:
+        return [item[1] for item in candidates[:2]]
+    fallback = AIRPORTS_BY_IATA.get("DXB") or orig
+    return [fallback]
+
+
+def build_distance_based_example_offers(
+    origin_iata: str,
+    destination_iata: str,
+    departure_date: date,
+    return_date: date,
+    travel_style: str = "STANDARD",
+    mode: str = "simulated",
+) -> list[dict[str, Any]]:
+    """Génère des offres d'exemple calculées sur la distance OurAirports :
+    - durée cohérente avec la distance,
+    - escale par un hub réel si la distance est grande (> 4500 km),
+    - prix indicatif selon le style Éco / Standard / Luxe,
+    - sans nom de compagnie ni numéro de vol inventés."""
+    orig_rec = resolve_airport_record(origin_iata) or AIRPORTS_BY_IATA["CDG"]
+    dest_rec = resolve_airport_record(destination_iata)
+    if dest_rec is None:
+        return []
+
+    orig_code = origin_iata.strip().upper()
+    dest_code = destination_iata.strip().upper()
+    orig_city_code = get_city_comparator_code(orig_code, orig_rec.municipality)
+    dest_city_code = get_city_comparator_code(dest_code, dest_rec.municipality)
+    comparator_urls = build_flight_comparator_urls(
+        orig_code,
+        dest_code,
+        departure_date.isoformat(),
+        return_date.isoformat(),
+        origin_city=orig_rec.municipality,
+        destination_city=dest_rec.municipality,
+    )
+
+    distance_km = round(
+        haversine_distance_km(
+            orig_rec.latitude,
+            orig_rec.longitude,
+            dest_rec.latitude,
+            dest_rec.longitude,
+        ),
+        1,
+    )
+
+    style_key = (travel_style or "STANDARD").strip().upper()
+    multiplier = {
+        "ECONOMIC": Decimal("0.78"),
+        "STANDARD": Decimal("1.00"),
+        "LUXURY": Decimal("2.65"),
+    }.get(style_key, Decimal("1.00"))
+    cabin = {"ECONOMIC": "ECONOMY", "STANDARD": "ECONOMY", "LUXURY": "BUSINESS"}.get(
+        style_key, "ECONOMY"
+    )
+
+    # Calcul du tarif de base aller-retour selon la distance orthodromique
+    if distance_km <= 1000.0:
+        base_price = Decimal(str(round(75.0 + distance_km * 0.14, 2)))
+    elif distance_km <= 4500.0:
+        base_price = Decimal(str(round(110.0 + distance_km * 0.11, 2)))
+    else:
+        base_price = Decimal(str(round(320.0 + distance_km * 0.068, 2)))
+
+    needs_stopover = distance_km > 4500.0
+    hubs = _select_stopover_hubs(orig_rec, dest_rec) if needs_stopover else []
+
+    offers: list[dict[str, Any]] = []
+    slot_hours = ((8, 30, 14, 15), (12, 15, 17, 45), (17, 40, 20, 10))
+    for idx in range(3):
+        dep_h, dep_m, ret_h, ret_m = slot_hours[idx]
+        if needs_stopover:
+            hub = hubs[idx % len(hubs)]
+            routed_km = haversine_distance_km(
+                orig_rec.latitude, orig_rec.longitude, hub.latitude, hub.longitude
+            ) + haversine_distance_km(
+                hub.latitude, hub.longitude, dest_rec.latitude, dest_rec.longitude
+            )
+            layover_min = 115 + idx * 20
+            duration_min = max(360, int(round((routed_km / 830.0) * 60.0 + 40.0 + layover_min)))
+            stops = 1
+            hub_iata: str | None = hub.iata_code
+            hub_city: str | None = hub.municipality
+            stopover_label = f"1 escale à {hub.municipality} ({hub.iata_code})"
+            outbound_ref = f"Aller • 1 escale ({hub.iata_code})"
+            inbound_ref = f"Retour • 1 escale ({hub.iata_code})"
+        else:
+            cruise_kmh = 580.0 if distance_km <= 800.0 else 730.0
+            duration_min = max(65, int(round((distance_km / cruise_kmh) * 60.0 + 35.0 + idx * 5)))
+            stops = 0
+            hub_iata = None
+            hub_city = None
+            stopover_label = "Direct"
+            outbound_ref = "Aller direct"
+            inbound_ref = "Retour direct"
+
+        dep_out = datetime.combine(departure_date, time(hour=dep_h, minute=dep_m))
+        arr_out = dep_out + timedelta(minutes=duration_min)
+        dep_in = datetime.combine(return_date, time(hour=ret_h, minute=ret_m))
+        if dep_in <= arr_out:
+            dep_in = arr_out + timedelta(hours=4)
+        arr_in = dep_in + timedelta(minutes=duration_min)
+
+        step_factor = Decimal(str(1 + idx * 0.07))
+        price_dec = (base_price * multiplier * step_factor).quantize(Decimal("0.01"))
+
+        offers.append(
+            {
+                "offer_id": f"ex-flt-{orig_code}-{dest_code}-{idx + 1}",
+                "airline_code": "",
+                "airline_name": "Offre d'exemple",
+                "flight_number_outbound": outbound_ref,
+                "flight_number_inbound": inbound_ref,
+                "origin_iata": orig_code,
+                "destination_iata": dest_code,
+                "origin_city_code": orig_city_code,
+                "destination_city_code": dest_city_code,
+                "destination_city": dest_rec.municipality,
+                "departure_outbound_at": dep_out.isoformat(),
+                "arrival_outbound_at": arr_out.isoformat(),
+                "departure_inbound_at": dep_in.isoformat(),
+                "arrival_inbound_at": arr_in.isoformat(),
+                "cabin_class": cabin,
+                "price_amount": str(price_dec),
+                "price_eur": float(price_dec),
+                "currency": "EUR",
+                "mode": mode,
+                "is_example_offer": True,
+                "offer_badge": "Offre d'exemple",
+                "price_label": "Prix indicatif",
+                "banner_text": "Offres d'exemple, prix indicatifs",
+                "distance_km": distance_km,
+                "duration_outbound_minutes": duration_min,
+                "duration_inbound_minutes": duration_min,
+                "stops": stops,
+                "stopover_hub_iata": hub_iata,
+                "stopover_hub_city": hub_city,
+                "stopover_label": stopover_label,
+                "comparator_urls": comparator_urls,
+            }
+        )
+    return offers
+
+
 class SimulatedFlightsProvider(BaseFlightsProvider):
     mode = "simulated"
 
@@ -208,10 +510,51 @@ class SimulatedFlightsProvider(BaseFlightsProvider):
         if return_date <= departure_date:
             raise ValueError("La date de retour doit être strictement postérieure à la date de départ.")
 
-        dest_key = destination_iata.upper()
-        meta = REALISTIC_FLIGHTS_CATALOG.get(dest_key)
+        orig_key = origin_iata.strip().upper()
+        dest_key = destination_iata.strip().upper()
+        orig_metro = get_city_comparator_code(orig_key)
+        dest_metro = get_city_comparator_code(dest_key)
+
+        # Pour les 5 villes de démo : compagnies réelles uniquement sur les liaisons qui existent
+        meta = (
+            VERIFIED_DEMO_DIRECT_ROUTES.get((orig_metro, dest_metro))
+            if dest_metro in DEMO_CITY_METRO_CODES
+            else None
+        )
         if meta is None:
-            return []
+            return build_distance_based_example_offers(
+                origin_iata=orig_key,
+                destination_iata=dest_key,
+                departure_date=departure_date,
+                return_date=return_date,
+                travel_style=travel_style,
+                mode=self.mode,
+            )
+
+        orig_rec = resolve_airport_record(orig_key)
+        dest_rec = resolve_airport_record(dest_key)
+        distance_km = (
+            round(
+                haversine_distance_km(
+                    orig_rec.latitude,
+                    orig_rec.longitude,
+                    dest_rec.latitude,
+                    dest_rec.longitude,
+                ),
+                1,
+            )
+            if orig_rec and dest_rec
+            else None
+        )
+        comparator_urls = build_flight_comparator_urls(
+            orig_key,
+            dest_key,
+            departure_date.isoformat(),
+            return_date.isoformat(),
+            origin_city=orig_rec.municipality if orig_rec else None,
+            destination_city=meta["city"],
+        )
+
         multiplier = {
             "ECONOMIC": Decimal("0.78"),
             "STANDARD": Decimal("1.00"),
@@ -220,6 +563,7 @@ class SimulatedFlightsProvider(BaseFlightsProvider):
         cabin = {"ECONOMIC": "ECONOMY", "STANDARD": "ECONOMY", "LUXURY": "BUSINESS"}.get(
             travel_style.upper(), "ECONOMY"
         )
+        duration_min = int(meta["duration_hours"]) * 60
 
         offers: list[dict[str, Any]] = []
         for idx, (code, airline_name) in enumerate(meta["airlines"]):
@@ -231,13 +575,15 @@ class SimulatedFlightsProvider(BaseFlightsProvider):
             price_dec = (meta["base_price_eur"] * multiplier * step_factor).quantize(Decimal("0.01"))
             offers.append(
                 {
-                    "offer_id": f"sim-flt-{origin_iata.upper()}-{dest_key}-{idx + 1}",
+                    "offer_id": f"sim-flt-{orig_key}-{dest_key}-{idx + 1}",
                     "airline_code": code,
                     "airline_name": airline_name,
                     "flight_number_outbound": f"{code}{104 + idx * 12}",
                     "flight_number_inbound": f"{code}{105 + idx * 12}",
-                    "origin_iata": origin_iata.upper(),
+                    "origin_iata": orig_key,
                     "destination_iata": dest_key,
+                    "origin_city_code": orig_metro,
+                    "destination_city_code": dest_metro,
                     "destination_city": meta["city"],
                     "departure_outbound_at": dep_out.isoformat(),
                     "arrival_outbound_at": arr_out.isoformat(),
@@ -248,6 +594,18 @@ class SimulatedFlightsProvider(BaseFlightsProvider):
                     "price_eur": float(price_dec),
                     "currency": "EUR",
                     "mode": self.mode,
+                    "is_example_offer": False,
+                    "offer_badge": "Offre d'exemple",
+                    "price_label": "Prix indicatif",
+                    "banner_text": "Offres d'exemple, prix indicatifs",
+                    "distance_km": distance_km,
+                    "duration_outbound_minutes": duration_min,
+                    "duration_inbound_minutes": duration_min,
+                    "stops": 0,
+                    "stopover_hub_iata": None,
+                    "stopover_hub_city": None,
+                    "stopover_label": "Direct",
+                    "comparator_urls": comparator_urls,
                 }
             )
         return offers

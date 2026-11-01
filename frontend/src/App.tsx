@@ -165,6 +165,8 @@ export interface FlightOffer {
   flight_number_inbound: string;
   origin_iata: string;
   destination_iata: string;
+  origin_city_code?: string;
+  destination_city_code?: string;
   destination_city: string;
   departure_outbound_at: string;
   arrival_outbound_at: string;
@@ -175,6 +177,24 @@ export interface FlightOffer {
   price_eur: number;
   currency: string;
   mode: string;
+  is_example_offer?: boolean;
+  offer_badge?: string;
+  price_label?: string;
+  banner_text?: string;
+  distance_km?: number;
+  duration_outbound_minutes?: number;
+  duration_inbound_minutes?: number;
+  stops?: number;
+  stopover_hub_iata?: string | null;
+  stopover_hub_city?: string | null;
+  stopover_label?: string;
+  comparator_urls?: {
+    origin_code?: string;
+    destination_code?: string;
+    google_flights?: string;
+    kayak?: string;
+    skyscanner?: string;
+  };
 }
 
 export interface FlightBooking {
@@ -218,16 +238,60 @@ const DEPARTURE_AIRPORTS = [
 const AIRPORT_CITY_NAMES: Record<string, string> = {
   CDG: "Paris (Charles de Gaulle)",
   ORY: "Paris (Orly)",
+  PAR: "Paris (PAR)",
   LYS: "Lyon (Saint-Exupéry)",
   MRS: "Marseille (Provence)",
   BRU: "Bruxelles",
   GVA: "Genève",
   LHR: "Londres (Heathrow)",
+  LON: "Londres (LON)",
   HND: "Tokyo (Haneda)",
+  TYO: "Tokyo (TYO)",
   FCO: "Rome (Fiumicino)",
+  ROM: "Rome (ROM)",
   RAK: "Marrakech (Ménara)",
   JFK: "New York (JFK)",
+  NYC: "New York (NYC)",
+  MIL: "Milan (MIL)",
+  MXP: "Milan (MIL)",
+  LIN: "Milan (MIL)",
+  BGY: "Milan (MIL)",
+  MIR: "Monastir (MIR)",
+  SYD: "Sydney (SYD)",
+  LIS: "Lisbonne (LIS)",
 };
+
+const CITY_COMPARATOR_CODE_BY_IATA: Record<string, string> = {
+  CDG: "PAR",
+  ORY: "PAR",
+  BVA: "PAR",
+  PAR: "PAR",
+  LHR: "LON",
+  LGW: "LON",
+  STN: "LON",
+  LTN: "LON",
+  LCY: "LON",
+  LON: "LON",
+  MXP: "MIL",
+  LIN: "MIL",
+  BGY: "MIL",
+  MIL: "MIL",
+  JFK: "NYC",
+  EWR: "NYC",
+  LGA: "NYC",
+  NYC: "NYC",
+  HND: "TYO",
+  NRT: "TYO",
+  TYO: "TYO",
+  FCO: "ROM",
+  CIA: "ROM",
+  ROM: "ROM",
+};
+
+function toCityComparatorCode(code: string): string {
+  const clean = (code || "").trim().toUpperCase();
+  return CITY_COMPARATOR_CODE_BY_IATA[clean] || clean;
+}
 
 function formatTimeHuman(iso: string): string {
   try {
@@ -1584,7 +1648,9 @@ function FlightsScreen({
   const destinationCity = activeDestination?.city_name || "Marrakech";
   const destinationIata = activeDestination?.iata_code || "RAK";
   const effectiveOrigin =
-    originIata.toUpperCase() === destinationIata.toUpperCase() ? "LHR" : originIata;
+    toCityComparatorCode(originIata) === toCityComparatorCode(destinationIata)
+      ? "LHR"
+      : originIata;
 
   const {
     data: offers = [],
@@ -1634,16 +1700,69 @@ function FlightsScreen({
     } else {
       copy.sort((a, b) => {
         const durA =
-          computeDurationMinutes(a.departure_outbound_at, a.arrival_outbound_at) +
-          computeDurationMinutes(a.departure_inbound_at, a.arrival_inbound_at);
+          (a.duration_outbound_minutes ||
+            computeDurationMinutes(a.departure_outbound_at, a.arrival_outbound_at)) +
+          (a.duration_inbound_minutes ||
+            computeDurationMinutes(a.departure_inbound_at, a.arrival_inbound_at));
         const durB =
-          computeDurationMinutes(b.departure_outbound_at, b.arrival_outbound_at) +
-          computeDurationMinutes(b.departure_inbound_at, b.arrival_inbound_at);
+          (b.duration_outbound_minutes ||
+            computeDurationMinutes(b.departure_outbound_at, b.arrival_outbound_at)) +
+          (b.duration_inbound_minutes ||
+            computeDurationMinutes(b.departure_inbound_at, b.arrival_inbound_at));
         return durA - durB;
       });
     }
     return copy;
   }, [offers, sortBy]);
+
+  const depDateIso = (
+    departureDate ||
+    (activeTrip?.arrival_at ? activeTrip.arrival_at.slice(0, 10) : "2026-11-10")
+  ).slice(0, 10);
+  const retDateIso = (
+    returnDate ||
+    (activeTrip?.departure_at ? activeTrip.departure_at.slice(0, 10) : "2026-11-17")
+  ).slice(0, 10);
+
+  const comparatorLinks = useMemo(() => {
+    const firstUrls = sortedOffers[0]?.comparator_urls;
+    const origCityCode =
+      firstUrls?.origin_code ||
+      sortedOffers[0]?.origin_city_code ||
+      toCityComparatorCode(effectiveOrigin);
+    const destCityCode =
+      firstUrls?.destination_code ||
+      sortedOffers[0]?.destination_city_code ||
+      toCityComparatorCode(destinationIata);
+
+    const googleUrl =
+      firstUrls?.google_flights ||
+      `https://www.google.com/travel/flights?hl=fr&curr=EUR&q=${encodeURIComponent(
+        `Vols ${origCityCode} ${destCityCode} ${depDateIso} ${retDateIso}`
+      )}`;
+    const kayakUrl =
+      firstUrls?.kayak ||
+      `https://www.kayak.fr/flights/${encodeURIComponent(
+        origCityCode
+      )}-${encodeURIComponent(destCityCode)}/${encodeURIComponent(
+        depDateIso
+      )}/${encodeURIComponent(retDateIso)}`;
+    const skyscannerUrl =
+      firstUrls?.skyscanner ||
+      `https://www.skyscanner.fr/transport/vols/${encodeURIComponent(
+        origCityCode.toLowerCase()
+      )}/${encodeURIComponent(destCityCode.toLowerCase())}/${encodeURIComponent(
+        depDateIso
+      )}/${encodeURIComponent(retDateIso)}/`;
+
+    return {
+      originCode: origCityCode,
+      destinationCode: destCityCode,
+      google: googleUrl,
+      kayak: kayakUrl,
+      skyscanner: skyscannerUrl,
+    };
+  }, [sortedOffers, effectiveOrigin, destinationIata, depDateIso, retDateIso]);
 
   const bookMutation = useMutation({
     mutationFn: async (offer: FlightOffer) => {
@@ -1920,6 +2039,78 @@ function FlightsScreen({
             </div>
           </div>
         </Card>
+
+        {/* Bandeau Offres d'exemple, prix indicatifs + bouton Voir les vrais prix (Google Flights, Kayak, Skyscanner) */}
+        <div
+          data-testid="flights-example-offers-banner"
+          className="mt-4 rounded-card border border-brand-200 bg-brand-50/70 px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <div className="space-y-0.5">
+            <div className="text-caption font-semibold text-brand-900">
+              {sortedOffers[0]?.banner_text || "Offres d'exemple, prix indicatifs"}
+            </div>
+            <p className="text-caption text-ink-secondary">
+              Ces horaires et tarifs sont proposés à titre indicatif pour organiser votre séjour ({comparatorLinks.originCode} → {comparatorLinks.destinationCode}).
+            </p>
+          </div>
+
+          <div
+            className="flex flex-wrap items-center gap-2"
+            data-testid="flights-real-prices-bar"
+          >
+            <a
+              href={comparatorLinks.google}
+              target="_blank"
+              rel="noopener noreferrer"
+              data-testid="flights-real-prices-btn"
+              className="inline-flex items-center justify-center gap-1.5 rounded-control px-3.5 py-2 text-xs font-semibold bg-accent text-white hover:bg-accent-hover shadow-subtle transition-colors"
+            >
+              <span>Voir les vrais prix</span>
+              <span aria-hidden="true">↗</span>
+            </a>
+
+            <div
+              className="inline-flex flex-wrap items-center gap-1.5 rounded-control border border-border bg-white px-2.5 py-1.5 text-xs"
+              role="group"
+              aria-label="Choisir un comparateur de vols"
+              data-testid="flights-compare-menu"
+            >
+              <a
+                href={comparatorLinks.google}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="flights-compare-google"
+                className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-semibold text-accent hover:bg-canvas-subtle transition-colors"
+              >
+                Google Flights ↗
+              </a>
+              <span className="text-border" aria-hidden="true">
+                •
+              </span>
+              <a
+                href={comparatorLinks.kayak}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="flights-compare-kayak"
+                className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-semibold text-accent hover:bg-canvas-subtle transition-colors"
+              >
+                Kayak ↗
+              </a>
+              <span className="text-border" aria-hidden="true">
+                •
+              </span>
+              <a
+                href={comparatorLinks.skyscanner}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-testid="flights-compare-skyscanner"
+                className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-semibold text-accent hover:bg-canvas-subtle transition-colors"
+              >
+                Skyscanner ↗
+              </a>
+            </div>
+          </div>
+        </div>
       </div>
 
       {/* Message d'erreur humain contextuel le cas échéant */}
@@ -1968,163 +2159,60 @@ function FlightsScreen({
           </div>
         </Card>
       ) : sortedOffers.length === 0 ? (
-        /* État 3 : Liste vide ou ville sans offres de vols intégrées */
-        (() => {
-          const isCustomWorldCity = !SEED_POPULAR_CITY_NAMES.has(
-            destinationCity.trim().toLowerCase()
-          );
-          const originCityLabel = departureOrigin?.cityName || effectiveOrigin;
-          const depDateIso = (
-            departureDate ||
-            (activeTrip?.arrival_at ? activeTrip.arrival_at.slice(0, 10) : "2026-11-10")
-          ).slice(0, 10);
-          const retDateIso = (
-            returnDate ||
-            (activeTrip?.departure_at ? activeTrip.departure_at.slice(0, 10) : "2026-11-17")
-          ).slice(0, 10);
-
-          const flightComparators = {
-            google: {
-              id: "google" as const,
-              label: "Google Flights",
-              url: `https://www.google.com/travel/flights?hl=fr&curr=EUR&q=${encodeURIComponent(
-                `Vols ${effectiveOrigin} ${destinationIata} ${depDateIso} ${retDateIso}`
-              )}`,
-            },
-            kayak: {
-              id: "kayak" as const,
-              label: "Kayak",
-              url: `https://www.kayak.fr/flights/${encodeURIComponent(
-                effectiveOrigin
-              )}-${encodeURIComponent(destinationIata)}/${encodeURIComponent(
-                depDateIso
-              )}/${encodeURIComponent(retDateIso)}`,
-            },
-            skyscanner: {
-              id: "skyscanner" as const,
-              label: "Skyscanner",
-              url: `https://www.skyscanner.fr/transport/vols/${encodeURIComponent(
-                effectiveOrigin.toLowerCase()
-              )}/${encodeURIComponent(destinationIata.toLowerCase())}/${encodeURIComponent(
-                depDateIso
-              )}/${encodeURIComponent(retDateIso)}/`,
-            },
-          };
-
-          return (
-            <Card className="p-8 text-center" data-testid="flights-empty-state">
-              <h2 className="text-h2 text-ink" data-testid="flights-empty-title">
-                {isCustomWorldCity
-                  ? `Nous n'avons pas encore de vols à afficher pour ${destinationCity}`
-                  : "Aucun vol trouvé pour ces critères"}
-              </h2>
-              <p className="mt-2 text-body text-ink-muted max-w-xl mx-auto">
-                {isCustomWorldCity
-                  ? `Comparez directement les liaisons entre ${originCityLabel} (${effectiveOrigin}) et ${destinationCity} (${destinationIata}) du ${depDateIso} au ${retDateIso}, ou poursuivez l'organisation de votre séjour.`
-                  : "Essayez un autre aéroport de départ ou modifiez vos dates de voyage sur l'accueil."}
-              </p>
-
-              {isCustomWorldCity && (
-                <div className="mt-6 flex flex-col items-center gap-3">
-                  <div className="inline-flex flex-wrap items-center justify-center gap-2">
-                    <a
-                      href={flightComparators.google.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      data-testid="flights-compare-primary-btn"
-                      className="inline-flex items-center justify-center gap-2 rounded-control px-5 py-2.5 text-sm font-semibold bg-accent text-white hover:bg-accent-hover shadow-subtle transition-colors"
-                    >
-                      <span>{`Comparer les vols ${originCityLabel} → ${destinationCity}`}</span>
-                      <span aria-hidden="true">↗</span>
-                    </a>
-                  </div>
-
-                  {/* Petit menu de choix du comparateur (Google Flights, Kayak, Skyscanner) */}
-                  <div
-                    className="inline-flex flex-wrap items-center justify-center gap-2 rounded-control border border-border bg-canvas-subtle px-3 py-1.5 text-xs"
-                    role="group"
-                    aria-label="Choisir un comparateur de vols"
-                    data-testid="flights-compare-menu"
-                  >
-                    <span className="text-ink-muted font-medium">Ouvrir sur :</span>
-                    <a
-                      href={flightComparators.google.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      data-testid="flights-compare-google"
-                      className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
-                    >
-                      Google Flights ↗
-                    </a>
-                    <span className="text-border" aria-hidden="true">
-                      •
-                    </span>
-                    <a
-                      href={flightComparators.kayak.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      data-testid="flights-compare-kayak"
-                      className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
-                    >
-                      Kayak ↗
-                    </a>
-                    <span className="text-border" aria-hidden="true">
-                      •
-                    </span>
-                    <a
-                      href={flightComparators.skyscanner.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      data-testid="flights-compare-skyscanner"
-                      className="inline-flex items-center gap-1 rounded px-2.5 py-1 font-semibold text-accent hover:bg-surface transition-colors"
-                    >
-                      Skyscanner ↗
-                    </a>
-                  </div>
-                </div>
-              )}
-
-              <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
-                <Button
-                  type="button"
-                  variant={isCustomWorldCity ? "secondary" : "primary"}
-                  data-testid="flights-continue-accommodations-btn"
-                  onClick={() => navigate("/accommodations")}
-                >
-                  Continuer vers l'hébergement
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  data-testid="flights-continue-activities-btn"
-                  onClick={() => navigate("/activities")}
-                >
-                  Voir les lieux de la ville
-                </Button>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  data-testid="flights-modify-search-btn"
-                  onClick={() => navigate("/")}
-                >
-                  Modifier ma recherche
-                </Button>
-              </div>
-            </Card>
-          );
-        })()
+        /* État 3 : Liste vide */
+        <Card className="p-8 text-center" data-testid="flights-empty-state">
+          <h2 className="text-h2 text-ink" data-testid="flights-empty-title">
+            Aucun vol trouvé pour ces critères
+          </h2>
+          <p className="mt-2 text-body text-ink-muted max-w-xl mx-auto">
+            Essayez un autre aéroport de départ ou modifiez vos dates de voyage sur l'accueil.
+          </p>
+          <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+            <Button
+              type="button"
+              variant="primary"
+              data-testid="flights-continue-accommodations-btn"
+              onClick={() => navigate("/accommodations")}
+            >
+              Continuer vers l'hébergement
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              data-testid="flights-continue-activities-btn"
+              onClick={() => navigate("/activities")}
+            >
+              Voir les lieux de la ville
+            </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              data-testid="flights-modify-search-btn"
+              onClick={() => navigate("/")}
+            >
+              Modifier ma recherche
+            </Button>
+          </div>
+        </Card>
       ) : (
         /* Liste des offres en cartes sobres */
         <div className="space-y-4" data-testid="flights-offers-list">
           {sortedOffers.map((offer, idx) => {
-            const outDuration = computeDurationMinutes(
-              offer.departure_outbound_at,
-              offer.arrival_outbound_at
-            );
-            const inDuration = computeDurationMinutes(
-              offer.departure_inbound_at,
-              offer.arrival_inbound_at
-            );
+            const outDuration =
+              offer.duration_outbound_minutes ||
+              computeDurationMinutes(
+                offer.departure_outbound_at,
+                offer.arrival_outbound_at
+              );
+            const inDuration =
+              offer.duration_inbound_minutes ||
+              computeDurationMinutes(
+                offer.departure_inbound_at,
+                offer.arrival_inbound_at
+              );
+            const stopoverText = offer.stopover_label || "Direct";
+            const badgeText = offer.offer_badge || "Offre d'exemple";
+            const priceLabelText = offer.price_label || "Prix indicatif";
             const isBookingThis = bookingOfferId === offer.offer_id;
 
             return (
@@ -2135,11 +2223,20 @@ function FlightsScreen({
               >
                 <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
                   <div className="flex-1 space-y-4">
-                    {/* Compagnie & confort */}
+                    {/* Compagnie ou liaison & étiquette Offre d'exemple */}
                     <div className="flex flex-wrap items-center gap-2.5">
-                      <span className="text-h2 font-semibold text-ink">
+                      <span
+                        className="text-h2 font-semibold text-ink"
+                        data-testid={`flight-offer-title-${idx}`}
+                      >
                         {offer.airline_name}
                       </span>
+                      <Badge
+                        variant="brand"
+                        data-testid={`flight-offer-badge-${idx}`}
+                      >
+                        {badgeText}
+                      </Badge>
                       <Badge variant="neutral">
                         {cabinLabelHuman(offer.cabin_class)}
                       </Badge>
@@ -2164,7 +2261,9 @@ function FlightsScreen({
                       </div>
                       <div className="text-caption text-ink-secondary flex items-center gap-1.5">
                         <Clock className="h-3.5 w-3.5 text-brand-700" />
-                        <span>Durée : {formatDurationHuman(outDuration)} • Direct</span>
+                        <span data-testid={`flight-stopover-label-${idx}`}>
+                          Durée : {formatDurationHuman(outDuration)} • {stopoverText}
+                        </span>
                       </div>
                       <div className="text-caption text-ink-secondary sm:text-right">
                         {originAirportLabel.split(" (")[0]} → {destinationCity}
@@ -2184,7 +2283,9 @@ function FlightsScreen({
                       </div>
                       <div className="text-caption text-ink-secondary flex items-center gap-1.5">
                         <Clock className="h-3.5 w-3.5 text-brand-700" />
-                        <span>Durée : {formatDurationHuman(inDuration)} • Direct</span>
+                        <span>
+                          Durée : {formatDurationHuman(inDuration)} • {stopoverText}
+                        </span>
                       </div>
                       <div className="text-caption text-ink-secondary sm:text-right">
                         {destinationCity} → {originAirportLabel.split(" (")[0]}
@@ -2192,14 +2293,20 @@ function FlightsScreen({
                     </div>
                   </div>
 
-                  {/* Prix & bouton Réserver */}
-                  <div className="flex flex-row md:flex-col items-center md:items-end justify-between gap-3 pt-4 md:pt-0 border-t md:border-t-0 md:border-l border-border md:pl-6 min-w-[170px]">
+                  {/* Prix indicatif & bouton Réserver */}
+                  <div className="flex flex-row md:flex-col items-center md:items-end justify-between gap-3 pt-4 md:pt-0 border-t md:border-t-0 md:border-l border-border md:pl-6 min-w-[180px]">
                     <div className="md:text-right">
+                      <div
+                        className="text-caption font-semibold text-brand-800"
+                        data-testid={`flight-price-label-${idx}`}
+                      >
+                        {priceLabelText}
+                      </div>
                       <div
                         className="text-h1 font-bold text-ink"
                         data-testid={`flight-offer-price-${idx}`}
                       >
-                        {Math.round(Number(offer.price_amount))} €
+                        ~{Math.round(Number(offer.price_amount))} €
                       </div>
                       <div className="text-caption text-ink-muted">
                         Aller-retour compris
@@ -2845,14 +2952,21 @@ export function TravelMateShell({
     [trips, activeTripId]
   );
 
-  const activeDestination = useMemo(
-    () =>
-      destinations.find((d) => d.id === activeTrip?.destination_id) ||
+  const activeDestination = useMemo(() => {
+    if (activeTrip) {
+      return (
+        destinations.find((d) => d.id === activeTrip.destination_id) || null
+      );
+    }
+    if (isLoadingDestinations) {
+      return null;
+    }
+    return (
       destinations.find((d) => d.city_name === "Marrakech") ||
       destinations[0] ||
-      null,
-    [destinations, activeTrip]
-  );
+      null
+    );
+  }, [destinations, activeTrip, isLoadingDestinations]);
 
   async function refreshGallery(category: string = "", radiusKm?: number) {
     if (!activeTrip?.id || !token) return;
@@ -2900,6 +3014,9 @@ export function TravelMateShell({
     const existing = trips.find((t) => t.destination_id === dest.id);
     if (existing) {
       setActiveTripId(existing.id);
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("travelmate_active_trip_id", existing.id);
+      }
       return existing;
     }
     if (!token) return null;
@@ -2923,6 +3040,9 @@ export function TravelMateShell({
       const created: Trip = await resp.json();
       setTrips((prev) => [created, ...prev]);
       setActiveTripId(created.id);
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("travelmate_active_trip_id", created.id);
+      }
       return created;
     }
     return null;
@@ -3453,7 +3573,7 @@ export function renderTravelerPagesForInspection() {
       latitude: 31.6295,
       longitude: -7.9811,
       hero_image_url:
-        "https://images.unsplash.com/photo-1597212618440-806262de4f6b?auto=format&fit=crop&w=1400&q=80",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/45/Koutoubia_Mosque%2C_Marrakesh%2C_Morocco.jpg/960px-Koutoubia_Mosque%2C_Marrakesh%2C_Morocco.jpg",
       description: "Médina ocre, jardins paisibles et palais historiques.",
       practical_info: { currency: "MAD", language: "Arabe / Français" },
     },
@@ -3467,7 +3587,7 @@ export function renderTravelerPagesForInspection() {
       latitude: 35.6762,
       longitude: 139.6503,
       hero_image_url:
-        "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?auto=format&fit=crop&w=1400&q=80",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/b/b2/Skyscrapers_of_Shinjuku_2009_January.jpg/960px-Skyscrapers_of_Shinjuku_2009_January.jpg",
       description: "Sanctuaires paisibles, quartiers créatifs et haute gastronomie.",
       practical_info: { currency: "JPY", language: "Japonais" },
     },
@@ -3481,7 +3601,7 @@ export function renderTravelerPagesForInspection() {
       latitude: 41.9028,
       longitude: 12.4964,
       hero_image_url:
-        "https://images.unsplash.com/photo-1552832230-c0197dd311b5?auto=format&fit=crop&w=1400&q=80",
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/d/de/Colosseo_2020.jpg/960px-Colosseo_2020.jpg",
       description: "Vestiges antiques, places baroques et trattorias authentiques.",
       practical_info: { currency: "EUR", language: "Italien" },
     },
@@ -3530,27 +3650,40 @@ export function renderTravelerPagesForInspection() {
   const sampleAccommodation: AccommodationItem = {
     id: "acc-ssr-1",
     destination_id: "dest-rak",
-    name: "Riad Jardin des Orangers",
+    name: "La Mamounia Marrakech",
     type: "HOTEL",
     source: "HOTEL",
-    source_provider: "TravelMate",
+    source_provider: "Wikidata / Wikimedia Commons",
     source_label: "Sélection vérifiée",
     provider_mode: "LIVE",
     is_simulated: false,
-    luxury_tier: "STANDARD",
-    booking_redirect_url: "https://example.com/riad",
-    neighborhood: "Médina — Kasbah",
-    address: "18 Derb Sidi Bouloukat, Marrakech",
-    latitude: 31.6258,
-    longitude: -7.9891,
-    price_per_night: "145.00",
+    luxury_tier: "LUXURY",
+    booking_redirect_url: "https://www.booking.com/searchresults.fr.html?ss=La+Mamounia+Marrakech",
+    booking_url: "https://www.booking.com/searchresults.fr.html?ss=La+Mamounia+Marrakech",
+    airbnb_url: "https://www.airbnb.fr/s/Marrakech/homes",
+    neighborhood: "Bab Jdid — Hivernage",
+    address: "Avenue Bab Jdid, Marrakech",
+    latitude: 31.6226,
+    longitude: -7.9977,
+    price_per_night: "460.00",
+    price_label: "Prix indicatif",
+    gamme_label: "Luxe",
     currency: "EUR",
-    rating: 4.8,
-    amenities: ["Petit-déjeuner inclus", "Patio arboré", "Wi-Fi"],
+    rating: 4.9,
+    amenities: ["Jardins historiques", "Spa & hammam", "Piscine extérieure", "Petit-déjeuner"],
     photos: [
-      "https://images.unsplash.com/photo-1582719508461-905c673771fd?auto=format&fit=crop&w=900&q=80",
+      "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3c/La_Mamounia_Hotel%2C_Marrakesh%2C_Morocco_-_20080520.jpg/960px-La_Mamounia_Hotel%2C_Marrakesh%2C_Morocco_-_20080520.jpg",
     ],
-    distance_from_center_km: 0.8,
+    photo_status: "commons_verified",
+    photo_file_title: "File:La Mamounia Hotel, Marrakesh, Morocco - 20080520.jpg",
+    photo_author: "Elya",
+    photo_license: "CC BY-SA 3.0",
+    photo_commons_url: "https://commons.wikimedia.org/wiki/File:La_Mamounia_Hotel,_Marrakesh,_Morocco_-_20080520.jpg",
+    photo_credit_text: "Photo : Elya — CC BY-SA 3.0 — Wikimedia Commons",
+    wikidata_id: "Q3210501",
+    accommodation_subtype: "hotel",
+    is_illustration: false,
+    distance_from_center_km: 1.1,
     nearby_restaurants: [
       {
         id: "rest-ssr-1",
@@ -3594,7 +3727,7 @@ export function renderTravelerPagesForInspection() {
         avg_rating: 4.9,
         opening_hours: { mon: "08:00-18:00" },
         hero_photos: [
-          "https://images.unsplash.com/photo-1564507592333-c60657eea523?auto=format&fit=crop&w=1000&q=80",
+          "https://upload.wikimedia.org/wikipedia/commons/thumb/5/59/Jardin_Majorelle_in_Marrakesh%2C_Morocco.jpg/960px-Jardin_Majorelle_in_Marrakesh%2C_Morocco.jpg",
         ],
         source_provider: "TravelMate",
         is_wishlisted: false,
