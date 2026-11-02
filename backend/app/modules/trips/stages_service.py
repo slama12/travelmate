@@ -121,7 +121,50 @@ def validate_stages_rules(stages_specs: list[dict[str, Any]]) -> None:
     for idx, spec in enumerate(stages_specs):
         step_num = idx + 1
         city_label = str(spec.get("city_name") or f"Étape {step_num}")
-        nights = int(spec.get("nights") if spec.get("nights") is not None else 0)
+
+        arr_date = spec.get("arrival_date")
+        if isinstance(arr_date, str) and len(arr_date) >= 10:
+            try:
+                arr_date = date.fromisoformat(arr_date[:10])
+                spec["arrival_date"] = arr_date
+            except ValueError:
+                arr_date = None
+        if not isinstance(arr_date, date):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "reason_code": "INVALID_STAGE_DATE",
+                    "message": f"La date d'arrivée de l'étape {step_num} ({city_label}) est manquante ou invalide.",
+                },
+            )
+
+        explicit_dep_date = spec.get("departure_date")
+        if isinstance(explicit_dep_date, str) and len(explicit_dep_date) >= 10:
+            try:
+                explicit_dep_date = date.fromisoformat(explicit_dep_date[:10])
+                spec["departure_date"] = explicit_dep_date
+            except ValueError:
+                explicit_dep_date = None
+
+        if isinstance(explicit_dep_date, date) and explicit_dep_date <= arr_date:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "reason_code": "INCONSISTENT_STAGE_DATES",
+                    "message": (
+                        f"Les dates de l'étape {step_num} ({city_label}) sont incohérentes : "
+                        "la date de départ doit être postérieure à la date d'arrivée (au moins 1 nuit sur place)."
+                    ),
+                },
+            )
+
+        raw_nights = spec.get("nights")
+        if raw_nights is None and isinstance(explicit_dep_date, date):
+            nights = (explicit_dep_date - arr_date).days
+            spec["nights"] = nights
+        else:
+            nights = int(raw_nights if raw_nights is not None else 0)
+
         if nights < 1:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -151,29 +194,11 @@ def validate_stages_rules(stages_specs: list[dict[str, Any]]) -> None:
                 },
             ) from exc
 
-        arr_date = spec.get("arrival_date")
-        if not isinstance(arr_date, date):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={
-                    "reason_code": "INVALID_STAGE_DATE",
-                    "message": f"La date d'arrivée de l'étape {step_num} ({city_label}) est manquante ou invalide.",
-                },
-            )
         expected_dep_date = arr_date + timedelta(days=nights)
-        explicit_dep_date = spec.get("departure_date")
         if isinstance(explicit_dep_date, date) and explicit_dep_date != expected_dep_date:
-            if explicit_dep_date <= arr_date:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail={
-                        "reason_code": "INCONSISTENT_STAGE_DATES",
-                        "message": (
-                            f"Les dates de l'étape {step_num} ({city_label}) sont incohérentes : "
-                            "la date de départ doit être postérieure à la date d'arrivée."
-                        ),
-                    },
-                )
+            nights = (explicit_dep_date - arr_date).days
+            spec["nights"] = nights
+            expected_dep_date = explicit_dep_date
         spec["departure_date"] = expected_dep_date
 
         if idx > 0:

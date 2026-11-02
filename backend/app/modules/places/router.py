@@ -258,7 +258,7 @@ async def ensure_destination_world_places(
             )
             new_place = Place(
                 destination_id=dest.id,
-                name=item.name,
+                name=(item.name or "")[:200],
                 description=item.description,
                 category=item.category,
                 is_outdoor=item.is_outdoor,
@@ -270,14 +270,14 @@ async def ensure_destination_world_places(
                 avg_rating=4.6,
                 opening_hours=item.opening_hours,
                 hero_photos=[],
-                source_provider=item.source_provider,
-                external_place_id=item.external_place_id,
-                address=item.address,
-                website_url=item.website_url,
-                price_label=item.price_label,
-                hours_status=item.hours_status,
-                source_url=item.source_url,
-                source_attribution=item.source_attribution,
+                source_provider=(item.source_provider or "")[:50],
+                external_place_id=(item.external_place_id[:120] if item.external_place_id else None),
+                address=(item.address[:255] if item.address else None),
+                website_url=(item.website_url[:500] if item.website_url else None),
+                price_label=(item.price_label[:120] if item.price_label else None),
+                hours_status=(item.hours_status[:60] if item.hours_status else None),
+                source_url=(item.source_url[:500] if item.source_url else None),
+                source_attribution=(item.source_attribution[:255] if item.source_attribution else None),
                 notoriety_score=int(item.notoriety_score),
             )
             db.add(new_place)

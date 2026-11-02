@@ -618,3 +618,198 @@ async def test_three_stages_three_countries_timezones_boundary_visit_chat_voice_
     assert [s["order_index"] for s in remaining] == [1, 2]
     assert remaining[1]["arrival_date"] == "2026-11-12"
     assert remaining[1]["departure_date"] == "2026-11-14"
+
+
+@pytest.mark.asyncio
+async def test_stage_crud_gps_coordinates_and_stage_level_visit_duration_validation(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """
+    Vérifie :
+    1. Chaque Stage expose city_name, latitude, longitude, arrival_date et departure_date.
+    2. Les endpoints REST permettent d'ajouter (POST), modifier (PUT/PATCH par étape ou lot),
+       réordonner (PUT /reorder) et supprimer (DELETE) les étapes d'un voyage existant.
+    3. La validation de la durée des visites (Prompt 8) fonctionne à l'échelle du Stage local
+       (une visite d'une ville ne peut ni être planifiée pendant les dates d'une autre étape du
+       voyage, ni déborder de la fenêtre [arrivée + tampon, départ - tampon] de son Stage local).
+    """
+    headers = await _auth_headers_for(db_session, "crud.gps.stage@travelmate.fr")
+
+    marrakech = await db_session.scalar(
+        select(Destination).where(Destination.city_name == "Marrakech")
+    )
+    rome = await db_session.scalar(select(Destination).where(Destination.city_name == "Rome"))
+    tokyo = await db_session.scalar(select(Destination).where(Destination.city_name == "Tokyo"))
+    assert marrakech and rome and tokyo
+
+    majorelle = await db_session.scalar(
+        select(Place).where(
+            Place.destination_id == marrakech.id, Place.name.ilike("%Majorelle%")
+        )
+    )
+    colisee = await db_session.scalar(
+        select(Place).where(Place.destination_id == rome.id)
+    )
+    assert majorelle and colisee
+    majorelle_id = majorelle.id
+    colisee_id = colisee.id
+
+    # 1. Création d'un voyage initial mono-étape à Marrakech (10 -> 13 nov 2026)
+    create_res = await client.post(
+        "/api/v1/trips",
+        headers=headers,
+        json={
+            "destination_id": marrakech.id,
+            "title": "Itinéraire Multi-Villes Test",
+            "arrival_at": "2026-11-10T10:00:00Z",
+            "departure_at": "2026-11-13T18:00:00Z",
+            "travel_style": "STANDARD",
+            "total_budget_planned": 2400.0,
+            "currency": "EUR",
+        },
+    )
+    assert create_res.status_code == 201, create_res.text
+    trip_id = create_res.json()["id"]
+    st1 = create_res.json()["stages"][0]
+    assert st1["city_name"] == "Marrakech"
+    assert abs(float(st1["latitude"]) - float(marrakech.latitude)) < 0.01
+    assert abs(float(st1["longitude"]) - float(marrakech.longitude)) < 0.01
+    assert st1["arrival_date"] == "2026-11-10"
+    assert st1["departure_date"] == "2026-11-13"
+
+    # 2. Ajout d'une étape 2 (Rome, 13 -> 16 nov 2026) via POST /trips/{trip_id}/stages
+    add_rome_res = await client.post(
+        f"/api/v1/trips/{trip_id}/stages",
+        headers=headers,
+        json={
+            "destination_id": rome.id,
+            "city_name": "Rome",
+            "arrival_date": "2026-11-13",
+            "departure_date": "2026-11-16",
+            "nights": 3,
+            "arrival_transport_mode": "VOL",
+        },
+    )
+    assert add_rome_res.status_code in (200, 201), add_rome_res.text
+    add_rome_body = add_rome_res.json()
+    stages_after_add = add_rome_body["stages"] if isinstance(add_rome_body, dict) else add_rome_body
+    assert len(stages_after_add) == 2
+    st2 = stages_after_add[1]
+    assert st2["city_name"] == "Rome"
+    assert abs(float(st2["latitude"]) - float(rome.latitude)) < 0.01
+    assert abs(float(st2["longitude"]) - float(rome.longitude)) < 0.01
+    assert st2["arrival_date"] == "2026-11-13"
+    assert st2["departure_date"] == "2026-11-16"
+
+    # 3. Ajout d'une étape 3 (Tokyo, 16 -> 18 nov 2026) puis modification via PUT /stages/{stage_id}
+    add_tokyo_res = await client.post(
+        f"/api/v1/trips/{trip_id}/stages",
+        headers=headers,
+        json={
+            "destination_id": tokyo.id,
+            "city_name": "Tokyo",
+            "arrival_date": "2026-11-16",
+            "departure_date": "2026-11-18",
+            "nights": 2,
+            "arrival_transport_mode": "TRAIN",
+        },
+    )
+    assert add_tokyo_res.status_code in (200, 201), add_tokyo_res.text
+    add_tokyo_body = add_tokyo_res.json()
+    stages_after_tokyo = add_tokyo_body["stages"] if isinstance(add_tokyo_body, dict) else add_tokyo_body
+    st3 = stages_after_tokyo[2]
+
+    # Modification de l'étape 2 (Rome passe de 3 à 4 nuits : 13 -> 17 nov) -> Tokyo décale automatiquement à 17 -> 19 nov
+    upd_rome_res = await client.put(
+        f"/api/v1/trips/{trip_id}/stages/{st2['id']}",
+        headers=headers,
+        json={
+            "arrival_date": "2026-11-13",
+            "departure_date": "2026-11-17",
+            "arrival_transport_mode": "TRAIN",
+        },
+    )
+    assert upd_rome_res.status_code == 200, upd_rome_res.text
+    upd_rome_body = upd_rome_res.json()
+    updated_stages = upd_rome_body["stages"] if isinstance(upd_rome_body, dict) else upd_rome_body
+    assert updated_stages[1]["departure_date"] == "2026-11-17"
+    assert updated_stages[1]["nights"] == 4
+    assert updated_stages[2]["arrival_date"] == "2026-11-17"
+    assert updated_stages[2]["departure_date"] == "2026-11-19"
+
+    # 4. Suppression de l'étape 3 (Tokyo) pour garder Marrakech (10->13 nov) + Rome (13->17 nov)
+    del_tokyo_res = await client.delete(
+        f"/api/v1/trips/{trip_id}/stages/{st3['id']}",
+        headers=headers,
+    )
+    assert del_tokyo_res.status_code == 200, del_tokyo_res.text
+    del_tokyo_body = del_tokyo_res.json()
+    remaining_stages = del_tokyo_body["stages"] if isinstance(del_tokyo_body, dict) else del_tokyo_body
+    assert len(remaining_stages) == 2
+
+    # 5. Validation de la durée des visites (Prompt 8) à l'échelle du Stage local :
+    # Le voyage global va du 2026-11-10 au 2026-11-17, mais l'étape 1 (Marrakech) s'arrête le 2026-11-13.
+    # 5a) Tenter de planifier un lieu de Marrakech (Jardin Majorelle) le 2026-11-15 (pendant l'étape 2 Rome) -> REFUSÉ (422 OUTSIDE_TRIP_WINDOW)
+    visit_wrong_stage_date = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/items",
+        headers=headers,
+        json={
+            "place_id": majorelle_id,
+            "visit_date": "2026-11-15",
+            "local_start_time": "10:00",
+            "duration_minutes": 90,
+            "transit_mode_to_next": "WALK",
+        },
+    )
+    assert visit_wrong_stage_date.status_code == 422, visit_wrong_stage_date.text
+    detail_a = visit_wrong_stage_date.json()["detail"]
+    assert (detail_a.get("reason_code") or detail_a.get("code")) == "OUTSIDE_TRIP_WINDOW"
+
+    # 5b) Tenter de planifier un lieu de Marrakech le 2026-11-13 à 17:30 pour 180 min (déborde l'heure de départ de l'étape 1) -> REFUSÉ (422 OUTSIDE_TRIP_WINDOW)
+    visit_overflow_stage1 = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/items",
+        headers=headers,
+        json={
+            "place_id": majorelle_id,
+            "visit_date": "2026-11-13",
+            "local_start_time": "17:30",
+            "duration_minutes": 180,
+            "transit_mode_to_next": "WALK",
+        },
+    )
+    assert visit_overflow_stage1.status_code == 422, visit_overflow_stage1.text
+    detail_b = visit_overflow_stage1.json()["detail"]
+    assert (detail_b.get("reason_code") or detail_b.get("code")) == "OUTSIDE_TRIP_WINDOW"
+
+    # 5c) Planifier Jardin Majorelle dans les dates locales de l'étape 1 (2026-11-11 à 10:00, 90 min) -> ACCEPTÉ (201)
+    visit_ok_stage1 = await client.post(
+        f"/api/v1/itinerary/trip/{trip_id}/items",
+        headers=headers,
+        json={
+            "place_id": majorelle_id,
+            "visit_date": "2026-11-11",
+            "local_start_time": "10:00",
+            "duration_minutes": 90,
+            "transit_mode_to_next": "WALK",
+        },
+    )
+    assert visit_ok_stage1.status_code == 201, visit_ok_stage1.text
+    created_visit = visit_ok_stage1.json()
+    assert created_visit["stage_id"] == st1["id"]
+    assert abs(float(created_visit["place_latitude"]) - float(majorelle.latitude)) < 0.01
+    assert abs(float(created_visit["place_longitude"]) - float(majorelle.longitude)) < 0.01
+
+    # 5d) Tenter de déplacer cette visite de Marrakech vers le 2026-11-15 (dates de l'étape 2 Rome) via PATCH /items/{item_id} -> REFUSÉ (422 OUTSIDE_TRIP_WINDOW)
+    move_outside_stage1 = await client.patch(
+        f"/api/v1/itinerary/items/{created_visit['id']}",
+        headers=headers,
+        json={
+            "visit_date": "2026-11-15",
+            "local_start_time": "10:00",
+            "duration_minutes": 90,
+        },
+    )
+    assert move_outside_stage1.status_code == 422, move_outside_stage1.text
+    detail_d = move_outside_stage1.json()["detail"]
+    assert (detail_d.get("reason_code") or detail_d.get("code")) == "OUTSIDE_TRIP_WINDOW"
+

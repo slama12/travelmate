@@ -365,14 +365,18 @@ async def test_live_docker_compose_backend_all_tabs_and_tokyo_scenario() -> None
     produit un doublon '/api/v1/api/v1'.
     """
     import os
+    from tests.test_db_lifecycle import cleanup_and_verify_cascade_for_emails
 
     live_base = _normalize_frontend_api_base(
         os.getenv("VITE_API_BASE_URL", "http://localhost:8000")
     )
-    assert live_base == "http://localhost:8000"
+    assert live_base in ("http://localhost:8000", "http://127.0.0.1:8001")
     assert "/api/v1" not in live_base
 
-    candidate_bases = [live_base, "http://backend:8000"]
+    test_api_base = _normalize_frontend_api_base(
+        os.getenv("TEST_API_BASE_URL", "http://127.0.0.1:8001")
+    )
+    candidate_bases = [test_api_base, live_base, "http://backend:8000"]
     reachable_base: str | None = None
     last_error: Exception | None = None
     for candidate in candidate_bases:
@@ -389,172 +393,176 @@ async def test_live_docker_compose_backend_all_tabs_and_tokyo_scenario() -> None
         f"Serveur HTTP live non joignable sur {candidate_bases}: {last_error}"
     )
 
-    async with AsyncClient(base_url=reachable_base, timeout=15.0) as http:
-        probe = await http.get("/health")
-        assert probe.status_code == 200
+    email = f"live.e2e.{uuid.uuid4().hex[:8]}@travelmate.app"
+    try:
+        async with AsyncClient(base_url=reachable_base, timeout=15.0) as http:
+            probe = await http.get("/health")
+            assert probe.status_code == 200
 
-        async def call_live(method: str, path: str, **kwargs):
-            full_url = f"{live_base}{path}"
-            assert "/api/v1/api/v1" not in full_url, f"Doublon /api/v1/api/v1 dans {full_url}"
-            r = await http.request(method, path, **kwargs)
-            assert r.status_code != 404, f"404 Not Found sur {method} {full_url}: {r.text}"
-            return r
+            async def call_live(method: str, path: str, **kwargs):
+                full_url = f"{reachable_base}{path}"
+                assert "/api/v1/api/v1" not in full_url, f"Doublon /api/v1/api/v1 dans {full_url}"
+                r = await http.request(method, path, **kwargs)
+                assert r.status_code != 404, f"404 Not Found sur {method} {full_url}: {r.text}"
+                return r
 
-        # 1. Inscription d'un nouvel utilisateur sur le vrai PostgreSQL
-        email = f"live.e2e.{uuid.uuid4().hex[:8]}@travelmate.app"
-        reg = await call_live(
-            "POST",
-            "/api/v1/auth/register",
-            json={
-                "email": email,
-                "password": "LivePassword2026!",
-                "full_name": "E2E Live Runner",
-                "preferred_style": "STANDARD",
-            },
-        )
-        assert reg.status_code == 201
-        jwt_token = reg.json()["access_token"]
-        headers = {"Authorization": f"Bearer {jwt_token}"}
-
-        # 2. Création d'un séjour Tokyo (HND)
-        dests = (await call_live("GET", "/api/v1/destinations")).json()
-        tokyo = next(d for d in dests if d["iata_code"] == "HND")
-
-        trip = (
-            await call_live(
+            # 1. Inscription d'un nouvel utilisateur sur le vrai PostgreSQL de test (travelmate_test)
+            reg = await call_live(
                 "POST",
-                "/api/v1/trips",
+                "/api/v1/auth/register",
+                json={
+                    "email": email,
+                    "password": "LivePassword2026!",
+                    "full_name": "E2E Live Runner",
+                    "preferred_style": "STANDARD",
+                },
+            )
+            assert reg.status_code == 201
+            jwt_token = reg.json()["access_token"]
+            headers = {"Authorization": f"Bearer {jwt_token}"}
+
+            # 2. Création d'un séjour Tokyo (HND)
+            dests = (await call_live("GET", "/api/v1/destinations")).json()
+            tokyo = next(d for d in dests if d["iata_code"] == "HND")
+
+            trip = (
+                await call_live(
+                    "POST",
+                    "/api/v1/trips",
+                    headers=headers,
+                    json={
+                        "destination_id": tokyo["id"],
+                        "title": "Séjour Live Docker Tokyo",
+                        "travel_style": "STANDARD",
+                        "total_budget_planned": "2500.00",
+                        "currency": "EUR",
+                    },
+                )
+            ).json()
+            trip_id = trip["id"]
+
+            # 3. Recherche et réservation du vol CDG -> HND
+            offers = (
+                await call_live(
+                    "GET",
+                    "/api/v1/flights/search",
+                    params={
+                        "origin_iata": "CDG",
+                        "destination_iata": "HND",
+                        "departure_date": "2026-11-10",
+                        "return_date": "2026-11-18",
+                        "travel_style": "STANDARD",
+                    },
+                )
+            ).json()
+            offer = offers[0]
+
+            booked = await call_live(
+                "POST",
+                "/api/v1/flights/book",
                 headers=headers,
                 json={
-                    "destination_id": tokyo["id"],
-                    "title": "Séjour Live Docker Tokyo",
-                    "travel_style": "STANDARD",
-                    "total_budget_planned": "2500.00",
-                    "currency": "EUR",
+                    "trip_id": trip_id,
+                    "idempotency_key": f"live-idem-{trip_id[:8]}",
+                    "airline": offer["airline_name"],
+                    "flight_number_outbound": offer["flight_number_outbound"],
+                    "flight_number_inbound": offer["flight_number_inbound"],
+                    "origin_iata": offer["origin_iata"],
+                    "destination_iata": offer["destination_iata"],
+                    "departure_outbound_at": offer["departure_outbound_at"],
+                    "arrival_outbound_at": offer["arrival_outbound_at"],
+                    "departure_inbound_at": offer["departure_inbound_at"],
+                    "arrival_inbound_at": offer["arrival_inbound_at"],
+                    "price_amount": str(offer["price_amount"]),
+                    "currency": offer["currency"],
+                    "cabin_class": offer["cabin_class"],
                 },
             )
-        ).json()
-        trip_id = trip["id"]
+            assert booked.status_code == 201
 
-        # 3. Recherche et réservation du vol CDG -> HND
-        offers = (
-            await call_live(
+            # 4. Chargement des 6 onglets sans aucun 404
+            await call_live("GET", f"/api/v1/flights/trip/{trip_id}", headers=headers)
+            acc_resp = await call_live(
                 "GET",
-                "/api/v1/flights/search",
+                "/api/v1/accommodations/search",
                 params={
-                    "origin_iata": "CDG",
-                    "destination_iata": "HND",
-                    "departure_date": "2026-11-10",
-                    "return_date": "2026-11-18",
-                    "travel_style": "STANDARD",
+                    "lat": tokyo["latitude"],
+                    "lng": tokyo["longitude"],
+                    "radius_km": 12,
+                    "restaurant_radius_km": 5,
+                    "min_price": "50",
+                    "max_price": "2000",
                 },
             )
-        ).json()
-        offer = offers[0]
+            assert acc_resp.status_code == 200
+            assert len(acc_resp.json()) >= 2
 
-        booked = await call_live(
-            "POST",
-            "/api/v1/flights/book",
-            headers=headers,
-            json={
-                "trip_id": trip_id,
-                "idempotency_key": f"live-idem-{trip_id[:8]}",
-                "airline": offer["airline_name"],
-                "flight_number_outbound": offer["flight_number_outbound"],
-                "flight_number_inbound": offer["flight_number_inbound"],
-                "origin_iata": offer["origin_iata"],
-                "destination_iata": offer["destination_iata"],
-                "departure_outbound_at": offer["departure_outbound_at"],
-                "arrival_outbound_at": offer["arrival_outbound_at"],
-                "departure_inbound_at": offer["departure_inbound_at"],
-                "arrival_inbound_at": offer["arrival_inbound_at"],
-                "price_amount": str(offer["price_amount"]),
-                "currency": offer["currency"],
-                "cabin_class": offer["cabin_class"],
-            },
-        )
-        assert booked.status_code == 201
+            gallery = (
+                await call_live("GET", f"/api/v1/places/trip/{trip_id}/gallery", headers=headers)
+            ).json()
+            assert gallery["unlocked"] is True
+            p1, p2 = gallery["places"][0], gallery["places"][1]
 
-        # 4. Chargement des 6 onglets sans aucun 404
-        await call_live("GET", f"/api/v1/flights/trip/{trip_id}", headers=headers)
-        acc_resp = await call_live(
-            "GET",
-            "/api/v1/accommodations/search",
-            params={
-                "lat": tokyo["latitude"],
-                "lng": tokyo["longitude"],
-                "radius_km": 12,
-                "restaurant_radius_km": 5,
-                "min_price": "50",
-                "max_price": "2000",
-            },
-        )
-        assert acc_resp.status_code == 200
-        assert len(acc_resp.json()) >= 2
+            await call_live(
+                "POST",
+                f"/api/v1/places/trip/{trip_id}/select",
+                headers=headers,
+                json={"place_id": p1["id"], "selected": True},
+            )
 
-        gallery = (
-            await call_live("GET", f"/api/v1/places/trip/{trip_id}/gallery", headers=headers)
-        ).json()
-        assert gallery["unlocked"] is True
-        p1, p2 = gallery["places"][0], gallery["places"][1]
+            # 5. Planification valide, puis refus hors séjour, puis refus chevauchement
+            ok_visit = await call_live(
+                "POST",
+                "/api/v1/itinerary/items",
+                headers=headers,
+                json={
+                    "trip_id": trip_id,
+                    "place_id": p1["id"],
+                    "visit_date": "2026-11-11",
+                    "local_start_time": "10:00",
+                    "duration_minutes": 90,
+                    "transit_mode": "METRO",
+                },
+            )
+            assert ok_visit.status_code == 201
 
-        await call_live(
-            "POST",
-            f"/api/v1/places/trip/{trip_id}/select",
-            headers=headers,
-            json={"place_id": p1["id"], "selected": True},
-        )
+            err_outside = await call_live(
+                "POST",
+                "/api/v1/itinerary/items",
+                headers=headers,
+                json={
+                    "trip_id": trip_id,
+                    "place_id": p2["id"],
+                    "visit_date": "2026-11-25",
+                    "local_start_time": "10:00",
+                    "duration_minutes": 90,
+                    "transit_mode": "METRO",
+                },
+            )
+            assert err_outside.status_code == 422
+            assert err_outside.json()["detail"]["reason_code"] == "OUTSIDE_TRIP_WINDOW"
 
-        # 5. Planification valide, puis refus hors séjour, puis refus chevauchement
-        ok_visit = await call_live(
-            "POST",
-            "/api/v1/itinerary/items",
-            headers=headers,
-            json={
-                "trip_id": trip_id,
-                "place_id": p1["id"],
-                "visit_date": "2026-11-11",
-                "local_start_time": "10:00",
-                "duration_minutes": 90,
-                "transit_mode": "METRO",
-            },
-        )
-        assert ok_visit.status_code == 201
+            err_overlap = await call_live(
+                "POST",
+                "/api/v1/itinerary/items",
+                headers=headers,
+                json={
+                    "trip_id": trip_id,
+                    "place_id": p2["id"],
+                    "visit_date": "2026-11-11",
+                    "local_start_time": "10:30",
+                    "duration_minutes": 90,
+                    "transit_mode": "METRO",
+                },
+            )
+            assert err_overlap.status_code == 422
+            assert err_overlap.json()["detail"]["reason_code"] == "OVERLAPPING_VISIT"
 
-        err_outside = await call_live(
-            "POST",
-            "/api/v1/itinerary/items",
-            headers=headers,
-            json={
-                "trip_id": trip_id,
-                "place_id": p2["id"],
-                "visit_date": "2026-11-25",
-                "local_start_time": "10:00",
-                "duration_minutes": 90,
-                "transit_mode": "METRO",
-            },
-        )
-        assert err_outside.status_code == 422
-        assert err_outside.json()["detail"]["reason_code"] == "OUTSIDE_TRIP_WINDOW"
-
-        err_overlap = await call_live(
-            "POST",
-            "/api/v1/itinerary/items",
-            headers=headers,
-            json={
-                "trip_id": trip_id,
-                "place_id": p2["id"],
-                "visit_date": "2026-11-11",
-                "local_start_time": "10:30",
-                "duration_minutes": 90,
-                "transit_mode": "METRO",
-            },
-        )
-        assert err_overlap.status_code == 422
-        assert err_overlap.json()["detail"]["reason_code"] == "OVERLAPPING_VISIT"
-
-        await call_live("GET", f"/api/v1/itinerary/trip/{trip_id}", headers=headers)
-        await call_live("GET", f"/api/v1/transports/trip/{trip_id}", headers=headers)
+            await call_live("GET", f"/api/v1/itinerary/trip/{trip_id}", headers=headers)
+            await call_live("GET", f"/api/v1/transports/trip/{trip_id}", headers=headers)
+    finally:
+        cleanup_res = cleanup_and_verify_cascade_for_emails([email])
+        assert cleanup_res["cascade_verified"] is True
 
 
 def _resolve_frontend_dir() -> Path:

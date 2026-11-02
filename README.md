@@ -107,7 +107,7 @@ Vous pouvez personnaliser optionnellement dans `.env` :
 
 ## Lancement des tests
 
-Les tests s'exécutent directement dans le conteneur Docker `backend` (incluant les tests unitaires, les tests d'intégration FastAPI/PostGIS/Redis et les tests E2E navigateur **Playwright**).
+Les tests (unitaires, intégration FastAPI/PostGIS/Redis et E2E navigateur **Playwright**) utilisent une base PostgreSQL dédiée **`travelmate_test`** (jamais `travelmate_db`), créée automatiquement au début de la session de test avec les migrations Alembic appliquées (`alembic upgrade head`) et détruite à la fin de la session (`DROP DATABASE IF EXISTS travelmate_test WITH (FORCE)`). Les tests Playwright ciblent une instance dédiée de l'application branchée sur `travelmate_test` et nettoient en cascade leurs comptes et séjours à la fin de chaque test. Un test de garde échoue si `travelmate_db` contient des comptes `playwright.*` après la suite.
 
 1. **Vérifier qu'Alembic possède une seule tête de migration** :
 
@@ -115,16 +115,22 @@ Les tests s'exécutent directement dans le conteneur Docker `backend` (incluant 
 docker compose exec -T backend alembic heads
 ```
 
-2. **Lancer la suite complète (Backend + Playwright dans Docker)** :
+2. **Lancer la suite complète (Backend + Playwright) via le profil Docker dédié `test`** :
+
+```bash
+docker compose --profile test run --rm backend-test
+```
+
+*(Alternative équivalente dans le conteneur `backend` en cours d'exécution, qui isole également la session sur `travelmate_test` :)*
 
 ```bash
 docker compose exec -T backend pytest -q tests /frontend/tests/test_itinerary_layout_playwright.py -rs
 ```
 
-3. **Lancer uniquement les tests backend** :
+3. **Lancer uniquement les tests backend (sur `travelmate_test`)** :
 
 ```bash
-docker compose exec -T backend pytest -q tests
+docker compose exec -T backend pytest -q tests -rs
 ```
 
 ---

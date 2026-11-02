@@ -197,7 +197,7 @@ class TripStage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
     trip: Mapped["Trip"] = relationship("Trip", back_populates="stages")
-    destination: Mapped["Destination"] = relationship("Destination")
+    destination: Mapped["Destination"] = relationship("Destination", lazy="joined")
 
     @property
     def country(self) -> str:
@@ -206,6 +206,34 @@ class TripStage(Base):
     @property
     def budget_planned(self) -> float | None:
         return self.planned_budget
+
+    @property
+    def latitude(self) -> float:
+        override = getattr(self, "_latitude", None)
+        if override is not None:
+            return float(override)
+        dest = self.__dict__.get("destination")
+        if dest is not None and getattr(dest, "latitude", None) is not None:
+            return float(dest.latitude)
+        return 0.0
+
+    @latitude.setter
+    def latitude(self, value: float | None) -> None:
+        self._latitude = float(value) if value is not None else None
+
+    @property
+    def longitude(self) -> float:
+        override = getattr(self, "_longitude", None)
+        if override is not None:
+            return float(override)
+        dest = self.__dict__.get("destination")
+        if dest is not None and getattr(dest, "longitude", None) is not None:
+            return float(dest.longitude)
+        return 0.0
+
+    @longitude.setter
+    def longitude(self, value: float | None) -> None:
+        self._longitude = float(value) if value is not None else None
 
 
 class TripMember(Base):
@@ -609,4 +637,8 @@ class ChatUnrecognized(Base):
     reason: Mapped[str] = mapped_column(String(100), default="UNRECOGNIZED_INTENT", nullable=False)
     assistant_reply: Mapped[str] = mapped_column(Text, default="", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+Stage = TripStage
+PlannedVisit = ItineraryItem
 

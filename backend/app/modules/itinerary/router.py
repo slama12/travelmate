@@ -351,14 +351,27 @@ def _resolve_stage_context_for_visit(
         place=place,
         stage_id=stage_id,
     )
-    # Si stage_id n'est pas fourni et que le lieu appartient uniquement à une autre étape du voyage,
-    # on rattache la validation à l'étape de la ville du lieu (ce qui refusera proprement une date hors étape).
-    if stage_id is None and target_stage is not None and place.destination_id != target_stage.destination_id:
+    # Si le lieu appartient à une ville d'une autre étape que celle résolue par la date (ou stage_id),
+    # on rattache la validation à l'étape locale de la ville du lieu afin que la visite soit contrôlée
+    # par rapport aux dates/heures de cette étape locale (et refusée si la date déborde hors de l'étape).
+    if target_stage is not None and place.destination_id != target_stage.destination_id:
         matching_place_stages = [
             (idx, st) for idx, st in enumerate(stages) if st.destination_id == place.destination_id
         ]
-        if len(matching_place_stages) == 1:
-            stage_idx, target_stage = matching_place_stages[0]
+        if matching_place_stages:
+            ref_date = visit_date
+            if ref_date is None and start_at is not None:
+                ref_date = ensure_utc(start_at).date()
+            if ref_date is not None:
+                stage_idx, target_stage = min(
+                    matching_place_stages,
+                    key=lambda pair: min(
+                        abs((ref_date - pair[1].arrival_date).days),
+                        abs((ref_date - pair[1].departure_date).days),
+                    ),
+                )
+            else:
+                stage_idx, target_stage = matching_place_stages[0]
 
     assert target_stage is not None
     stage_tz = target_stage.timezone or default_tz or "UTC"
@@ -651,9 +664,13 @@ async def create_itinerary_item(
 
 
 @router.patch("/items/{item_id}", response_model=ItineraryItemResponse)
+@router.put("/items/{item_id}", response_model=ItineraryItemResponse)
+@router.patch("/trip/{trip_id}/items/{item_id}", response_model=ItineraryItemResponse)
+@router.put("/trip/{trip_id}/items/{item_id}", response_model=ItineraryItemResponse)
 async def update_or_move_itinerary_item(
     item_id: str,
     payload: ItineraryItemUpdateRequest,
+    trip_id: str | None = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ItineraryItemResponse:

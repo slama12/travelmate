@@ -10,6 +10,44 @@ export default defineConfig({
       configureServer(server) {
         server.middlewares.use("/__rendered_pages", async (_req, res) => {
           try {
+            if (
+              typeof (globalThis as any).window === "undefined" ||
+              !(globalThis as any).window.localStorage
+            ) {
+              const fakeStorage = {
+                getItem: () => null,
+                setItem: () => {},
+                removeItem: () => {},
+                clear: () => {},
+              };
+              const fakeDoc = {
+                createElement: () => ({
+                  style: {},
+                  setAttribute: () => {},
+                  getElementsByTagName: () => [],
+                }),
+                documentElement: { style: {} },
+                getElementsByTagName: () => [],
+                body: { style: {} },
+              };
+              (globalThis as any).window = {
+                __SSR_SHIM__: true,
+                screen: {},
+                devicePixelRatio: 1,
+                navigator: { userAgent: "node-ssr", platform: "linux" },
+                document: fakeDoc,
+                localStorage: fakeStorage,
+                sessionStorage: fakeStorage,
+              };
+              (globalThis as any).document = fakeDoc;
+              (globalThis as any).localStorage = fakeStorage;
+              (globalThis as any).sessionStorage = fakeStorage;
+              try {
+                (globalThis as any).navigator = (globalThis as any).window.navigator;
+              } catch {
+                // Node 21+ defines globalThis.navigator as a getter
+              }
+            }
             const mod = await server.ssrLoadModule("/src/App.tsx");
             const payload = mod.renderTravelerPagesForInspection();
             res.statusCode = 200;

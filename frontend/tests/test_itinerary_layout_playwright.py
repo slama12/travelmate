@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -8,7 +9,22 @@ import sys
 import time
 from typing import Any
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright as _raw_sync_playwright
+from sqlalchemy import create_engine, text
+
+_BACKEND_DIR = Path(__file__).resolve().parents[2] / "backend"
+if not _BACKEND_DIR.exists():
+    _BACKEND_DIR = Path("/app")
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_DIR))
+
+from tests.test_db_lifecycle import (  # noqa: E402
+    SEED_DEMO_EMAIL,
+    TEST_DB_NAME,
+    cleanup_and_verify_cascade_for_emails,
+    reset_travelmate_test_state_sync,
+    setup_travelmate_test_database,
+)
 
 WIDTHS = (390, 768, 1024, 1280, 1440)
 ARTIFACT_DIR = Path(
@@ -26,7 +42,86 @@ CHROME_EXE = os.getenv(
     else "/usr/bin/chromium",
 )
 BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
-API_URL = os.getenv("VITE_API_BASE_URL", "http://localhost:8000")
+TEST_API_PORT = int(os.getenv("TEST_API_PORT", "8001"))
+API_URL = os.getenv("TEST_API_BASE_URL", f"http://localhost:{TEST_API_PORT}")
+
+
+def _cleanup_playwright_test_db_cascade(test_sync_url: str) -> None:
+    """
+    Nettoie tous les comptes et séjours créés par Playwright dans travelmate_test
+    en vérifiant la suppression en cascade (users -> trips -> tables enfants).
+    """
+    eng = create_engine(test_sync_url)
+    try:
+        with eng.connect() as conn:
+            rows = conn.execute(
+                text("SELECT email FROM users WHERE email <> :demo_email"),
+                {"demo_email": SEED_DEMO_EMAIL},
+            ).fetchall()
+            emails = [str(r[0]) for r in rows]
+    finally:
+        eng.dispose()
+
+    if emails:
+        res = cleanup_and_verify_cascade_for_emails(emails, db_sync_url=test_sync_url)
+        assert res["cascade_verified"] is True
+
+    reset_travelmate_test_state_sync()
+
+
+@contextmanager
+def sync_playwright():
+    """
+    Gestionnaire de contexte Playwright isolé :
+    - Garantit que la base dédiée 'travelmate_test' et le serveur de test Uvicorn sont actifs
+    - Redirige tous les appels fetch du navigateur vers l'instance branchée sur 'travelmate_test'
+    - Nettoie en cascade les comptes et séjours créés à la fin du test
+    """
+    test_sync_url, _, _ = setup_travelmate_test_database()
+    assert TEST_DB_NAME in test_sync_url and "travelmate_db" not in test_sync_url
+    reset_travelmate_test_state_sync()
+
+    with _raw_sync_playwright() as p:
+        orig_launch = p.chromium.launch
+
+        def _isolated_launch(*args: Any, **kwargs: Any):
+            browser = orig_launch(*args, **kwargs)
+            orig_new_context = browser.new_context
+
+            def _isolated_new_context(*c_args: Any, **c_kwargs: Any):
+                ctx = orig_new_context(*c_args, **c_kwargs)
+                ctx.add_init_script(
+                    f"""(() => {{
+                      const testApiBase = {json.dumps(API_URL)};
+                      const origFetch = window.fetch.bind(window);
+                      window.fetch = function(input, init) {{
+                        if (typeof input === "string") {{
+                          input = input.replace(
+                            /^https?:\\/\\/(localhost|127\\.0\\.0\\.1):8000\\b/,
+                            testApiBase
+                          );
+                        }} else if (typeof URL !== "undefined" && input instanceof URL) {{
+                          input = new URL(
+                            input.toString().replace(
+                              /^https?:\\/\\/(localhost|127\\.0\\.0\\.1):8000\\b/,
+                              testApiBase
+                            )
+                          );
+                        }}
+                        return origFetch(input, init);
+                      }};
+                    }})();"""
+                )
+                return ctx
+
+            browser.new_context = _isolated_new_context  # type: ignore[method-assign]
+            return browser
+
+        p.chromium.launch = _isolated_launch  # type: ignore[method-assign]
+        try:
+            yield p
+        finally:
+            _cleanup_playwright_test_db_cascade(test_sync_url)
 
 
 def _boxes_overlap(a: dict[str, Any], b: dict[str, Any], tolerance_px: float = 1.5) -> bool:
@@ -35,12 +130,54 @@ def _boxes_overlap(a: dict[str, Any], b: dict[str, Any], tolerance_px: float = 1
     return overlap_x and overlap_y
 
 
-def _ensure_wsl_bridge() -> subprocess.Popen[Any] | None:
+_SHARED_BRIDGE_PROC: subprocess.Popen[Any] | None = None
+
+
+class _BridgeHandle:
+    """Poignée compatible avec bridge_proc.terminate() qui conserve le pont TCP actif entre les tests."""
+
+    def terminate(self) -> None:
+        pass
+
+
+def _stop_shared_bridge() -> None:
+    global _SHARED_BRIDGE_PROC
+    if _SHARED_BRIDGE_PROC is not None:
+        try:
+            if _SHARED_BRIDGE_PROC.poll() is None:
+                _SHARED_BRIDGE_PROC.terminate()
+                _SHARED_BRIDGE_PROC.wait(timeout=3.0)
+        except Exception:
+            pass
+        finally:
+            _SHARED_BRIDGE_PROC = None
+
+
+import atexit as _atexit
+import socket as _socket
+
+_atexit.register(_stop_shared_bridge)
+
+
+def _is_port_open(host: str, port: int) -> bool:
+    try:
+        with _socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_wsl_bridge() -> Any:
     """
     Sous Docker (Linux), redirige 127.0.0.1:5173 vers frontend:5173 pour que Chromium
     accède au frontend et au backend sur la même origine localhost.
+    Maintient un pont persistant unique sur toute la session pour éviter tout conflit de port entre tests.
     """
+    global _SHARED_BRIDGE_PROC
     if os.name != "nt":
+        if _SHARED_BRIDGE_PROC is not None and _SHARED_BRIDGE_PROC.poll() is None and _is_port_open("127.0.0.1", 5173):
+            return _BridgeHandle()
+
         forwarder_code = (
             "import asyncio\n"
             "async def pipe(r, w):\n"
@@ -59,17 +196,20 @@ def _ensure_wsl_bridge() -> subprocess.Popen[Any] | None:
             "        try: cw.close()\n"
             "        except Exception: pass\n"
             "async def main():\n"
-            "    srv = await asyncio.start_server(handle, '127.0.0.1', 5173)\n"
+            "    srv = await asyncio.start_server(handle, '127.0.0.1', 5173, reuse_address=True)\n"
             "    async with srv: await srv.serve_forever()\n"
             "asyncio.run(main())\n"
         )
-        proc = subprocess.Popen(
+        _SHARED_BRIDGE_PROC = subprocess.Popen(
             [sys.executable, "-c", forwarder_code],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(0.5)
-        return proc
+        for _ in range(20):
+            if _is_port_open("127.0.0.1", 5173):
+                break
+            time.sleep(0.1)
+        return _BridgeHandle()
 
     bridge_script = ARTIFACT_DIR / "scratch" / "wsl_port_bridge.py"
     if not bridge_script.exists():
@@ -1343,6 +1483,7 @@ def test_world_cities_step1_geonames_search_create_and_fallback_playwright() -> 
 
             page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
             page.wait_for_selector('[data-testid="home-destination-input"]', timeout=15000)
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
 
             # Authentification pour permettre la création du séjour sur la ville hors seed
             page.evaluate(
@@ -2658,6 +2799,197 @@ def test_accommodations_and_flights_milan_monastir_paris_sydney_paris_lyon_playw
             bridge_proc.terminate()
 
 
+def test_multi_city_trip_builder_no_overlap_and_react_leaflet_map_playwright() -> None:
+    """
+    Vérifie dans Chromium (Playwright) :
+    1. Le formulaire React de création/édition d'un voyage multi-villes permet d'ajouter
+       plusieurs destinations avec leurs dates respectives et bloque tout chevauchement de dates.
+    2. La carte interactive react-leaflet sur la vue détaillée du voyage (/trip et /itinerary) :
+       - Affiche un marqueur distinct (.tm-stage-marker-pin) pour chaque ville/étape,
+       - Trace une polyligne (.tm-itinerary-stage-polyline) reliant les étapes dans l'ordre chronologique,
+       - Affiche des marqueurs secondaires (.tm-visit-marker-pin) pour les lieux à visiter (PlannedVisit) validés.
+    """
+    bridge_proc = _ensure_wsl_bridge()
+    try:
+        with sync_playwright() as p:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": ["--disable-gpu", "--no-sandbox"],
+            }
+            if Path(CHROME_EXE).exists():
+                launch_kwargs["executable_path"] = CHROME_EXE
+
+            browser = p.chromium.launch(**launch_kwargs)
+            context = browser.new_context(viewport={"width": 1440, "height": 900})
+            page = context.new_page()
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="popular-destinations-grid"]', timeout=15000)
+
+            seed_data = page.evaluate(
+                """async (apiUrl) => {
+                  const email = "playwright.multicity.map." + Date.now() + "@travelmate.app";
+                  const regResp = await fetch(apiUrl + "/api/v1/auth/register", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      email,
+                      full_name: "Voyageur Multi Villes Carte",
+                      password: "PasswordStep4!2026",
+                      preferred_style: "STANDARD"
+                    })
+                  });
+                  const regData = await regResp.json();
+                  const token = regData.access_token;
+                  localStorage.setItem("travelmate_jwt_token", token);
+                  localStorage.setItem("travelmate_test_jwt", token);
+                  localStorage.setItem("travelmate_user_profile", JSON.stringify(regData.user));
+
+                  const destsResp = await fetch(apiUrl + "/api/v1/destinations");
+                  const dests = await destsResp.json();
+                  const marrakech = dests.find((d) => d.city_name === "Marrakech") || dests[0];
+                  return { token, marrakech };
+                }""",
+                API_URL,
+            )
+            token = seed_data["token"]
+            marrakech_dest = seed_data["marrakech"]
+
+            page.goto(f"{BASE_URL}/", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="toggle-multi-city-mode-btn"]', timeout=15000)
+
+            # 1. Ouvre le constructeur multi-villes sur la page d'accueil
+            page.click('[data-testid="toggle-multi-city-mode-btn"]')
+            page.wait_for_selector('[data-testid="multi-city-stage-row-1"]', timeout=10000)
+
+            # Vérifie que 2 étapes initiales sans chevauchement sont proposées
+            assert page.locator('[data-testid^="multi-city-stage-row-"]').count() == 2
+
+            # Fixe les dates de l'étape 1 (10 -> 13 nov 2026) puis simule un chevauchement sur l'étape 2 (arrivée le 11 nov 2026)
+            page.fill('[data-testid="stage-arrival-date-1"]', "2026-11-10")
+            page.fill('[data-testid="stage-departure-date-1"]', "2026-11-13")
+            page.fill('[data-testid="stage-arrival-date-2"]', "2026-11-11")
+            page.fill('[data-testid="stage-departure-date-2"]', "2026-11-16")
+            page.wait_for_selector('[data-testid="multi-city-date-error"]', timeout=5000)
+            err_text = page.locator('[data-testid="multi-city-date-error"]').inner_text()
+            assert "chevauche" in err_text.lower()
+            assert page.locator('[data-testid="create-multi-city-trip-btn"]').is_disabled()
+
+            # Corrige la date d'arrivée de l'étape 2 à 2026-11-13 (sans chevauchement) et crée le voyage
+            page.fill('[data-testid="stage-arrival-date-2"]', "2026-11-13")
+            page.fill('[data-testid="stage-departure-date-2"]', "2026-11-16")
+            assert page.locator('[data-testid="multi-city-date-error"]').count() == 0
+            assert not page.locator('[data-testid="create-multi-city-trip-btn"]').is_disabled()
+
+            page.click('[data-testid="create-multi-city-trip-btn"]')
+            page.wait_for_url("**/trip", timeout=15000)
+            page.wait_for_selector('[data-testid="trip-multi-city-map-card"]', timeout=15000)
+            page.wait_for_selector('[data-testid="trip-stages-manager-card"]', timeout=15000)
+
+            # 2. Ajoute une visite validée (PlannedVisit) sur l'étape 1 du voyage nouvellement créé
+            active_trip_id = page.evaluate("() => localStorage.getItem('travelmate_active_trip_id')")
+            assert active_trip_id
+            visit_added = page.evaluate(
+                """async ([apiUrl, tripId, tk]) => {
+                  const tripResp = await fetch(apiUrl + "/api/v1/trips/" + tripId, {
+                    headers: { "Authorization": "Bearer " + tk }
+                  });
+                  const trip = await tripResp.json();
+                  const stage1City = (trip.stages && trip.stages[0] && trip.stages[0].city_name) || "Paris";
+                  const placesResp = await fetch(
+                    apiUrl + "/api/v1/places/city/" + encodeURIComponent(stage1City),
+                    { headers: { "Authorization": "Bearer " + tk } }
+                  );
+                  const placesData = placesResp.ok ? await placesResp.json() : {};
+                  const places = Array.isArray(placesData) ? placesData : (placesData.places || []);
+                  if (places.length > 0) {
+                    const itemResp = await fetch(apiUrl + "/api/v1/itinerary/items", {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + tk
+                      },
+                      body: JSON.stringify({
+                        trip_id: tripId,
+                        place_id: places[0].id,
+                        visit_date: "2026-11-11",
+                        local_start_time: "10:00",
+                        duration_minutes: 90,
+                        transit_mode: "WALK"
+                      })
+                    });
+                    return { status: itemResp.status, body: await itemResp.json() };
+                  }
+                  return { status: 0, body: placesData };
+                }""",
+                [API_URL, active_trip_id, token],
+            )
+            assert visit_added["status"] in (200, 201), f"Échec ajout visite validée: {visit_added}"
+
+            # Recharge /trip et vérifie la carte react-leaflet (marqueurs d'étapes, polyligne, marqueur secondaire de visite)
+            page.goto(f"{BASE_URL}/trip", wait_until="domcontentloaded", timeout=20000)
+            page.wait_for_selector('[data-testid="trip-multi-city-map-leaflet"]', timeout=15000)
+            page.wait_for_selector(".tm-stage-marker-pin", timeout=15000)
+            page.wait_for_selector(".tm-itinerary-stage-polyline", timeout=15000)
+            page.wait_for_selector(".tm-visit-marker-pin", timeout=15000)
+
+            map_stats = page.evaluate(
+                """() => {
+                    const stagePins = Array.from(document.querySelectorAll('.tm-stage-marker-pin')).map(el => el.getAttribute('data-stage-order') || (el.textContent || '').trim());
+                    const polylines = document.querySelectorAll('.tm-itinerary-stage-polyline').length;
+                    const visitPins = document.querySelectorAll('.tm-visit-marker-pin').length;
+                    return { stagePins, polylines, visitPins };
+                }"""
+            )
+            assert map_stats["stagePins"] == ["1", "2"], f"Attendu 2 marqueurs d'étapes [1, 2], obtenu {map_stats['stagePins']}"
+            assert map_stats["polylines"] >= 1, "La polyligne reliant les étapes doit être présente sur la carte"
+            assert map_stats["visitPins"] >= 1, "Au moins un marqueur secondaire de visite validée (PlannedVisit) doit être affiché"
+
+            # 3. Ajoute une 3e étape depuis le gestionnaire d'étapes sur /trip et vérifie que la carte passe à 3 marqueurs d'étapes
+            page.click('[data-testid="trip-add-stage-open-btn"]')
+            page.wait_for_selector('[data-testid="trip-add-stage-form"]', timeout=5000)
+            page.click('[data-testid="new-stage-submit-btn"]')
+            page.wait_for_function(
+                "() => document.querySelectorAll('.tm-stage-marker-pin').length === 3",
+                timeout=10000,
+            )
+
+            browser.close()
+    finally:
+        if bridge_proc is not None:
+            bridge_proc.terminate()
+
+
+def test_z_dev_database_has_no_playwright_accounts_after_suite() -> None:
+    """
+    Vérifie à la fin de la suite Playwright :
+    1. Que le service de test pointe bien vers 'travelmate_test' (jamais 'travelmate_db').
+    2. Que la suppression en cascade d'un compte 'playwright.*' dans 'travelmate_test'
+       supprime l'utilisateur, ses séjours et ses réservations/visites liées.
+    3. Que la base de développement ('travelmate_db') ne contient aucun compte 'playwright.*'.
+    """
+    test_sync_url, test_async_url, dev_sync_url = setup_travelmate_test_database()
+    assert TEST_DB_NAME in test_sync_url and "travelmate_db" not in test_sync_url
+    assert TEST_DB_NAME in test_async_url and "travelmate_db" not in test_async_url
+    assert "travelmate_db" in dev_sync_url
+
+    # Vérifie que la base de développement ne contient aucun compte playwright.*
+    dev_engine = create_engine(dev_sync_url)
+    try:
+        with dev_engine.connect() as conn:
+            playwright_rows = conn.execute(
+                text("SELECT email FROM users WHERE lower(email) LIKE 'playwright.%'")
+            ).fetchall()
+            playwright_emails = [str(r[0]) for r in playwright_rows]
+    finally:
+        dev_engine.dispose()
+
+    assert playwright_emails == [], (
+        f"La base de développement travelmate_db contient des comptes playwright.* après la suite : "
+        f"{playwright_emails}"
+    )
+
+
 if __name__ == "__main__":
     test_mon_programme_layout_5_widths_playwright()
     test_real_chat_marrakech_jardin_secret_medina_and_single_row_header()
@@ -2666,8 +2998,6 @@ if __name__ == "__main__":
     test_home_barcelone_geonames_autocomplete_visible_clickable_no_timezone_playwright()
     test_world_places_step3_photos_visible_credit_and_no_layout_shift_playwright()
     test_accommodations_and_flights_milan_monastir_paris_sydney_paris_lyon_playwright()
-
-
-
-
+    test_multi_city_trip_builder_no_overlap_and_react_leaflet_map_playwright()
+    test_z_dev_database_has_no_playwright_accounts_after_suite()
 

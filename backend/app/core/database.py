@@ -135,6 +135,19 @@ def AsyncSessionLocal() -> AsyncSession:
     return AsyncSession(_SyncSessionLocal())
 
 
+def rebind_database_engine(database_url: str) -> CompatAsyncEngine:
+    """Rebranche le moteur SQLAlchemy et la fabrique de sessions sur une nouvelle URL (ex: travelmate_test)."""
+    new_engine = build_async_engine(database_url)
+    try:
+        engine.sync_engine.dispose()
+    except Exception:
+        pass
+    engine.sync_engine = new_engine.sync_engine
+    engine.dialect = new_engine.dialect
+    _SyncSessionLocal.configure(bind=new_engine.sync_engine)
+    return engine
+
+
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         yield session

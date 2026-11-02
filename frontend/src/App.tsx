@@ -20,6 +20,7 @@ import { DayPicker, type DateRange } from "react-day-picker";
 import { format, parseISO } from "date-fns";
 import { fr } from "date-fns/locale";
 import {
+  AlertCircle,
   ArrowRight,
   Calendar as CalendarIcon,
   CheckCircle2,
@@ -65,6 +66,13 @@ import {
   type TripGalleryPayload,
   TripPracticalInfoScreen,
 } from "./EnvoiCScreens";
+import {
+  HomeMultiCityBuilder,
+  validateDraftStagesNoOverlap,
+  addDaysIso,
+  diffDaysIso,
+  type DraftStageFormItem,
+} from "./MultiCityComponents";
 
 const RAW_API_BASE = String(
   (import.meta as any).env?.VITE_API_BASE_URL || "http://localhost:8000"
@@ -799,6 +807,34 @@ function GeoNamesCityAutocompleteField({
 /* ============================================================================
  * 1. ÉCRAN ACCUEIL (/)
  * ========================================================================== */
+function normalizeIsoDateInput(raw: string, fallbackIso: string): string {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) return fallbackIso;
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+  }
+  const frMatch = trimmed.match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})$/);
+  if (frMatch) {
+    return `${frMatch[3]}-${frMatch[2]}-${frMatch[1]}`;
+  }
+  const parsed = new Date(trimmed);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+  return fallbackIso;
+}
+
+function normalizeCityLookupText(raw: string): string {
+  return String(raw || "")
+    .replace(/^Région\s*:\s*/i, "")
+    .split(/[,•\(\-]/)[0]
+    .trim()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
 function HomeScreen({
   destinations,
   isLoadingDestinations,
@@ -810,6 +846,7 @@ function HomeScreen({
   onSelectDestinationAndSearch,
   onRegisterCreatedDestination,
   initialUnavailableCity = null,
+  onCreateMultiCityTrip,
 }: {
   destinations: Destination[];
   isLoadingDestinations: boolean;
@@ -821,6 +858,10 @@ function HomeScreen({
   onSelectDestinationAndSearch: (dest: Destination) => Promise<void>;
   onRegisterCreatedDestination?: (dest: Destination) => void;
   initialUnavailableCity?: string | null;
+  onCreateMultiCityTrip?: (
+    stages: DraftStageFormItem[],
+    targetRoute?: "/flights" | "/trip"
+  ) => Promise<void>;
 }) {
   const [cityQuery, setCityQuery] = useState<string>("");
   const [autocompleteOpen, setAutocompleteOpen] = useState<boolean>(false);
@@ -829,6 +870,7 @@ function HomeScreen({
   const [unavailableCity, setUnavailableCity] = useState<string | null>(
     initialUnavailableCity
   );
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [geonamesResults, setGeonamesResults] = useState<GeoNamesCitySearchItem[]>([]);
   const [selectedGeoCity, setSelectedGeoCity] = useState<GeoNamesCitySearchItem | null>(
     null
@@ -838,6 +880,8 @@ function HomeScreen({
     string | null
   >(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const [multiCityEnabled, setMultiCityEnabled] = useState<boolean>(false);
+  const [multiCitySubmitError, setMultiCitySubmitError] = useState<string>("");
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
 
   const popularDestinations = useMemo(() => {
@@ -847,10 +891,63 @@ function HomeScreen({
     return seedList.length > 0 ? seedList : destinations.slice(0, 5);
   }, [destinations]);
 
+  const [draftStages, setDraftStages] = useState<DraftStageFormItem[]>([]);
+  useEffect(() => {
+    if (draftStages.length === 0 && popularDestinations.length > 0) {
+      const firstDest =
+        popularDestinations.find((d) => d.city_name === "Marrakech") ||
+        popularDestinations[0];
+      const secondDest =
+        popularDestinations.find(
+          (d) =>
+            d.id !== firstDest.id &&
+            d.city_name.toLowerCase() !== firstDest.city_name.toLowerCase()
+        ) || null;
+      const arr1 = normalizeIsoDateInput(departureDate, "2026-11-10");
+      const dep1 = addDaysIso(arr1, 3);
+      const normRet = normalizeIsoDateInput(returnDate, addDaysIso(dep1, 4));
+      const dep2 = diffDaysIso(dep1, normRet) > 0 ? normRet : addDaysIso(dep1, 4);
+      setDraftStages([
+        {
+          key: "stage-init-1",
+          destination_id: firstDest.id,
+          city_name: firstDest.city_name,
+          country_name: firstDest.country_name || "Maroc",
+          country_code_iso2: firstDest.country_code_iso2 || "MA",
+          timezone: firstDest.timezone || "Africa/Casablanca",
+          latitude: firstDest.latitude,
+          longitude: firstDest.longitude,
+          iata_code: firstDest.iata_code,
+          arrival_date: arr1,
+          departure_date: dep1,
+          nights: Math.max(1, diffDaysIso(arr1, dep1)),
+          arrival_transport_mode: "VOL",
+        },
+        {
+          key: "stage-init-2",
+          destination_id: secondDest ? secondDest.id : undefined,
+          city_name: secondDest ? secondDest.city_name : "Rome",
+          country_name: secondDest ? secondDest.country_name || "Italie" : "Italie",
+          country_code_iso2: secondDest ? secondDest.country_code_iso2 || "IT" : "IT",
+          timezone: secondDest ? secondDest.timezone || "Europe/Rome" : "Europe/Rome",
+          latitude: secondDest ? secondDest.latitude : 41.9028,
+          longitude: secondDest ? secondDest.longitude : 12.4964,
+          iata_code: secondDest ? secondDest.iata_code : "FCO",
+          arrival_date: dep1,
+          departure_date: dep2,
+          nights: Math.max(1, diffDaysIso(dep1, dep2)),
+          arrival_transport_mode: "TRAIN",
+        },
+      ]);
+    }
+  }, [popularDestinations, departureDate, returnDate, draftStages.length]);
+
   const selectedRange: DateRange = useMemo(() => {
+    const depIso = normalizeIsoDateInput(departureDate, "2026-11-10");
+    const retIso = normalizeIsoDateInput(returnDate, "2026-11-17");
     return {
-      from: departureDate ? parseISO(departureDate) : parseISO("2026-11-10"),
-      to: returnDate ? parseISO(returnDate) : parseISO("2026-11-17"),
+      from: parseISO(depIso),
+      to: parseISO(retIso),
     };
   }, [departureDate, returnDate]);
 
@@ -966,11 +1063,13 @@ function HomeScreen({
   async function resolveGeoCityToDestination(
     item: GeoNamesCitySearchItem
   ): Promise<Destination | null> {
-    const cleanCityName = item.nom.replace(/^Région\s*:\s*/i, "").trim();
+    const rawName = String(item.nom || (item as any).city_name || "").trim();
+    const cleanCityName = rawName.replace(/^Région\s*:\s*/i, "").trim();
+    const cleanLookup = normalizeCityLookupText(cleanCityName);
     const existingSeed = destinations.find(
       (d) =>
         (item.destination_id && d.id === item.destination_id) ||
-        d.city_name.trim().toLowerCase() === cleanCityName.toLowerCase()
+        normalizeCityLookupText(d.city_name) === cleanLookup
     );
     if (
       existingSeed &&
@@ -979,21 +1078,37 @@ function HomeScreen({
       return existingSeed;
     }
 
+    const rawIata = String(
+      item.iata_code || (item as any).nearest_airport_iata || ""
+    ).trim();
+    const validIata = rawIata.length === 3 ? rawIata.toUpperCase() : undefined;
+    const rawCountryIso2 = String(
+      item.code_pays || (item as any).country_code_iso2 || "XX"
+    )
+      .trim()
+      .toUpperCase()
+      .slice(0, 2);
+    const rawCoords = item.coordonnees || {
+      latitude: (item as any).latitude ?? 48.8566,
+      longitude: (item as any).longitude ?? 2.3522,
+    };
+
     try {
       const resp = await fetch(`${API_BASE}/api/v1/destinations/resolve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          geonameId: item.geonameId,
+          geonameId: item.geonameId ?? (item as any).geoname_id ?? null,
           nom: cleanCityName,
-          pays: item.pays,
-          code_pays: item.code_pays,
+          pays: item.pays || (item as any).country_name || "Monde",
+          code_pays: rawCountryIso2.length === 2 ? rawCountryIso2 : "XX",
           region: item.region || item.region_name || null,
           sous_titre: item.sous_titre || null,
-          coordonnees: item.coordonnees,
-          fuseau_horaire: item.fuseau_horaire,
-          population: item.population,
-          iata_code: item.iata_code,
+          coordonnees: rawCoords,
+          fuseau_horaire:
+            item.fuseau_horaire || (item as any).timezone || "Europe/Paris",
+          population: item.population || 0,
+          ...(validIata ? { iata_code: validIata } : {}),
         }),
       });
       if (resp.ok) {
@@ -1001,47 +1116,142 @@ function HomeScreen({
         onRegisterCreatedDestination?.(resolvedDest);
         return resolvedDest;
       }
-    } catch {
-      // Fallback sur existingSeed si erreur réseau
+      if (!existingSeed) {
+        const errBody = await resp.json().catch(() => null);
+        throw new Error(
+          humanErrorMessage(
+            errBody,
+            `Impossible de préparer la destination « ${cleanCityName} ».`
+          )
+        );
+      }
+    } catch (err) {
+      if (existingSeed) {
+        return existingSeed;
+      }
+      throw err;
     }
     return existingSeed || null;
   }
 
   function handleSelectHomeSuggestion(item: GeoNamesCitySearchItem) {
-    const cleanName = item.nom.replace(/^Région\s*:\s*/i, "").trim();
+    const cleanName = String(item.nom || (item as any).city_name || "")
+      .replace(/^Région\s*:\s*/i, "")
+      .trim();
     setSelectedGeoCity(item);
     setCityQuery(cleanName);
     setUnavailableCity(null);
+    setSearchError(null);
     setAutocompleteOpen(false);
     setActiveOptionIndex(-1);
+  }
+
+  async function handleSubmitMultiCityStages(
+    targetRoute: "/flights" | "/trip" = "/trip"
+  ) {
+    setMultiCitySubmitError("");
+    setSearchError(null);
+    const check = validateDraftStagesNoOverlap(draftStages);
+    if (!check.valid) {
+      const msg = check.error || "Dates des étapes invalides.";
+      setMultiCitySubmitError(msg);
+      setSearchError(msg);
+      return;
+    }
+    if (onCreateMultiCityTrip) {
+      setIsSubmitting(true);
+      try {
+        await onCreateMultiCityTrip(draftStages, targetRoute);
+      } catch (err: any) {
+        const msg =
+          err instanceof Error
+            ? err.message
+            : "Impossible de créer le voyage multi-villes. Veuillez réessayer.";
+        setMultiCitySubmitError(msg);
+        setSearchError(msg);
+      } finally {
+        setIsSubmitting(false);
+      }
+    }
   }
 
   async function handleSubmitSearch(e: React.FormEvent) {
     e.preventDefault();
     setUnavailableCity(null);
+    setMultiCitySubmitError("");
+    setSearchError(null);
+
+    // Validation souple et normalisation des dates avant soumission
+    const normDep = normalizeIsoDateInput(departureDate, "");
+    let normRet = normalizeIsoDateInput(returnDate, "");
+    if (!normDep || !normRet) {
+      setSearchError(
+        "Veuillez sélectionner une date de départ et une date de retour valides."
+      );
+      return;
+    }
+    const nightsDiff = diffDaysIso(normDep, normRet);
+    if (nightsDiff < 0) {
+      setSearchError(
+        `Dates de séjour invalides : la date de retour (${normRet}) doit être postérieure à la date de départ (${normDep}).`
+      );
+      return;
+    }
+    if (nightsDiff === 0) {
+      normRet = addDaysIso(normDep, 7);
+      onChangeDates(normDep, normRet);
+    } else if (normDep !== departureDate || normRet !== returnDate) {
+      onChangeDates(normDep, normRet);
+    }
+
     const trimmed = cityQuery.trim();
+
+    // Si le mode multi-villes est ouvert et qu'aucune destination simple n'a été saisie dans le champ principal
+    if (multiCityEnabled && onCreateMultiCityTrip && !trimmed) {
+      await handleSubmitMultiCityStages("/flights");
+      return;
+    }
 
     if (!trimmed) {
       const defaultDest =
         popularDestinations.find((d) => d.city_name === "Marrakech") ||
-        popularDestinations[0];
-      if (defaultDest) {
-        setIsSubmitting(true);
+        popularDestinations[0] ||
+        destinations[0];
+      if (!defaultDest) {
+        setSearchError(
+          "Veuillez saisir une destination (ex. Marrakech, Rome, Lisbonne) pour lancer la recherche."
+        );
+        return;
+      }
+      setIsSubmitting(true);
+      try {
         await onSelectDestinationAndSearch(defaultDest);
+      } catch (err: any) {
+        setSearchError(
+          err instanceof Error
+            ? err.message
+            : "Impossible de créer le voyage pour cette destination."
+        );
+      } finally {
         setIsSubmitting(false);
       }
       return;
     }
+
+    const cleanLookup = normalizeCityLookupText(trimmed);
+    const strippedQuery = trimmed
+      .replace(/^Région\s*:\s*/i, "")
+      .split(/[,•\(]/)[0]
+      .trim();
 
     setIsSubmitting(true);
     try {
       // 1. Si l'utilisateur a choisi une suggestion GeoNames explicite correspondant au champ
       if (
         selectedGeoCity &&
-        selectedGeoCity.nom
-          .replace(/^Région\s*:\s*/i, "")
-          .trim()
-          .toLowerCase() === trimmed.toLowerCase()
+        normalizeCityLookupText(
+          selectedGeoCity.nom || (selectedGeoCity as any).city_name || ""
+        ) === cleanLookup
       ) {
         const resolved = await resolveGeoCityToDestination(selectedGeoCity);
         if (resolved) {
@@ -1052,7 +1262,9 @@ function HomeScreen({
 
       // 2. Si la ville fait partie des destinations déjà chargées (ex: les 5 villes du seed)
       const directSeedMatch = destinations.find(
-        (d) => d.city_name.trim().toLowerCase() === trimmed.toLowerCase()
+        (d) =>
+          d.city_name.trim().toLowerCase() === trimmed.toLowerCase() ||
+          normalizeCityLookupText(d.city_name) === cleanLookup
       );
       if (directSeedMatch) {
         await onSelectDestinationAndSearch(directSeedMatch);
@@ -1063,10 +1275,8 @@ function HomeScreen({
       const geoMatch =
         geonamesResults.find(
           (g) =>
-            g.nom
-              .replace(/^Région\s*:\s*/i, "")
-              .trim()
-              .toLowerCase() === trimmed.toLowerCase()
+            normalizeCityLookupText(g.nom || (g as any).city_name || "") ===
+            cleanLookup
         ) || geonamesResults[0];
       if (geoMatch) {
         const resolved = await resolveGeoCityToDestination(geoMatch);
@@ -1077,10 +1287,13 @@ function HomeScreen({
       }
 
       // 4. Sinon, interroge immédiatement /api/v1/destinations/search?q=... (si l'utilisateur a validé avant les 300 ms)
-      if (trimmed.length >= 3) {
+      const queryForApi = strippedQuery.length >= 2 ? strippedQuery : trimmed;
+      if (queryForApi.length >= 2) {
         try {
           const searchResp = await fetch(
-            `${API_BASE}/api/v1/destinations/search?q=${encodeURIComponent(trimmed)}`
+            `${API_BASE}/api/v1/destinations/search?q=${encodeURIComponent(
+              queryForApi
+            )}`
           );
           if (searchResp.ok) {
             const searchData = await searchResp.json();
@@ -1089,29 +1302,40 @@ function HomeScreen({
                 searchData.message ||
                   "Recherche de villes indisponible — repli sur les 5 destinations populaires."
               );
-            } else if (
-              Array.isArray(searchData?.results) &&
-              searchData.results.length > 0
-            ) {
-              const resolved = await resolveGeoCityToDestination(
-                searchData.results[0]
-              );
+            }
+            const apiResults: GeoNamesCitySearchItem[] =
+              Array.isArray(searchData?.results) && searchData.results.length > 0
+                ? searchData.results
+                : Array.isArray(searchData) && searchData.length > 0
+                ? searchData
+                : [];
+            if (apiResults.length > 0) {
+              const bestCandidate =
+                apiResults.find(
+                  (item) =>
+                    normalizeCityLookupText(
+                      item.nom || (item as any).city_name || ""
+                    ) === cleanLookup
+                ) || apiResults[0];
+              const resolved = await resolveGeoCityToDestination(bestCandidate);
               if (resolved) {
                 await onSelectDestinationAndSearch(resolved);
                 return;
               }
             }
           }
-        } catch {
+        } catch (searchErr: any) {
           setGeonamesUnavailableMessage(
             "Recherche de villes indisponible — repli sur les 5 destinations populaires."
           );
         }
       }
 
-      // 5. Dernier repli partiel sur les villes populaires ou affichage "ville introuvable"
-      const partialSeedMatch = popularDestinations.find((d) =>
-        d.city_name.toLowerCase().includes(trimmed.toLowerCase())
+      // 5. Dernier repli partiel sur les villes populaires ou affichage d'erreur + carte de repli
+      const partialSeedMatch = popularDestinations.find(
+        (d) =>
+          normalizeCityLookupText(d.city_name).includes(cleanLookup) ||
+          cleanLookup.includes(normalizeCityLookupText(d.city_name))
       );
       if (partialSeedMatch) {
         await onSelectDestinationAndSearch(partialSeedMatch);
@@ -1119,7 +1343,16 @@ function HomeScreen({
       }
 
       setUnavailableCity(trimmed);
+      setSearchError(
+        `La destination « ${trimmed} » est introuvable ou indisponible. Veuillez vérifier l'orthographe ou choisir l'une des destinations ci-dessous.`
+      );
       setAutocompleteOpen(false);
+    } catch (err: any) {
+      setSearchError(
+        err instanceof Error
+          ? err.message
+          : "Une erreur est survenue lors de la création du voyage. Veuillez réessayer."
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -1127,12 +1360,22 @@ function HomeScreen({
 
   async function handlePickAvailableDestination(dest: Destination) {
     setUnavailableCity(null);
+    setSearchError(null);
     setSelectedGeoCity(null);
     setCityQuery(dest.city_name);
     setAutocompleteOpen(false);
     setIsSubmitting(true);
-    await onSelectDestinationAndSearch(dest);
-    setIsSubmitting(false);
+    try {
+      await onSelectDestinationAndSearch(dest);
+    } catch (err: any) {
+      setSearchError(
+        err instanceof Error
+          ? err.message
+          : "Impossible de créer le voyage pour cette destination."
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
   }
 
   const formattedDateRange = useMemo(() => {
@@ -1223,6 +1466,7 @@ function HomeScreen({
                       setCityQuery(e.target.value);
                       setSelectedGeoCity(null);
                       setUnavailableCity(null);
+                      setSearchError(null);
                       setAutocompleteOpen(true);
                       setActiveOptionIndex(-1);
                     }}
@@ -1372,7 +1616,7 @@ function HomeScreen({
                 )}
               </div>
 
-              {/* Champ 2 : Dates (Calendrier react-day-picker) */}
+              {/* Champ 2 : Dates (Calendrier react-day-picker + saisie directe) */}
               <div className="md:col-span-3">
                 <label className="block text-caption font-medium text-ink-secondary mb-1 pl-1">
                   Dates du séjour
@@ -1394,6 +1638,50 @@ function HomeScreen({
                       sideOffset={8}
                       className="z-50 rounded-card border border-border bg-canvas-card p-4 shadow-popover"
                     >
+                      <div className="mb-3 grid grid-cols-2 gap-2 border-b border-border pb-3">
+                        <div>
+                          <label
+                            htmlFor="home-departure-date-input"
+                            className="block text-[11px] font-semibold text-ink-secondary mb-1"
+                          >
+                            Départ
+                          </label>
+                          <input
+                            id="home-departure-date-input"
+                            data-testid="home-departure-date-input"
+                            type="date"
+                            value={normalizeIsoDateInput(departureDate, "2026-11-10")}
+                            onChange={(e) => {
+                              const nextDep = e.target.value;
+                              if (!nextDep) return;
+                              setSearchError(null);
+                              onChangeDates(nextDep, returnDate);
+                            }}
+                            className="h-9 w-full rounded-md border border-border bg-canvas-card px-2 text-caption text-ink"
+                          />
+                        </div>
+                        <div>
+                          <label
+                            htmlFor="home-return-date-input"
+                            className="block text-[11px] font-semibold text-ink-secondary mb-1"
+                          >
+                            Retour
+                          </label>
+                          <input
+                            id="home-return-date-input"
+                            data-testid="home-return-date-input"
+                            type="date"
+                            value={normalizeIsoDateInput(returnDate, "2026-11-17")}
+                            onChange={(e) => {
+                              const nextRet = e.target.value;
+                              if (!nextRet) return;
+                              setSearchError(null);
+                              onChangeDates(departureDate, nextRet);
+                            }}
+                            className="h-9 w-full rounded-md border border-border bg-canvas-card px-2 text-caption text-ink"
+                          />
+                        </div>
+                      </div>
                       <DayPicker
                         mode="range"
                         locale={fr}
@@ -1402,12 +1690,12 @@ function HomeScreen({
                         onSelect={(range) => {
                           if (range?.from) {
                             const dep = format(range.from, "yyyy-MM-dd");
-                            const ret = range.to
+                            const rawRet = range.to
                               ? format(range.to, "yyyy-MM-dd")
-                              : format(
-                                  new Date(range.from.getTime() + 7 * 86400000),
-                                  "yyyy-MM-dd"
-                                );
+                              : "";
+                            const ret =
+                              rawRet && rawRet > dep ? rawRet : addDaysIso(dep, 7);
+                            setSearchError(null);
                             onChangeDates(dep, ret);
                           }
                         }}
@@ -1458,6 +1746,85 @@ function HomeScreen({
                 </Button>
               </div>
             </form>
+
+            {/* Message d'erreur visible en cas d'échec API ou de blocage de validation front-end */}
+            {searchError && (
+              <div
+                role="alert"
+                data-testid="home-search-error"
+                className="mt-3 flex items-center justify-between gap-3 rounded-card border border-red-300 bg-red-50 px-4 py-3 text-caption font-semibold text-red-900 shadow-sm"
+              >
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="h-4 w-4 text-red-700 shrink-0" />
+                  <span>{searchError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSearchError(null)}
+                  className="text-[12px] font-medium text-red-700 underline hover:text-red-900 shrink-0"
+                >
+                  Fermer
+                </button>
+              </div>
+            )}
+
+            {/* Constructeur d'itinéraire multi-villes (destinations multiples sans chevauchement de dates) */}
+            <div className="mx-auto max-w-4xl">
+              <HomeMultiCityBuilder
+                destinationsCatalog={
+                  popularDestinations.length > 0 ? popularDestinations : destinations
+                }
+                apiBase={API_BASE}
+                enabled={multiCityEnabled}
+                onToggleEnabled={(next: boolean) => {
+                  setMultiCityEnabled(next);
+                  setMultiCitySubmitError("");
+                  setSearchError(null);
+                }}
+                stages={draftStages}
+                onChangeStages={(nextStages: DraftStageFormItem[]) => {
+                  setDraftStages(nextStages);
+                  setMultiCitySubmitError("");
+                  setSearchError(null);
+                  if (nextStages.length > 0) {
+                    const firstArr = nextStages[0].arrival_date;
+                    const lastDep = nextStages[nextStages.length - 1].departure_date;
+                    if (firstArr && lastDep) {
+                      onChangeDates(firstArr, lastDep);
+                    }
+                  }
+                }}
+              />
+              {multiCityEnabled && (
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                  {multiCitySubmitError ? (
+                    <span
+                      className="text-caption font-semibold text-red-700 bg-white/95 px-3 py-1.5 rounded-md border border-red-200"
+                      data-testid="home-multi-city-submit-error"
+                    >
+                      {multiCitySubmitError}
+                    </span>
+                  ) : (
+                    <span className="text-caption text-white/90 font-medium">
+                      Chaque étape suit immédiatement la précédente sans chevauchement.
+                    </span>
+                  )}
+                  <Button
+                    type="button"
+                    size="md"
+                    disabled={isSubmitting || !validateDraftStagesNoOverlap(draftStages).valid}
+                    data-testid="create-multi-city-trip-btn"
+                    onClick={() => handleSubmitMultiCityStages("/trip")}
+                  >
+                    <span>
+                      {isSubmitting
+                        ? "Création..."
+                        : `Créer ce voyage multi-villes (${draftStages.length} étapes)`}
+                    </span>
+                  </Button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -3009,9 +3376,67 @@ export function TravelMateShell({
     });
   }
 
-  async function ensureTripForDestination(dest: Destination): Promise<Trip | null> {
+  async function refreshDemoSession(): Promise<string> {
+    try {
+      const meResp = await fetch(`${API_BASE}/api/v1/auth/me`);
+      if (meResp.ok) {
+        const meData: UserProfile = await meResp.json();
+        const csrfResp = await fetch(`${API_BASE}/api/v1/auth/csrf`).catch(
+          () => null
+        );
+        if (csrfResp && csrfResp.ok) {
+          const csrfJson = await csrfResp.json();
+          setInMemoryCsrfToken(csrfJson.csrf_token);
+        }
+        persistSession(SESSION_COOKIE_MARKER, meData);
+        return SESSION_COOKIE_MARKER;
+      }
+      const loginResp = await fetch(`${API_BASE}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: "demo@travelmate.app",
+          password: "TravelMate2026!",
+        }),
+      });
+      if (loginResp.ok) {
+        const authData = await loginResp.json();
+        setInMemoryCsrfToken(authData.csrf_token);
+        persistSession(SESSION_COOKIE_MARKER, authData.user);
+        return SESSION_COOKIE_MARKER;
+      }
+    } catch {
+      // Ignorer et laisser l'appelant gérer l'erreur
+    }
+    return token || "";
+  }
+
+  async function ensureTripForDestination(
+    dest: Destination,
+    options?: { forceMatchDates?: boolean; throwOnError?: boolean }
+  ): Promise<Trip | null> {
     registerCreatedDestination(dest);
-    const existing = trips.find((t) => t.destination_id === dest.id);
+    const depIso = normalizeIsoDateInput(departureDate, "2026-11-10");
+    let retIso = normalizeIsoDateInput(returnDate, addDaysIso(depIso, 7));
+    const nights = diffDaysIso(depIso, retIso);
+    if (nights < 0) {
+      if (options?.throwOnError) {
+        throw new Error(
+          `Dates de séjour invalides : la date de retour (${retIso}) doit être postérieure à la date de départ (${depIso}).`
+        );
+      }
+      retIso = addDaysIso(depIso, 7);
+    } else if (nights === 0) {
+      retIso = addDaysIso(depIso, 7);
+    }
+
+    const existing = trips.find((t) => {
+      if (t.destination_id !== dest.id) return false;
+      if (!options?.forceMatchDates) return true;
+      const tArr = String(t.arrival_at || "").slice(0, 10);
+      const tDep = String(t.departure_at || "").slice(0, 10);
+      return tArr === depIso && tDep === retIso;
+    });
     if (existing) {
       setActiveTripId(existing.id);
       if (typeof localStorage !== "undefined") {
@@ -3019,42 +3444,171 @@ export function TravelMateShell({
       }
       return existing;
     }
-    if (!token) return null;
-    const resp = await fetch(`${API_BASE}/api/v1/trips`, {
+
+    let activeToken = token || (await refreshDemoSession());
+    if (!activeToken) {
+      if (options?.throwOnError) {
+        throw new Error(
+          "Session expirée ou non authentifiée. Veuillez vous reconnecter."
+        );
+      }
+      return null;
+    }
+
+    const payload = {
+      destination_id: dest.id,
+      title: `Voyage à ${dest.city_name}`,
+      travel_style: preferences.travelStyle || "STANDARD",
+      total_budget_planned: 2200,
+      currency: preferences.currency || "EUR",
+      arrival_at: `${depIso}T10:30:00Z`,
+      departure_at: `${retIso}T18:00:00Z`,
+    };
+
+    let resp = await fetch(`${API_BASE}/api/v1/trips`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${activeToken}`,
       },
-      body: JSON.stringify({
-        destination_id: dest.id,
-        title: `Voyage à ${dest.city_name}`,
-        travel_style: preferences.travelStyle,
-        total_budget_planned: 2200,
-        currency: preferences.currency,
-        arrival_at: `${departureDate}T10:30:00Z`,
-        departure_at: `${returnDate}T18:00:00Z`,
-      }),
+      body: JSON.stringify(payload),
     });
+
+    if (resp.status === 401 || resp.status === 403) {
+      activeToken = await refreshDemoSession();
+      if (activeToken) {
+        resp = await fetch(`${API_BASE}/api/v1/trips`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${activeToken}`,
+          },
+          body: JSON.stringify(payload),
+        });
+      }
+    }
+
     if (resp.ok) {
       const created: Trip = await resp.json();
-      setTrips((prev) => [created, ...prev]);
+      setTrips((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
       setActiveTripId(created.id);
       if (typeof localStorage !== "undefined") {
         localStorage.setItem("travelmate_active_trip_id", created.id);
       }
       return created;
     }
+
+    if (options?.throwOnError) {
+      const errBody = await resp.json().catch(() => null);
+      throw new Error(
+        humanErrorMessage(
+          errBody,
+          `Impossible de créer le voyage pour ${dest.city_name} (code ${resp.status}).`
+        )
+      );
+    }
     return null;
   }
 
   async function handleSelectDestinationAndGoToFlights(dest: Destination) {
     registerCreatedDestination(dest);
-    if (dest.iata_code.toUpperCase() === originIata.toUpperCase()) {
+    const destIata = String(dest.iata_code || "").toUpperCase();
+    if (destIata && destIata === String(originIata || "").toUpperCase()) {
       setOriginIata("LHR");
     }
-    await ensureTripForDestination(dest);
+    await ensureTripForDestination(dest, {
+      forceMatchDates: true,
+      throwOnError: true,
+    });
     navigate("/flights");
+  }
+
+  async function handleCreateMultiCityTrip(
+    draftStages: DraftStageFormItem[],
+    targetRoute: "/flights" | "/trip" = "/trip"
+  ) {
+    if (!draftStages || draftStages.length === 0) {
+      throw new Error("Veuillez ajouter au moins une étape à votre itinéraire.");
+    }
+    const validation = validateDraftStagesNoOverlap(draftStages);
+    if (!validation.valid) {
+      throw new Error(validation.error || "Les dates des étapes sont invalides.");
+    }
+
+    let activeToken = token || (await refreshDemoSession());
+    if (!activeToken) {
+      throw new Error(
+        "Session expirée ou non authentifiée. Veuillez vous reconnecter."
+      );
+    }
+
+    const firstStage = draftStages[0];
+    const lastStage = draftStages[draftStages.length - 1];
+    const cityNames = draftStages.map((s) => s.city_name).join(" → ");
+    const payload = {
+      destination_id: firstStage.destination_id,
+      title: `Voyage ${cityNames}`,
+      travel_style: preferences.travelStyle || "STANDARD",
+      total_budget_planned: 2800,
+      currency: preferences.currency || "EUR",
+      arrival_at: `${firstStage.arrival_date}T10:30:00Z`,
+      departure_at: `${lastStage.departure_date}T18:00:00Z`,
+      stages: draftStages.map((s) => ({
+        destination_id: s.destination_id,
+        geoname_id: s.geoname_id ?? undefined,
+        city_name: s.city_name,
+        country_name: s.country_name || "Monde",
+        country_code_iso2: s.country_code_iso2 || "XX",
+        timezone: s.timezone || "UTC",
+        latitude: s.latitude ?? undefined,
+        longitude: s.longitude ?? undefined,
+        arrival_date: s.arrival_date,
+        departure_date: s.departure_date,
+        nights: Math.max(1, diffDaysIso(s.arrival_date, s.departure_date)),
+        arrival_transport_mode: s.arrival_transport_mode || "VOL",
+      })),
+    };
+
+    let resp = await fetch(`${API_BASE}/api/v1/trips`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${activeToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (resp.status === 401 || resp.status === 403) {
+      activeToken = await refreshDemoSession();
+      if (activeToken) {
+        resp = await fetch(`${API_BASE}/api/v1/trips`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${activeToken}`,
+          },
+          body: JSON.stringify(payload),
+        });
+      }
+    }
+
+    if (!resp.ok) {
+      const errBody = await resp.json().catch(() => null);
+      throw new Error(
+        humanErrorMessage(
+          errBody,
+          `Impossible de créer le voyage multi-villes (code ${resp.status}).`
+        )
+      );
+    }
+
+    const created: Trip = await resp.json();
+    setTrips((prev) => [created, ...prev.filter((t) => t.id !== created.id)]);
+    setActiveTripId(created.id);
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("travelmate_active_trip_id", created.id);
+    }
+    navigate(targetRoute);
   }
 
   const progressSteps = [
@@ -3277,6 +3831,7 @@ export function TravelMateShell({
                 onSelectDestinationAndSearch={handleSelectDestinationAndGoToFlights}
                 onRegisterCreatedDestination={registerCreatedDestination}
                 initialUnavailableCity={ssrState?.initialUnavailableCity ?? null}
+                onCreateMultiCityTrip={handleCreateMultiCityTrip}
               />
             }
           />
@@ -3378,6 +3933,12 @@ export function TravelMateShell({
                 latestBooking={latestBooking}
                 selectedAccommodation={selectedAccommodation}
                 onOpenDocumentsModal={() => navigate("/trip/documents")}
+                destinations={destinations}
+                onTripUpdated={(updatedTrip) => {
+                  setTrips((prev) =>
+                    prev.map((t) => (t.id === updatedTrip.id ? updatedTrip : t))
+                  );
+                }}
               />
             }
           />

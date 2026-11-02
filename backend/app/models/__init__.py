@@ -14,10 +14,14 @@ from app.models.entities import (
     TravelJournal,
     Trip,
     TripMember,
+    TripStage,
     User,
     VaultDocument,
     WishlistItem,
 )
+
+Stage = TripStage
+PlannedVisit = ItineraryItem
 from app.models.enums import (
     AccommodationType,
     AlertType,
@@ -28,6 +32,7 @@ from app.models.enums import (
     InviteStatus,
     MemberRole,
     PlaceCategory,
+    StageArrivalTransportMode,
     TransitMode,
     TravelStyle,
     TripStatus,
@@ -37,12 +42,15 @@ __all__ = [
     "User",
     "Destination",
     "Trip",
+    "TripStage",
+    "Stage",
     "TripMember",
     "FlightBooking",
     "Accommodation",
     "AccommodationBooking",
     "Place",
     "ItineraryItem",
+    "PlannedVisit",
     "BudgetItem",
     "VaultDocument",
     "PlaceVote",
@@ -54,6 +62,7 @@ __all__ = [
     "ChatMessage",
     "TravelStyle",
     "TripStatus",
+    "StageArrivalTransportMode",
     "MemberRole",
     "InviteStatus",
     "CabinClass",

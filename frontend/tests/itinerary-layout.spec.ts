@@ -5,7 +5,10 @@ const WIDTHS = [390, 768, 1024, 1280, 1440] as const;
 const ARTIFACT_DIR =
   process.env.ARTIFACT_DIR ||
   "C:\\Users\\mohamed.slama\\.gemini\\antigravity\\brain\\5cabc6ba-ac77-4aa2-b151-2378a164db64";
-const API_URL = process.env.VITE_API_BASE_URL || "http://localhost:8000";
+const API_URL =
+  process.env.TEST_API_BASE_URL ||
+  process.env.VITE_API_BASE_URL ||
+  "http://localhost:8001";
 
 interface BoxInfo {
   name: string;
@@ -26,6 +29,27 @@ function boxesOverlap(a: BoxInfo, b: BoxInfo, tolerancePx = 1.5): boolean {
 }
 
 test.describe("Mon programme — Vérification de mise en page aux 5 largeurs (390, 768, 1024, 1280, 1440 px)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript((testApiBase: string) => {
+      const origFetch = window.fetch.bind(window);
+      window.fetch = function (input: RequestInfo | URL, init?: RequestInit) {
+        if (typeof input === "string") {
+          input = input.replace(
+            /^https?:\/\/(localhost|127\.0\.0\.1):8000\b/,
+            testApiBase
+          );
+        } else if (typeof URL !== "undefined" && input instanceof URL) {
+          input = new URL(
+            input
+              .toString()
+              .replace(/^https?:\/\/(localhost|127\.0\.0\.1):8000\b/, testApiBase)
+          );
+        }
+        return origFetch(input, init);
+      };
+    }, API_URL);
+  });
+
   test("Le titre ne dépasse jamais 2 lignes, aucune coupure de mot, badges sur 1 ligne, puces non coupées et zéro chevauchement (chat fermé et ouvert)", async ({
     page,
   }) => {

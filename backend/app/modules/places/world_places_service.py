@@ -295,6 +295,8 @@ def parse_price_text(raw_price: str | None) -> tuple[str, float, str]:
     cleaned = clean_wikitext_value(raw_price or "")
     if not cleaned or cleaned.lower() in ("non renseigné", "non renseigne", "n/a", "-", "?"):
         return ("non renseigné", 0.0, TravelStyle.STANDARD.value)
+    if len(cleaned) > 120:
+        cleaned = cleaned[:119].rstrip() + "…"
 
     lower = cleaned.lower()
     if any(tok in lower for tok in ("gratuit", "free", "entrée libre", "acces libre", "0 €", "0€")):
@@ -836,6 +838,9 @@ class WorldPlacesService:
         client: httpx.AsyncClient,
         lang: str,
         page_title: str,
+        *,
+        timeout: float = 10.0,
+        retry_on_failure: bool = True,
     ) -> tuple[str, str, list[dict[str, Any]]]:
         """
         Récupère le wikitext et les liens d'une page Wikivoyage via action=parse.
@@ -849,7 +854,14 @@ class WorldPlacesService:
             "redirects": "1",
             "format": "json",
         }
-        data = await self._request_json_with_backoff(client, "GET", api_url, params=params)
+        data = await self._request_json_with_backoff(
+            client,
+            "GET",
+            api_url,
+            params=params,
+            timeout=timeout,
+            retry_on_failure=retry_on_failure,
+        )
         parse_obj = data.get("parse")
         if not isinstance(parse_obj, dict):
             # Fallback : recherche du titre dans Wikivoyage
@@ -860,7 +872,14 @@ class WorldPlacesService:
                 "srlimit": "3",
                 "format": "json",
             }
-            search_data = await self._request_json_with_backoff(client, "GET", api_url, params=search_params)
+            search_data = await self._request_json_with_backoff(
+                client,
+                "GET",
+                api_url,
+                params=search_params,
+                timeout=timeout,
+                retry_on_failure=retry_on_failure,
+            )
             hits = ((search_data.get("query") or {}).get("search")) or []
             norm_wanted = normalize_place_text(page_title)
             matched_title = None
@@ -872,7 +891,14 @@ class WorldPlacesService:
             if not matched_title:
                 return ("", "", [])
             params["page"] = matched_title
-            data = await self._request_json_with_backoff(client, "GET", api_url, params=params)
+            data = await self._request_json_with_backoff(
+                client,
+                "GET",
+                api_url,
+                params=params,
+                timeout=timeout,
+                retry_on_failure=retry_on_failure,
+            )
             parse_obj = data.get("parse")
             if not isinstance(parse_obj, dict):
                 return ("", "", [])
@@ -1863,11 +1889,13 @@ class WorldPlacesService:
         """
         candidates: list[NormalizedWorldAccommodation] = []
         if allow_network:
+            is_mock_transport = self._http_transport is not None
+            req_timeout = 10.0 if is_mock_transport else 2.5
             try:
                 async with httpx.AsyncClient(
                     transport=self._http_transport,
                     headers={"User-Agent": WORLD_PLACES_USER_AGENT},
-                    timeout=10.0,
+                    timeout=req_timeout,
                 ) as client:
                     for lang in ("fr", "en"):
                         try:
@@ -1875,6 +1903,8 @@ class WorldPlacesService:
                                 client,
                                 lang=lang,
                                 page_title=city_name,
+                                timeout=req_timeout,
+                                retry_on_failure=is_mock_transport,
                             )
                             if main_wikitext:
                                 parsed = self.parse_wikivoyage_sleep_listings(
@@ -1885,6 +1915,8 @@ class WorldPlacesService:
                                     city_lon=city_lon,
                                 )
                                 candidates.extend(parsed)
+                                if candidates or not is_mock_transport:
+                                    break
                         except Exception:
                             continue
             except Exception:

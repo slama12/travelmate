@@ -52,6 +52,12 @@ import {
   useToast,
 } from "./components/ui";
 import type { FlightBooking, UserProfile } from "./App";
+import {
+  TripMultiCityMap,
+  TripStagesManagerCard,
+  type TripStageItem,
+  type MapValidatedVisitItem,
+} from "./MultiCityComponents";
 
 declare global {
   interface Window {
@@ -93,6 +99,9 @@ export interface Trip {
   selected_place_ids: string[];
   status: string;
   current_user_role?: "OWNER" | "EDITOR" | "VIEWER" | string;
+  stages?: TripStageItem[];
+  stages_count?: number;
+  is_multi_city?: boolean;
 }
 
 export interface NearbyRestaurant {
@@ -253,6 +262,11 @@ export interface ItineraryItemView {
   weather_warning?: boolean | string | null;
   weather_dismissed?: boolean;
   notes: string | null;
+  stage_id?: string | null;
+  stage_order_index?: number | null;
+  stage_city_name?: string | null;
+  place_latitude?: number;
+  place_longitude?: number;
 }
 
 export interface ItineraryDayGroup {
@@ -4184,7 +4198,58 @@ export function ItineraryScreen({
   }, []);
 
   const cityLabel = destination?.city_name || schedule?.city_name || "votre destination";
+  const [stagesState, setStagesState] = useState<TripStageItem[]>(trip?.stages || []);
 
+  useEffect(() => {
+    if (Array.isArray(trip?.stages) && trip.stages.length > 0) {
+      setStagesState(trip.stages);
+    }
+  }, [trip?.stages]);
+
+  async function refreshStages(tripId: string) {
+    try {
+      const sResp = await fetch(`${apiBase}/api/v1/trips/${tripId}/stages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (sResp.ok) {
+        const sJson: TripStageItem[] = await sResp.json();
+        setStagesState(Array.isArray(sJson) ? sJson : []);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  const mapVisits: MapValidatedVisitItem[] = useMemo(() => {
+    const rawItems = schedule?.items || [];
+    return rawItems
+      .map((item) => {
+        const matchedPlace = places.find((p) => p.id === item.place_id);
+        const lat = Number(item.place_latitude ?? matchedPlace?.latitude ?? 0);
+        const lng = Number(item.place_longitude ?? matchedPlace?.longitude ?? 0);
+        return {
+          id: item.id,
+          place_id: item.place_id,
+          place_name: item.place_name,
+          place_category: item.place_category,
+          local_visit_date: item.local_visit_date || item.visit_date,
+          local_start_time: item.local_start_time,
+          local_end_time: item.local_end_time,
+          duration_minutes: item.duration_minutes,
+          latitude: lat,
+          longitude: lng,
+          stage_id: item.stage_id ?? null,
+          stage_order_index: item.stage_order_index ?? null,
+          stage_city_name: item.stage_city_name ?? null,
+        };
+      })
+      .filter(
+        (v) =>
+          Number.isFinite(v.latitude) &&
+          Number.isFinite(v.longitude) &&
+          (Math.abs(v.latitude) > 0.0001 || Math.abs(v.longitude) > 0.0001)
+      );
+  }, [schedule?.items, places]);
 
   async function refreshWeather(tripId: string) {
     try {
@@ -4245,6 +4310,7 @@ export function ItineraryScreen({
         setVisitDate((prev) => prev || defaultDay);
       }
       await refreshWeather(trip.id);
+      await refreshStages(trip.id);
     } finally {
       setLoading(false);
     }
@@ -5658,6 +5724,13 @@ export function ItineraryScreen({
           </div>
         )}
       </Card>
+
+      {/* Carte interactive multi-villes (react-leaflet) : étapes, polyligne chronologique & visites validées */}
+      <TripMultiCityMap
+        stages={stagesState}
+        visits={mapVisits}
+        fallbackDestination={destination}
+      />
 
       {/* Continuer vers le récapitulatif Mon voyage */}
       <div className="flex justify-start">
@@ -7084,6 +7157,8 @@ export function MyTripSummaryScreen({
   latestBooking,
   selectedAccommodation,
   onOpenDocumentsModal,
+  destinations,
+  onTripUpdated,
 }: {
   apiBase: string;
   token: string;
@@ -7092,6 +7167,8 @@ export function MyTripSummaryScreen({
   latestBooking: FlightBooking | null;
   selectedAccommodation: AccommodationItem | null;
   onOpenDocumentsModal?: () => void;
+  destinations?: Destination[];
+  onTripUpdated?: (updatedTrip: Trip) => void;
 }) {
   const navigate = useNavigate();
   const [schedule, setSchedule] = useState<TripItinerarySchedule | null>(null);
@@ -7106,12 +7183,77 @@ export function MyTripSummaryScreen({
   const [practicalSummary, setPracticalSummary] = useState<PracticalInfoPayload>(
     DEFAULT_DEMO_PRACTICAL_INFO
   );
+  const [stagesState, setStagesState] = useState<TripStageItem[]>(trip?.stages || []);
+  const [destinationsState, setDestinationsState] = useState<Destination[]>(
+    destinations || (destination ? [destination] : [])
+  );
+
+  useEffect(() => {
+    if (Array.isArray(trip?.stages) && trip.stages.length > 0) {
+      setStagesState(trip.stages);
+    }
+  }, [trip?.stages]);
+
+  useEffect(() => {
+    if (Array.isArray(destinations) && destinations.length > 0) {
+      setDestinationsState(destinations);
+    }
+  }, [destinations]);
 
   const cityLabel = destination?.city_name || "votre destination";
   const activeRole = trip?.current_user_role || budgetSummary.current_user_role || "OWNER";
+  const canWriteTrip = activeRole === "OWNER" || activeRole === "EDITOR";
+
+  const mapVisits: MapValidatedVisitItem[] = useMemo(() => {
+    const rawItems = schedule?.items || [];
+    return rawItems
+      .map((item) => {
+        const lat = Number(item.place_latitude ?? 0);
+        const lng = Number(item.place_longitude ?? 0);
+        return {
+          id: item.id,
+          place_id: item.place_id,
+          place_name: item.place_name,
+          place_category: item.place_category,
+          local_visit_date: item.local_visit_date || item.visit_date,
+          local_start_time: item.local_start_time,
+          local_end_time: item.local_end_time,
+          duration_minutes: item.duration_minutes,
+          latitude: lat,
+          longitude: lng,
+          stage_id: item.stage_id ?? null,
+          stage_order_index: item.stage_order_index ?? null,
+          stage_city_name: item.stage_city_name ?? null,
+        };
+      })
+      .filter(
+        (v) =>
+          Number.isFinite(v.latitude) &&
+          Number.isFinite(v.longitude) &&
+          (Math.abs(v.latitude) > 0.0001 || Math.abs(v.longitude) > 0.0001)
+      );
+  }, [schedule?.items]);
 
   useEffect(() => {
     if (!trip?.id || !token) return;
+
+    fetch(`${apiBase}/api/v1/trips/${trip.id}/stages`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((raw) => {
+        if (Array.isArray(raw)) setStagesState(raw);
+      })
+      .catch(() => null);
+
+    if (!destinations || destinations.length === 0) {
+      fetch(`${apiBase}/api/v1/destinations`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((raw) => {
+          if (Array.isArray(raw) && raw.length > 0) setDestinationsState(raw);
+        })
+        .catch(() => null);
+    }
 
     fetch(`${apiBase}/api/v1/itinerary/trip/${trip.id}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -7531,6 +7673,41 @@ export function MyTripSummaryScreen({
           Ouvrir mon programme jour par jour
         </Button>
       </Card>
+
+      {/* 5. Carte interactive de l'itinéraire multi-villes (react-leaflet) */}
+      <TripMultiCityMap
+        stages={stagesState}
+        visits={mapVisits}
+        fallbackDestination={destination}
+        destinationsCatalog={destinationsState}
+      />
+
+      {/* 6. Gestion des étapes multi-villes du voyage (ajout, modification, réordonnancement, suppression sans chevauchement) */}
+      {trip?.id && (
+        <TripStagesManagerCard
+          tripId={trip.id}
+          stages={stagesState}
+          canWrite={canWriteTrip}
+          apiBase={apiBase}
+          jwtToken={token}
+          destinationsCatalog={destinationsState}
+          onStagesUpdated={(nextStages) => {
+            setStagesState(nextStages);
+            if (onTripUpdated && trip) {
+              const firstSt = nextStages[0];
+              const lastSt = nextStages[nextStages.length - 1];
+              onTripUpdated({
+                ...trip,
+                stages: nextStages,
+                stages_count: nextStages.length,
+                is_multi_city: nextStages.length > 1,
+                arrival_at: firstSt ? `${firstSt.arrival_date}T10:30:00Z` : trip.arrival_at,
+                departure_at: lastSt ? `${lastSt.departure_date}T18:00:00Z` : trip.departure_at,
+              });
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

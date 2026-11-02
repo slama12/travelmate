@@ -7,6 +7,7 @@ from app.models.enums import TravelStyle
 
 
 class TripStageInput(BaseModel):
+    id: str | None = None
     order_index: int | None = None
     destination_id: str | None = None
     geoname_id: int | None = None
@@ -38,6 +39,47 @@ class TripStageInput(BaseModel):
             self.country_name = self.country
         if self.country_name and not self.country:
             self.country = self.country_name
+        if (
+            self.departure_date is not None
+            and self.arrival_date is not None
+            and "nights" not in self.model_fields_set
+        ):
+            self.nights = (self.departure_date - self.arrival_date).days
+        return self
+
+
+class TripStageUpdateRequest(BaseModel):
+    destination_id: str | None = None
+    geoname_id: int | None = None
+    city_name: str | None = None
+    country: str | None = None
+    country_name: str | None = None
+    country_code_iso2: str | None = None
+    timezone: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    iata_code: str | None = None
+    arrival_date: date | None = None
+    nights: int | None = None
+    departure_date: date | None = None
+    arrival_at: datetime | None = None
+    departure_at: datetime | None = None
+    arrival_time_local: str | None = None
+    departure_time_local: str | None = None
+    arrival_transport_mode: str | None = None
+    departure_transport_mode: str | None = None
+    transport_unlocked: bool | None = None
+    transport_booking_ref: str | None = None
+    selected_place_ids: list[str] | None = None
+    planned_budget: float | None = Field(default=None, ge=0.0)
+    recalculate_dates: bool = True
+
+    @model_validator(mode="after")
+    def _sync_update_fields(self) -> "TripStageUpdateRequest":
+        if self.country and not self.country_name:
+            self.country_name = self.country
+        if self.country_name and not self.country:
+            self.country = self.country_name
         return self
 
 
@@ -54,6 +96,10 @@ class TripStageResponse(BaseModel):
     country_name: str
     country_code_iso2: str
     timezone: str
+    latitude: float = 0.0
+    longitude: float = 0.0
+    iata_code: str | None = None
+    hero_image_url: str | None = None
     arrival_date: date
     nights: int
     departure_date: date
@@ -128,6 +174,26 @@ class TripCreateRequest(BaseModel):
     @model_validator(mode="after")
     def _sync_budget(self) -> "TripCreateRequest":
         if self.total_budget is not None and self.total_budget_planned == 1500.0:
+            self.total_budget_planned = float(self.total_budget)
+        return self
+
+
+class TripUpdateRequest(BaseModel):
+    destination_id: str | None = None
+    origin_iata: str | None = None
+    title: str | None = Field(default=None, min_length=2, max_length=200)
+    travel_style: TravelStyle | None = None
+    total_budget_planned: float | None = Field(default=None, ge=0.0)
+    total_budget: float | None = Field(default=None, ge=0.0)
+    currency: str | None = Field(default=None, min_length=3, max_length=3)
+    preferences: dict[str, Any] | None = None
+    arrival_at: datetime | None = None
+    departure_at: datetime | None = None
+    stages: list[TripStageInput] | None = None
+
+    @model_validator(mode="after")
+    def _sync_update_budget(self) -> "TripUpdateRequest":
+        if self.total_budget is not None and self.total_budget_planned is None:
             self.total_budget_planned = float(self.total_budget)
         return self
 
